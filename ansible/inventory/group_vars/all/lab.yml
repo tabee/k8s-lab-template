@@ -1,0 +1,142 @@
+---
+# ONE source for the lab VM: infra/envs/local/lab.yaml (base) and
+# lab.local.yaml (own values, optional, in .gitignore). OpenTofu and
+# scripts/lab.sh read the same files. From them the variable "lab" is built here.
+# No secrets. Runbook: docs/how-to/rebuild.md, docs/tutorials/lab-for-friends.md
+
+# Environment: the inventory may set "lab_env" (see docs/concepts/decisions/0001-one-source-lab-yaml.md).
+# Without it the environment is "local", exactly as before. Layers, the later one wins per key:
+#   1. infra/envs/local/lab.yaml        base with every key (always read)
+#   2. infra/envs/<lab_env>/lab.yaml    only the keys this environment changes (not read for "local")
+#   3. infra/envs/<lab_env>/lab.local.yaml  own values, in .gitignore
+lab_env_name: "{{ lab_env | default('local') }}"
+lab_base_dir: "{{ playbook_dir }}/../infra/envs/local"
+lab_dir: "{{ playbook_dir }}/../infra/envs/{{ lab_env_name }}"
+lab_basis: "{{ lookup('ansible.builtin.file', lab_base_dir ~ '/lab.yaml') | from_yaml | combine(lab_overrides) }}"
+# query(...) returns an empty list if the file is missing.
+lab_overrides: >-
+  {{ {} if lab_env_name == 'local' else
+     ((query('ansible.builtin.file', lab_dir ~ '/lab.yaml', errors='ignore') | first | default('', true)) | from_yaml | default({}, true)) }}
+lab_local: "{{ (query('ansible.builtin.file', lab_dir ~ '/lab.local.yaml', errors='ignore') | first | default('', true)) | from_yaml | default({}, true) }}"
+# source: github (ADR 0024) makes the github_* values the effective repo_url, repo_known_hosts and
+# repo_egress_cidrs. The same override sits in scripts/lab.sh (cfg_load) and scripts/repo-egress.py (load_config).
+lab_merged: "{{ lab_basis | combine(lab_local_renamed) }}"
+lab: >-
+  {{ lab_merged
+     | combine({'repo_url': lab_merged.github_repo_url,
+                'repo_known_hosts': lab_merged.github_known_hosts,
+                'repo_egress_cidrs': lab_merged.github_egress_cidrs} if (lab_merged.source | default('gitea')) == 'github' else {}) }}
+# Old lab.local.yaml files may still use the former German keys edge_profil / edge_profil_admin
+# (renamed in wave 3b). They are mapped here, the new key wins if both are present.
+lab_local_renamed: >-
+  {{ lab_local
+     | combine({'edge_profile': lab_local.edge_profil} if ('edge_profil' in lab_local and 'edge_profile' not in lab_local) else {})
+     | combine({'edge_profile_admin': lab_local.edge_profil_admin} if ('edge_profil_admin' in lab_local and 'edge_profile_admin' not in lab_local) else {}) }}
+
+# Network edge (issue #1): lists from lab.yaml. The words vm_cidr, gateway, vm_ip are
+# replaced by the values, a single address becomes /32 or /128. ONE place for
+# firewall (group_vars/k3s), Traefik comparison (scripts/lab.sh customize, verify-traefik)
+# and lab_values. The check for valid networks is done by the role firewall.
+# "-e edge_profile=edge" switches on the trial run without touching lab.local.yaml.
+lab_edge_profile: "{{ edge_profile | default(lab.edge_profile) }}"
+lab_edge_admin_raw: "{{ lab.edge_profile_admin if lab_edge_profile == 'edge' else lab.edge_admin_cidrs }}"
+lab_edge_admin_cidrs: >-
+  {{ ((lab_edge_admin_raw if lab_edge_admin_raw is string else lab_edge_admin_raw | join(',')) | split(','))
+     | map('trim') | reject('equalto', '')
+     | map('regex_replace', '^vm_cidr$', lab.vm_cidr)
+     | map('regex_replace', '^gateway$', lab.gateway)
+     | map('regex_replace', '^vm_ip$', lab.vm_ip)
+     | map('regex_replace', '^([0-9.]+)$', '\1/32')
+     | map('regex_replace', '^([0-9a-fA-F]*:[0-9a-fA-F:.]*)$', '\1/128')
+     | unique | list }}
+lab_edge_ingress_cidrs: >-
+  {{ ((lab.edge_ingress_cidrs if lab.edge_ingress_cidrs is string else lab.edge_ingress_cidrs | join(',')) | split(','))
+     | map('trim') | reject('equalto', '')
+     | map('regex_replace', '^vm_cidr$', lab.vm_cidr)
+     | map('regex_replace', '^gateway$', lab.gateway)
+     | map('regex_replace', '^vm_ip$', lab.vm_ip)
+     | map('regex_replace', '^([0-9.]+)$', '\1/32')
+     | map('regex_replace', '^([0-9a-fA-F]*:[0-9a-fA-F:.]*)$', '\1/128')
+     | unique | list }}
+# Git server addresses of the egress policies (issue #5): comma text from lab.yaml, a single
+# address becomes /32. scripts/repo-egress.py writes the same list into gitops/.
+lab_repo_egress_cidrs: >-
+  {{ ((lab.repo_egress_cidrs if lab.repo_egress_cidrs is string else lab.repo_egress_cidrs | join(',')) | split(','))
+     | map('trim') | reject('equalto', '')
+     | map('regex_replace', '^([0-9.]+)$', '\1/32')
+     | unique | list }}
+
+# Everything scripts/lab.sh needs to know outside lab.yaml (preflight,
+# cleanup). The wrapper reads only this object, no paths from scripts:
+#   cd ansible && ansible backup_host -m ansible.builtin.debug -a 'msg={{ lab_values | to_json }}'
+lab_values:
+  vm_name: "{{ lab.vm_name }}"
+  vm_ip: "{{ lab.vm_ip }}"
+  fqdn: "{{ lab.vm_name }}.{{ lab.domain }}"
+  gateway: "{{ lab.gateway }}"
+  edge_profile: "{{ lab_edge_profile }}"
+  edge_admin_cidrs: "{{ lab_edge_admin_cidrs }}"
+  edge_ingress_cidrs: "{{ lab_edge_ingress_cidrs }}"
+  acme_active: "{{ lab_acme_active | bool }}"
+  kubeconfig: "{{ argocd_kubeconfig }}"
+  age_key: "{{ argocd_sops_age_key_path | expanduser }}"
+  sops_config: "{{ argocd_sops_config_path }}"
+  deploy_key: "{{ argocd_repo_ssh_key_path | expanduser }}"
+  repo_url: "{{ argocd_repo_url }}"
+  secrets_repo_url: "{{ argocd_secrets_repo_url }}"
+  secrets_deploy_key: "{{ argocd_secrets_repo_ssh_key_path | expanduser }}"
+  known_hosts: "{{ argocd_repo_known_hosts }}"
+  sudo_exe: "{{ ansible_become_exe | default('sudo') }}"
+  rustfs_port: "{{ backup_s3_port }}"
+  # Replica (issue #3) and alerts (issue #8): lab.sh calls the scripts with these configs.
+  replica_enabled: "{{ backup_replica_enabled | bool }}"
+  replica_config: "{{ backup_replica_config }}"
+  replica_script: "{{ backup_replica_script }}"
+  alert_enabled: "{{ backup_alert_enabled | bool }}"
+  alert_config: "{{ backup_alert_config }}"
+  alert_script: "{{ backup_alert_script }}"
+  alert_maintenance_file: "{{ backup_alert_maintenance_file }}"
+  # Marker of an unfinished rebuild --restore (restore.yml). Never a secret.
+  restore_state_file: "{{ restore_state_file }}"
+  rustfs_root_env: "{{ backup_s3_root_env }}"
+  rustfs_env_files:
+    - "{{ backup_s3_user_env }}"
+    - "{{ backup_s3_k8up_user_env }}"
+  # Bucket of the Postgres backups (CNPG) and of the file backups (K8up)
+  bucket_cnpg: "{{ backup_s3_bucket }}"
+  bucket_k8up: "{{ backup_s3_k8up_bucket }}"
+  # On-disk rustfs tree. rebuild --restore reads prefix/serverName here. Never a secret.
+  backup_data_dir: "{{ backup_s3_data_dir }}"
+  # One age limit, the same number as the restore drill. A running VM is not
+  # destroyed until a backup newer than this exists; rebuild --restore takes one first.
+  backup_max_age_h: "{{ restore_drill_max_age_h }}"
+  # Where scripts/matrix-import.sh prepare writes the signing key of an imported homeserver (lab.sh init encrypts the file
+  # into SOPS). The path is not a secret.
+  matrix_signing_key_file: "{{ matrix_signing_key_file }}"
+  secret_files:
+    - "{{ gitea_db_password_file }}"
+    - "{{ gitea_admin_user_file }}"
+    - "{{ gitea_admin_password_file }}"
+    - "{{ gitea_k8up_repo_password_file }}"
+    - "{{ gitea_runner_token_file }}"
+    - "{{ matrix_db_password_file }}"
+    - "{{ matrix_admin_user_file }}"
+    - "{{ matrix_admin_password_file }}"
+    - "{{ matrix_registration_secret_file }}"
+    - "{{ keycloak_db_password_file }}"
+    - "{{ keycloak_admin_user_file }}"
+    - "{{ keycloak_admin_password_file }}"
+    - "{{ keycloak_gitea_client_secret_file }}"
+    - "{{ keycloak_synapse_client_secret_file }}"
+  # Files under gitops/ where gateway or VM network are hard-coded (Argo CD reads
+  # only Git, lab.yaml does not reach them). The preflight checks that they match
+  # lab.yaml; with a different network they must be adjusted by hand.
+  gitops_gateway_files:
+    - gitops/workloads/db-lab/objectstore.yaml
+    - gitops/workloads/gitea/manifests/objectstore.yaml
+    - gitops/workloads/gitea/manifests/k8up-schedule.yaml
+    - gitops/workloads/matrix/manifests/objectstore.yaml
+    - gitops/workloads/matrix/manifests/k8up-schedule.yaml
+    - gitops/workloads/keycloak/manifests/objectstore.yaml
+  gitops_cidr_files:
+    - gitops/platform/traefik/values.yaml

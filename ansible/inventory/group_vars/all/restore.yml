@@ -1,0 +1,27 @@
+---
+# rebuild --restore (ADR-0018): the ONE place for its waits and its state marker.
+
+# How long restore-clusters.yml waits in total until the barman-cloud plugin
+# is usable (cert-manager running, Certificates barman-cloud-client and
+# barman-cloud-server Ready, plugin Deployment Available). The plugin needs
+# cert-manager, and cert-manager needs image pulls and a webhook on a new VM,
+# so this is generous. One budget for the whole chain, not per step.
+restore_plugin_timeout_min: 30
+# Seconds between two polls of that wait.
+restore_plugin_delay: 10
+
+# Inside that budget: after this many minutes without Ready Certificates, a cnpg
+# Argo CD application whose sync FAILED (retries used up) is synced once by hand.
+restore_plugin_nudge_after_min: 4
+# Inside that budget: after this many minutes without an Available plugin
+# Deployment (Certificates are Ready by then), the plugin pod is deleted once so
+# the kubelet mounts the now existing TLS secrets at once, not after its back-off.
+restore_plugin_pod_grace_min: 3
+
+# Marker for an unfinished rebuild --restore. lab.sh writes it before the VM is
+# destroyed. recover-files.yml --tags verify removes it, and only after the
+# files and the checks went through. While it exists, rebuild --restore does
+# not take "fresh backups" of a running VM: the VM may be half restored, and a
+# backup of empty volumes would become the newest one. lab.sh gets the path
+# through lab_values (restore_state_file).
+restore_state_file: "{{ backup_s3_home }}/k8s-lab-data/state/restore-in-progress.json"

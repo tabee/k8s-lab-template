@@ -1,0 +1,90 @@
+---
+# One round of the Certificate wait (included twice by restore-plugin-ready.yml, loop var
+# restore_pl_round). Round 1 waits at most restore_plugin_nudge_after_min. If the Certificates
+# are still not Ready and the sync of the cnpg application FAILED (retries used up), round 2
+# syncs it once by hand: Argo CD does not sync the same revision again by itself. Then it waits
+# for the rest of the budget. A missing CRD or a webhook that does not answer only means "not yet".
+# The include itself cannot skip round 2 (Ansible includes both rounds before it runs the first), so
+# the whole round is one block that checks the flag when it runs.
+- name: Run one round of the wait, number {{ restore_pl_round }}
+  when: not (restore_pl_certs_done | default(false) | bool)
+  block:
+    - name: Read the Argo CD application of the plugin
+      when: restore_pl_round | int == 2
+      kubernetes.core.k8s_info:
+        api_version: argoproj.io/v1alpha1
+        kind: Application
+        namespace: "{{ argocd_namespace }}"
+        name: "{{ restore_op_app.metadata.name }}"
+      register: restore_pl_app
+      failed_when: false
+
+    - name: Sync the plugin application once because its sync failed
+      when:
+        - restore_pl_round | int == 2
+        - restore_pl_app.resources | default([]) | length == 1
+        - restore_pl_app.resources[0].operation is not defined
+        - (restore_pl_app.resources[0].status.operationState.phase | default('')) in ['Failed', 'Error']
+      block:
+        - name: Build the one-off sync operation
+          ansible.builtin.set_fact:
+            restore_pl_sync_op: >-
+              {{ {'initiatedBy': {'username': 'lab-restore'},
+                  'sync': {'prune': (restore_pl_app.resources[0].spec.syncPolicy.automated.prune | default(false)),
+                           'syncOptions': (restore_pl_app.resources[0].spec.syncPolicy.syncOptions | default([]))}}
+                 | combine({'retry': restore_pl_app.resources[0].spec.syncPolicy.retry}
+                           if restore_pl_app.resources[0].spec.syncPolicy.retry is defined else {}) }}
+
+        - name: Start the one-off sync
+          kubernetes.core.k8s:
+            state: patched
+            definition:
+              apiVersion: argoproj.io/v1alpha1
+              kind: Application
+              metadata:
+                name: "{{ restore_op_app.metadata.name }}"
+                namespace: "{{ argocd_namespace }}"
+              operation: "{{ restore_pl_sync_op }}"
+
+        - name: Say that the sync was started
+          ansible.builtin.debug:
+            msg: >-
+              The Argo CD application {{ restore_op_app.metadata.name }} had a failed sync
+              ({{ restore_pl_app.resources[0].status.operationState.message | default('no message') | truncate(200) }})
+              and the plugin Certificates are not Ready. One sync was started by hand.
+
+    - name: Wait until the plugin Certificates are Ready
+      kubernetes.core.k8s_info:
+        api_version: cert-manager.io/v1
+        kind: Certificate
+        namespace: "{{ restore_op_ns }}"
+      register: restore_pl_certs
+      retries: "{{ [(([restore_pl_left | int, restore_pl_nudge_polls | int] | min) if restore_pl_round | int == 1 else restore_pl_left | int), 1] | max }}"
+      delay: "{{ restore_plugin_delay }}"
+      until: restore_pl_certs_ok | bool
+      failed_when: false
+      vars:
+        restore_pl_certs_ok: >-
+          {%- set ready = [] -%}
+          {%- for c in restore_pl_certs.resources | default([]) -%}
+          {%- if c.metadata.name in restore_plugin_certs
+              and (c.status.conditions | default([]) | selectattr('type', 'equalto', 'Ready')
+                   | selectattr('status', 'equalto', 'True') | list | length) == 1 -%}
+          {%- set _ = ready.append(c.metadata.name) -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {{ (ready | unique | list | length) == (restore_plugin_certs | length) }}
+
+    - name: Count the polls of this round
+      ansible.builtin.set_fact:
+        restore_pl_left: "{{ restore_pl_left | int - (restore_pl_certs.attempts | default(1) | int) }}"
+        restore_pl_certs_done: >-
+          {%- set ready = [] -%}
+          {%- for c in restore_pl_certs.resources | default([]) -%}
+          {%- if c.metadata.name in restore_plugin_certs
+              and (c.status.conditions | default([]) | selectattr('type', 'equalto', 'Ready')
+                   | selectattr('status', 'equalto', 'True') | list | length) == 1 -%}
+          {%- set _ = ready.append(c.metadata.name) -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {{ (ready | unique | list | length) == (restore_plugin_certs | length) }}

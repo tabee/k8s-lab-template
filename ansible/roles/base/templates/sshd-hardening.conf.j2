@@ -1,0 +1,37 @@
+# {{ ansible_managed }}
+# Key login only, no root, small attack surface.
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no
+PubkeyAuthentication yes
+AuthenticationMethods publickey
+AllowUsers {{ base_ssh_allow_users | join(' ') }}
+MaxAuthTries 3
+LoginGraceTime 30
+X11Forwarding no
+AllowAgentForwarding no
+ClientAliveInterval 300
+ClientAliveCountMax 2
+
+# No tunnels and forwarding (pivot protection). Note: breaks
+# "ssh -L" and VS Code Remote-SSH; kubectl goes directly to port 6443.
+AllowTcpForwarding no
+AllowStreamLocalForwarding no
+PermitTunnel no
+GatewayPorts no
+PermitUserEnvironment no
+
+# Only on the Ansible address, IPv4 only.
+AddressFamily inet
+ListenAddress {{ base_ssh_listen_address }}
+
+# Crypto (lists in group_vars/all/main.yml)
+KexAlgorithms {{ base_ssh_kex_algorithms | join(',') }}
+Ciphers {{ base_ssh_ciphers | join(',') }}
+MACs {{ base_ssh_macs | join(',') }}
+HostKeyAlgorithms {{ base_ssh_host_key_algorithms | join(',') }}
+PubkeyAcceptedAlgorithms {{ base_ssh_pubkey_algorithms | join(',') }}
+
+# Logs the fingerprint of the key used.
+LogLevel VERBOSE

@@ -1,0 +1,51 @@
+---
+# Child application of the root app: Keycloak (single sign-on).
+# Source 1: local chart gitops/charts/keycloak (the realm as ConfigMap).
+#           No chart registry.
+# Source 2: raw manifests under gitops/workloads/keycloak/manifests
+#           (namespace, CNPG, certificate, ingress, deployment, realm job).
+# The realm job is a PostSync hook. Secrets come from the app secrets-keycloak.
+# See docs/how-to/keycloak.md and ADR-0019.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: keycloak
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: lab
+  sources:
+    - repoURL: ssh://git@github.com/YOUR-NAME/k8s-lab.git
+      targetRevision: main
+      path: gitops/charts/keycloak
+      helm:
+        releaseName: keycloak
+    - repoURL: ssh://git@github.com/YOUR-NAME/k8s-lab.git
+      targetRevision: main
+      path: gitops/workloads/keycloak/manifests
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: keycloak
+  # Runtime recovery (rebuild --restore) may differ here. Git stays initdb. ADR-0018.
+  ignoreDifferences:
+    - group: postgresql.cnpg.io
+      kind: Cluster
+      jqPathExpressions:
+        - .spec.bootstrap
+        - .spec.externalClusters
+        - .spec.plugins[].parameters.serverName
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - RespectIgnoreDifferences=true
+      - SkipDryRunOnMissingResource=true
+      - ServerSideApply=true
+    retry:
+      limit: 10
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 3m

@@ -1,0 +1,670 @@
+---
+# Check Matrix (Synapse + Element Web): federation off, admin login, backups.
+# Usage (from ansible/):
+#   ansible-playbook verify-matrix.yml                 everything, including the file restore
+#   ansible-playbook verify-matrix.yml --tags repo     repo only, without a cluster
+#   ansible-playbook verify-matrix.yml --tags repo,cluster
+# Prerequisite: argocd.yml has run and the state is on the branch Argo CD reads.
+#
+# Names come from the manifests under gitops/workloads/matrix and the chart
+# gitops/charts/matrix. Endpoint and bucket names come from backup_s3.yml.
+# The Matrix server_name comes from lab.yaml (matrix_server_name) and must
+# equal gitops/charts/matrix/values.yaml serverName.
+#
+# Federation proof (tag cluster): the client API answers, the federation
+# version endpoint does not, and /.well-known/matrix/server is absent.
+# Nothing secret is printed. The admin login runs inside the pod and
+# prints only "login ok".
+#
+# File proof: write a marker on the media store, take one K8up backup,
+# restore that snapshot into the throwaway namespace matrix-verify and
+# read the marker back. The Backup object is kept so a following
+# restore-drill can see a completed K8up backup on a fresh cluster
+# (the schedule itself does not run at install). The snapshot stays
+# until the retention. The next run deletes the previous verify backup.
+
+- name: Check Matrix
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: "{{ argocd_kubeconfig }}"
+  vars:
+    verify_retries: 60
+    verify_delay: 10
+    verify_repo: "{{ playbook_dir }}/.."
+    verify_wl: "{{ verify_repo }}/gitops/workloads/matrix"
+    verify_mf: "{{ verify_wl }}/manifests"
+    verify_chart: "{{ verify_repo }}/gitops/charts/matrix"
+    verify_k3s_host: "{{ groups['k3s'] | first }}"
+    verify_lb_ip: "{{ hostvars[verify_k3s_host]['ansible_host'] }}"
+    verify_m_cluster: "{{ lookup('ansible.builtin.file', verify_mf ~ '/cluster.yaml') | from_yaml }}"
+    verify_m_pooler: "{{ lookup('ansible.builtin.file', verify_mf ~ '/pooler.yaml') | from_yaml }}"
+    verify_m_os: "{{ lookup('ansible.builtin.file', verify_mf ~ '/objectstore.yaml') | from_yaml }}"
+    verify_m_sb: "{{ lookup('ansible.builtin.file', verify_mf ~ '/scheduledbackup.yaml') | from_yaml }}"
+    verify_m_sched: "{{ lookup('ansible.builtin.file', verify_mf ~ '/k8up-schedule.yaml') | from_yaml }}"
+    verify_m_podcfg: "{{ lookup('ansible.builtin.file', verify_mf ~ '/k8up-podconfig.yaml') | from_yaml }}"
+    verify_m_pvc: "{{ lookup('ansible.builtin.file', verify_mf ~ '/pvc.yaml') | from_yaml }}"
+    verify_m_cert: "{{ lookup('ansible.builtin.file', verify_mf ~ '/certificate.yaml') | from_yaml }}"
+    verify_m_ns: "{{ lookup('ansible.builtin.file', verify_mf ~ '/namespace.yaml') | from_yaml }}"
+    verify_m_syn: "{{ lookup('ansible.builtin.file', verify_chart ~ '/templates/deployment-synapse.yaml') | from_yaml }}"
+    verify_m_el: "{{ lookup('ansible.builtin.file', verify_chart ~ '/templates/deployment-element.yaml') | from_yaml }}"
+    verify_m_values: "{{ lookup('ansible.builtin.file', verify_chart ~ '/values.yaml') | from_yaml }}"
+    verify_m_app: "{{ lookup('ansible.builtin.file', verify_repo ~ '/gitops/apps/matrix.yaml') | from_yaml }}"
+    verify_m_app_sec: "{{ lookup('ansible.builtin.file', verify_repo ~ '/gitops/apps/secrets-matrix.yaml') | from_yaml }}"
+    verify_hs: "{{ lookup('ansible.builtin.file', verify_chart ~ '/templates/configmap-homeserver.yaml') }}"
+    verify_el_cfg: "{{ lookup('ansible.builtin.file', verify_chart ~ '/templates/configmap-element.yaml') }}"
+    verify_syn_text: "{{ lookup('ansible.builtin.file', verify_chart ~ '/templates/deployment-synapse.yaml') }}"
+    verify_el_text: "{{ lookup('ansible.builtin.file', verify_chart ~ '/templates/deployment-element.yaml') }}"
+    verify_netpol_text: "{{ lookup('ansible.builtin.file', verify_mf ~ '/networkpolicy.yaml') }}"
+    verify_signing_example: "{{ lookup('ansible.builtin.file', verify_repo ~ '/secrets/matrix/matrix-signing-key.sops.yaml.example') }}"
+    verify_ns: "{{ verify_m_cluster.metadata.namespace }}"
+    verify_cluster: "{{ verify_m_cluster.metadata.name }}"
+    verify_boot: "{{ verify_m_cluster.spec.bootstrap.initdb | default(verify_m_cluster.spec.bootstrap.recovery) }}"
+    verify_s3: "{{ verify_m_sched.spec.backend.s3 }}"
+    verify_host: "matrix.{{ lab.domain }}"
+    verify_element_host: "element.{{ lab.domain }}"
+    verify_apps:
+      - "{{ verify_m_app_sec.metadata.name }}"
+      - "{{ verify_m_app.metadata.name }}"
+    verify_curl_base:
+      - curl
+      - --silent
+      - --show-error
+      - --max-time
+      - "20"
+      - --cacert
+      - "{{ lab_ca_cert_path | expanduser }}"
+      - --write-out
+      - "\n%{http_code}"
+    verify_restore_ns: "{{ verify_ns }}-verify"
+    verify_db_user: "{{ verify_m_syn.spec.template.spec.containers[0].env | selectattr('name', 'equalto', 'DATABASE_USER') | map(attribute='value') | first }}"
+    verify_db_name: "{{ verify_m_syn.spec.template.spec.containers[0].env | selectattr('name', 'equalto', 'DATABASE_NAME') | map(attribute='value') | first }}"
+    verify_db_host: "{{ verify_m_syn.spec.template.spec.containers[0].env | selectattr('name', 'equalto', 'DATABASE_HOST') | map(attribute='value') | first }}"
+  tasks:
+    - name: Set the run ID (once, not anew on every access)
+      ansible.builtin.set_fact:
+        verify_run: "r{{ lookup('ansible.builtin.pipe', 'date -u +%Y%m%d%H%M%S') }}"
+      tags: [always]
+
+    # ================= Repo (without cluster) =================
+    - name: Check repo
+      tags: [repo]
+      block:
+        - name: Server name, public hosts and federation switch
+          ansible.builtin.assert:
+            that:
+              - verify_m_values.serverName == lab.matrix_server_name
+              - verify_m_values.domain == lab.domain
+              - verify_m_cert.spec.dnsNames | sort == [verify_element_host, verify_host] | sort
+              - "'.Values.serverName' in verify_hs"
+              - "'federation_domain_whitelist: []' in verify_hs"
+              - "'enable_registration: false' in verify_hs"
+              - "'serve_server_wellknown: false' in verify_hs"
+              - "'8448' not in verify_hs"
+              - "'names: [federation]' not in verify_hs"
+              - "'names: [client]' in verify_hs"
+              - "'.Values.serverName' in verify_el_cfg"
+              - "lab.matrix_server_name not in verify_hs"
+              - "lab.matrix_server_name not in verify_el_cfg"
+            fail_msg: >-
+              Matrix identity or federation switch drifted.
+              serverName {{ verify_m_values.serverName }}, lab.yaml {{ lab.matrix_server_name }},
+              certificate {{ verify_m_cert.spec.dnsNames }}.
+            success_msg: "serverName {{ verify_m_values.serverName }}, federation whitelist empty, registration off"
+
+        - name: Images are pinned, the process user is fixed, and the database names match
+          ansible.builtin.assert:
+            that:
+              - "'@sha256:' in verify_syn_text"
+              - "'@sha256:' in verify_el_text"
+              - "'runAsUser: 991' in verify_syn_text"
+              - "'name: UID' not in verify_syn_text"
+              - verify_m_podcfg.spec.template.spec.securityContext.runAsUser | int == 991
+              - "'containerPort: 8080' in verify_el_text"
+              - "'ELEMENT_WEB_PORT' in verify_el_text"
+              - verify_db_user == verify_boot.owner
+              - verify_db_name == verify_boot.database
+              - verify_db_host == verify_m_pooler.metadata.name ~ '.' ~ verify_ns ~ '.svc'
+              - verify_m_pooler.spec.pgbouncer.poolMode == 'session'
+              - verify_m_cluster.spec.plugins[0].enabled | bool
+              - verify_m_cluster.spec.enableSuperuserAccess | bool == false
+              - verify_m_sb.spec.schedule.split()[2] ~ verify_m_sb.spec.schedule.split()[1]
+                < verify_m_sched.spec.backup.schedule.split()[1] ~ verify_m_sched.spec.backup.schedule.split()[0]
+            fail_msg: "Matrix image pin, uid, pooler or backup order drifted."
+            success_msg: "Synapse uid 991, session pooler, database {{ verify_db_name }}, backups staggered"
+
+        - name: Backup copies, NetworkPolicy, revision and optional signing key
+          ansible.builtin.assert:
+            that:
+              - verify_m_os.spec.configuration.endpointURL == backup_s3_vm_endpoint
+              - verify_m_os.spec.configuration.destinationPath == 's3://' ~ backup_s3_bucket ~ '/' ~ verify_ns
+              - verify_s3.endpoint == backup_s3_vm_endpoint
+              - verify_s3.bucket == backup_s3_k8up_bucket ~ '/' ~ verify_ns
+              - "'0.0.0.0/0' not in verify_netpol_text"
+              - verify_m_ns.metadata.labels['pod-security.kubernetes.io/enforce'] == 'restricted'
+              - verify_m_app.spec.sources | map(attribute='targetRevision') | unique | list == [argocd_repo_revision]
+              - verify_m_app_sec.spec.source.targetRevision == argocd_repo_revision
+              - "'@optional:matrix-signing-key' in verify_signing_example"
+              - verify_m_pvc.metadata.annotations['k8up.io/backup'] == 'true'
+            fail_msg: >-
+              Backup copy or policy drifted. CNPG {{ verify_m_os.spec.configuration.destinationPath }},
+              K8up {{ verify_s3.bucket }} (expected s3://{{ backup_s3_bucket }}/{{ verify_ns }} and
+              {{ backup_s3_k8up_bucket }}/{{ verify_ns }}).
+            success_msg: "CNPG prefix {{ verify_ns }}, K8up prefix {{ verify_ns }}, signing key optional"
+
+    # ================= Cluster =================
+    - name: Read Argo CD applications
+      kubernetes.core.k8s_info:
+        api_version: argoproj.io/v1alpha1
+        kind: Application
+        namespace: "{{ argocd_namespace }}"
+        name: "{{ item }}"
+      register: verify_app_info
+      until: >-
+        verify_app_info.resources | length == 1 and
+        (verify_app_info.resources | first).status.sync.status | default('') == 'Synced' and
+        (verify_app_info.resources | first).status.health.status | default('') == 'Healthy'
+      retries: "{{ verify_retries }}"
+      delay: "{{ verify_delay }}"
+      failed_when: false
+      loop: "{{ verify_apps }}"
+      tags: [cluster]
+
+    - name: Applications are Synced and Healthy
+      ansible.builtin.assert:
+        that:
+          - item.resources | default([]) | length == 1
+          - (item.resources | first).status.sync.status | default('') == 'Synced'
+          - (item.resources | first).status.health.status | default('') == 'Healthy'
+        fail_msg: "Application {{ item.item }} is not Synced and Healthy."
+        success_msg: "{{ item.item }} Synced and Healthy"
+      loop: "{{ verify_app_info.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      tags: [cluster]
+
+    - name: Read the namespace
+      kubernetes.core.k8s_info:
+        kind: Namespace
+        name: "{{ verify_ns }}"
+      register: verify_ns_info
+      tags: [cluster]
+
+    - name: Namespace enforces restricted Pod Security
+      ansible.builtin.assert:
+        that:
+          - (verify_ns_info.resources | first).metadata.labels['pod-security.kubernetes.io/enforce'] == 'restricted'
+        fail_msg: "Namespace {{ verify_ns }} does not enforce restricted."
+        success_msg: "{{ verify_ns }} PSA restricted"
+      tags: [cluster]
+
+    - name: Read database matrix-db
+      kubernetes.core.k8s_info:
+        api_version: postgresql.cnpg.io/v1
+        kind: Cluster
+        namespace: "{{ verify_ns }}"
+        name: "{{ verify_cluster }}"
+      register: verify_cl
+      until: (verify_cl.resources | first).status.phase | default('') == 'Cluster in healthy state'
+      retries: "{{ verify_retries }}"
+      delay: "{{ verify_delay }}"
+      tags: [cluster]
+
+    - name: Database is healthy
+      ansible.builtin.assert:
+        that:
+          - (verify_cl.resources | first).status.phase == 'Cluster in healthy state'
+        fail_msg: "{{ verify_cluster }} is not healthy."
+        success_msg: "{{ verify_cluster }} healthy"
+      tags: [cluster]
+
+    - name: Wait until a completed database backup exists
+      kubernetes.core.k8s_info:
+        api_version: postgresql.cnpg.io/v1
+        kind: Backup
+        namespace: "{{ verify_ns }}"
+      register: verify_cnpg_bk
+      until: >-
+        verify_cnpg_bk.resources
+        | selectattr('spec.cluster.name', 'equalto', verify_cluster)
+        | selectattr('status.phase', 'defined')
+        | selectattr('status.phase', 'equalto', 'completed')
+        | list | length > 0
+      retries: 90
+      delay: 10
+      tags: [cluster]
+
+    - name: A completed database backup exists
+      ansible.builtin.assert:
+        that: >-
+          verify_cnpg_bk.resources
+          | selectattr('spec.cluster.name', 'equalto', verify_cluster)
+          | selectattr('status.phase', 'defined')
+          | selectattr('status.phase', 'equalto', 'completed')
+          | list | length > 0
+        fail_msg: "No completed CNPG backup of {{ verify_cluster }} yet."
+        success_msg: "CNPG backup of {{ verify_cluster }} completed"
+      tags: [cluster]
+
+    - name: Wait until Synapse and Element are ready
+      kubernetes.core.k8s_info:
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ verify_ns }}"
+        name: "{{ item }}"
+      register: verify_dep
+      until: (verify_dep.resources | first).status.readyReplicas | default(0) | int >= 1
+      retries: "{{ verify_retries }}"
+      delay: "{{ verify_delay }}"
+      loop:
+        - synapse
+        - element
+      tags: [cluster]
+
+    - name: Find the Synapse pod
+      kubernetes.core.k8s_info:
+        kind: Pod
+        namespace: "{{ verify_ns }}"
+        label_selectors:
+          - app.kubernetes.io/name=synapse
+      register: verify_pods
+      tags: [cluster]
+
+    - name: Remember the running Synapse pod
+      ansible.builtin.set_fact:
+        verify_pod: "{{ (verify_pods.resources | selectattr('status.phase', 'equalto', 'Running') | first).metadata.name }}"
+      tags: [cluster]
+
+    - name: Client API answers  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        argv: "{{ verify_curl_base + ['--connect-to', verify_host ~ ':443:' ~ verify_lb_ip ~ ':443', 'https://' ~ verify_host ~ '/_matrix/client/versions'] }}"
+      register: verify_client
+      changed_when: false
+      tags: [cluster]
+
+    - name: Client API is up
+      ansible.builtin.assert:
+        that:
+          - verify_client.rc == 0
+          - verify_client.stdout_lines[-1] == '200'
+        fail_msg: "Client versions endpoint returned {{ verify_client.stdout_lines[-1] | default(verify_client.rc) }}."
+        success_msg: "Client API answers"
+      tags: [cluster]
+
+    - name: Federation version endpoint  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        argv: >-
+          {{ verify_curl_base + ['--connect-to', verify_host ~ ':443:' ~ verify_lb_ip ~ ':443',
+             'https://' ~ verify_host ~ '/_matrix/federation/v1/version'] }}
+      register: verify_fed
+      changed_when: false
+      tags: [cluster]
+
+    - name: Server does not federate
+      ansible.builtin.assert:
+        that:
+          - verify_fed.rc == 0
+          - verify_fed.stdout_lines[-1] == '404'
+          - "'M_UNRECOGNIZED' in verify_fed.stdout"
+          - "'\"server\"' not in verify_fed.stdout"
+        fail_msg: "Federation version endpoint was not refused (HTTP {{ verify_fed.stdout_lines[-1] | default('-') }})."
+        success_msg: "Federation version is 404 M_UNRECOGNIZED"
+      tags: [cluster]
+
+    - name: Server well-known delegation  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        argv: >-
+          {{ verify_curl_base + ['--connect-to', verify_host ~ ':443:' ~ verify_lb_ip ~ ':443',
+             'https://' ~ verify_host ~ '/.well-known/matrix/server'] }}
+      register: verify_wk
+      changed_when: false
+      tags: [cluster]
+
+    - name: No server delegation is published
+      ansible.builtin.assert:
+        that:
+          - verify_wk.stdout_lines[-1] == '404'
+        fail_msg: "Well-known server document returned {{ verify_wk.stdout_lines[-1] | default('-') }}."
+        success_msg: "No /.well-known/matrix/server"
+      tags: [cluster]
+
+    - name: Registration request  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        argv: >-
+          {{ verify_curl_base + ['--connect-to', verify_host ~ ':443:' ~ verify_lb_ip ~ ':443',
+             '-X', 'POST', '-H', 'Content-Type: application/json', '--data', '@-',
+             'https://' ~ verify_host ~ '/_matrix/client/v3/register'] }}
+        stdin: '{"username":"verify-must-not-exist","password":"verify-not-created","auth":{"type":"m.login.dummy"}}'
+      register: verify_reg
+      changed_when: false
+      no_log: true
+      tags: [cluster]
+
+    - name: Registration is closed
+      ansible.builtin.assert:
+        that:
+          - verify_reg.rc == 0
+          - verify_reg.stdout_lines[-1] == '403'
+        fail_msg: "Registration was not refused."
+        success_msg: "Registration refused"
+      tags: [cluster]
+
+    - name: Element Web answers  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        argv: "{{ verify_curl_base + ['--connect-to', verify_element_host ~ ':443:' ~ verify_lb_ip ~ ':443', 'https://' ~ verify_element_host ~ '/'] }}"
+      register: verify_el_http
+      changed_when: false
+      tags: [cluster]
+
+    - name: Element Web is up
+      ansible.builtin.assert:
+        that:
+          - verify_el_http.rc == 0
+          - verify_el_http.stdout_lines[-1] == '200'
+        fail_msg: "Element Web returned {{ verify_el_http.stdout_lines[-1] | default(verify_el_http.rc) }}."
+        success_msg: "Element Web answers"
+      tags: [cluster]
+
+    # k8s_exec takes one string and splits it. A list is not an argv.
+    - name: Log in as the admin inside the pod
+      kubernetes.core.k8s_exec:
+        namespace: "{{ verify_ns }}"
+        pod: "{{ verify_pod }}"
+        command: python /bootstrap/check-login.py
+      register: verify_login
+      changed_when: false
+      no_log: true
+      tags: [cluster]
+
+    - name: Admin login works
+      ansible.builtin.assert:
+        that:
+          - verify_login.rc == 0
+          - verify_login.stdout is search('login ok')
+        fail_msg: "Admin login failed."
+        success_msg: "Admin login ok"
+      tags: [cluster]
+
+    - name: Signing key is on the volume
+      kubernetes.core.k8s_exec:
+        namespace: "{{ verify_ns }}"
+        pod: "{{ verify_pod }}"
+        command: >-
+          python -c "import os,sys; p='/data/signing.key';
+          sys.exit(0 if os.path.isfile(p) and os.path.getsize(p) > 0 else 1)"
+      register: verify_key
+      changed_when: false
+      no_log: true
+      tags: [cluster]
+
+    - name: Signing key exists and is not printed
+      ansible.builtin.assert:
+        that: verify_key.rc == 0
+        fail_msg: "Signing key is missing on the volume."
+        success_msg: "Signing key present on the volume"
+      tags: [cluster]
+
+    - name: File restore
+      tags: [cluster]
+      block:
+        - name: Write the backup marker on the media store
+          kubernetes.core.k8s_exec:
+            namespace: "{{ verify_ns }}"
+            pod: "{{ verify_pod }}"
+            command: >-
+              python -c "open('/data/media_store/verify-marker','w').write('{{ verify_run }}' + chr(10))"
+          changed_when: true
+
+        - name: List earlier verify backups
+          kubernetes.core.k8s_info:
+            api_version: k8up.io/v1
+            kind: Backup
+            namespace: "{{ verify_ns }}"
+          register: verify_old_bk
+
+        - name: Remove earlier verify backups (the new one stays for the drill)
+          kubernetes.core.k8s:
+            state: absent
+            api_version: k8up.io/v1
+            kind: Backup
+            namespace: "{{ verify_ns }}"
+            name: "{{ item.metadata.name }}"
+          loop: "{{ verify_old_bk.resources }}"
+          when: item.metadata.name is match('^verify-')
+          loop_control:
+            label: "{{ item.metadata.name }}"
+
+        - name: Start one-off file backup
+          kubernetes.core.k8s:
+            definition:
+              apiVersion: k8up.io/v1
+              kind: Backup
+              metadata:
+                name: "verify-{{ verify_run }}"
+                namespace: "{{ verify_ns }}"
+              spec:
+                podConfigRef: "{{ verify_m_sched.spec.podConfigRef }}"
+                backend: "{{ verify_m_sched.spec.backend }}"
+                tags: ["verify-{{ verify_run }}"]
+                successfulJobsHistoryLimit: 1
+                failedJobsHistoryLimit: 1
+
+        - name: Wait until the file backup is done
+          kubernetes.core.k8s_info:
+            api_version: k8up.io/v1
+            kind: Backup
+            namespace: "{{ verify_ns }}"
+            name: "verify-{{ verify_run }}"
+          register: verify_bk
+          until: (verify_bk.resources | first).status.finished | default(false)
+          retries: 60
+          delay: 10
+
+        - name: File backup succeeded
+          ansible.builtin.assert:
+            that:
+              - verify_bk_done | length == 1
+              - verify_bk_done[0].status == 'True'
+              - verify_bk_done[0].reason == 'Succeeded'
+            fail_msg: "File backup verify-{{ verify_run }} did not succeed."
+            success_msg: "File backup verify-{{ verify_run }} done"
+          vars:
+            verify_bk_done: >-
+              {{ (verify_bk.resources | first).status.conditions | default([])
+                 | selectattr('type', 'equalto', 'Completed') | list }}
+
+        - name: Remove a leftover throwaway namespace
+          kubernetes.core.k8s:
+            state: absent
+            kind: Namespace
+            name: "{{ verify_restore_ns }}"
+            wait: true
+            wait_timeout: 300
+
+        - name: Create the throwaway namespace
+          kubernetes.core.k8s:
+            definition:
+              apiVersion: v1
+              kind: Namespace
+              metadata:
+                name: "{{ verify_restore_ns }}"
+                labels:
+                  pod-security.kubernetes.io/enforce: restricted
+                  app.kubernetes.io/managed-by: verify-matrix
+
+        - name: Read the K8up secrets (values are not printed)
+          kubernetes.core.k8s_info:
+            kind: Secret
+            namespace: "{{ verify_ns }}"
+            name: "{{ item }}"
+          register: verify_k8up_sec
+          loop:
+            - "{{ verify_s3.accessKeyIDSecretRef.name }}"
+            - "{{ verify_m_sched.spec.backend.repoPasswordSecretRef.name }}"
+          no_log: true
+
+        - name: Copy the K8up secrets
+          kubernetes.core.k8s:
+            definition:
+              apiVersion: v1
+              kind: Secret
+              type: Opaque
+              metadata:
+                name: "{{ item.item }}"
+                namespace: "{{ verify_restore_ns }}"
+              data: "{{ (item.resources | first).data }}"
+          loop: "{{ verify_k8up_sec.results }}"
+          no_log: true
+
+        - name: Copy the PodConfig
+          kubernetes.core.k8s:
+            definition:
+              apiVersion: "{{ verify_m_podcfg.apiVersion }}"
+              kind: PodConfig
+              metadata:
+                name: "{{ verify_m_podcfg.metadata.name }}"
+                namespace: "{{ verify_restore_ns }}"
+              spec: "{{ verify_m_podcfg.spec }}"
+
+        - name: Create the empty target volume
+          kubernetes.core.k8s:
+            definition:
+              apiVersion: v1
+              kind: PersistentVolumeClaim
+              metadata:
+                name: restore-target
+                namespace: "{{ verify_restore_ns }}"
+              spec:
+                accessModes: [ReadWriteOnce]
+                resources:
+                  requests:
+                    storage: "{{ verify_m_pvc.spec.resources.requests.storage }}"
+
+        - name: Start the file restore
+          kubernetes.core.k8s:
+            definition:
+              apiVersion: k8up.io/v1
+              kind: Restore
+              metadata:
+                name: "verify-{{ verify_run }}"
+                namespace: "{{ verify_restore_ns }}"
+              spec:
+                podConfigRef: "{{ verify_m_sched.spec.podConfigRef }}"
+                backend: "{{ verify_m_sched.spec.backend }}"
+                tags: ["verify-{{ verify_run }}"]
+                restoreMethod:
+                  folder:
+                    claimName: restore-target
+
+        - name: Wait until the file restore is done
+          kubernetes.core.k8s_info:
+            api_version: k8up.io/v1
+            kind: Restore
+            namespace: "{{ verify_restore_ns }}"
+            name: "verify-{{ verify_run }}"
+          register: verify_rs
+          until: (verify_rs.resources | first).status.finished | default(false)
+          retries: 60
+          delay: 10
+
+        - name: File restore succeeded
+          ansible.builtin.assert:
+            that:
+              - verify_rs_done | length == 1
+              - verify_rs_done[0].status == 'True'
+              - verify_rs_done[0].reason == 'Succeeded'
+            fail_msg: "File restore verify-{{ verify_run }} did not succeed."
+            success_msg: "File restore verify-{{ verify_run }} done"
+          vars:
+            verify_rs_done: >-
+              {{ (verify_rs.resources | first).status.conditions | default([])
+                 | selectattr('type', 'equalto', 'Completed') | list }}
+
+        - name: Start the check pod
+          kubernetes.core.k8s:
+            definition:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                name: verify-files
+                namespace: "{{ verify_restore_ns }}"
+              spec:
+                restartPolicy: Never
+                automountServiceAccountToken: false
+                securityContext:
+                  runAsNonRoot: true
+                  runAsUser: 991
+                  runAsGroup: 991
+                  fsGroup: 991
+                  seccompProfile:
+                    type: RuntimeDefault
+                containers:
+                  - name: check
+                    image: "{{ egress_probe_image }}"
+                    command: [python, -c]
+                    args:
+                      - |
+                        import pathlib
+                        p = pathlib.Path("/data/media_store/verify-marker")
+                        got = p.read_text().strip() if p.is_file() else ""
+                        print("MARKER" if got == "{{ verify_run }}" else "MARKER-MISMATCH")
+                    securityContext:
+                      allowPrivilegeEscalation: false
+                      readOnlyRootFilesystem: true
+                      capabilities:
+                        drop: [ALL]
+                    volumeMounts:
+                      - name: data
+                        mountPath: /data
+                        readOnly: true
+                      - name: tmp
+                        mountPath: /tmp
+                volumes:
+                  - name: data
+                    persistentVolumeClaim:
+                      claimName: restore-target
+                  - name: tmp
+                    emptyDir: {}
+
+        - name: Wait until the check pod is done
+          kubernetes.core.k8s_info:
+            kind: Pod
+            namespace: "{{ verify_restore_ns }}"
+            name: verify-files
+          register: verify_check_pod
+          until: (verify_check_pod.resources | first).status.phase | default('') in ['Succeeded', 'Failed']
+          retries: 30
+          delay: 5
+
+        - name: Read the check pod log
+          kubernetes.core.k8s_log:
+            namespace: "{{ verify_restore_ns }}"
+            name: verify-files
+          register: verify_check_log
+
+        - name: Restored marker matches this run
+          ansible.builtin.assert:
+            that:
+              - (verify_check_pod.resources | first).status.phase == 'Succeeded'
+              - verify_check_log.log is search('^MARKER$')
+              - "'MARKER-MISMATCH' not in verify_check_log.log"
+            fail_msg: "Restored media store did not contain this run's marker."
+            success_msg: "Restored marker matches {{ verify_run }}"
+
+      always:
+        - name: Throwaway namespace gone
+          kubernetes.core.k8s:
+            state: absent
+            kind: Namespace
+            name: "{{ verify_restore_ns }}"
+            wait: true
+            wait_timeout: 300
+          tags: [cluster]
+
+    - name: Egress probes (allowed targets connect, everything else is blocked)
+      ansible.builtin.include_tasks: tasks/egress-probe.yml
+      vars:
+        egress_probes: "{{ egress_probe_control + egress_probe_matrix }}"
+      tags: [cluster, egress]

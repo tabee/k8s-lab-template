@@ -1,0 +1,25 @@
+---
+# Public name of Keycloak. The lab CA only signs names under the lab domain,
+# so this host follows that domain (lab.sh customize rewrites it).
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: keycloak
+  namespace: keycloak
+spec:
+  secretName: keycloak-tls
+  dnsNames:
+    - sso.lab.example
+  duration: 2160h
+  renewBefore: 720h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  usages:
+    - digital signature
+    - server auth
+  issuerRef:
+    group: cert-manager.io
+    kind: ClusterIssuer
+    name: lab-ca

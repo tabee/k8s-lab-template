@@ -1,0 +1,88 @@
+---
+# Quadlet file from the template, checked beforehand with the quadlet generator.
+# The old file (before stage 8a) is backed up once.
+
+- name: Image present? (nothing is ever pulled at boot)
+  ansible.builtin.command: podman image exists {{ backup_s3_image }}
+  register: backup_s3_image_exists
+  changed_when: false
+  failed_when: backup_s3_image_exists.rc not in [0, 1]
+  check_mode: false
+
+- name: Pull image (pinned digest)
+  ansible.builtin.command: podman pull {{ backup_s3_image }}
+  register: backup_s3_pull
+  changed_when: true
+  when: backup_s3_image_exists.rc != 0
+
+- name: Read existing quadlet file
+  ansible.builtin.stat:
+    path: "{{ backup_s3_quadlet_dir }}/{{ backup_s3_container_name }}.container"
+  register: backup_s3_quadlet_old
+
+# Back up only a foreign (old) file, never our own from stage 8a.
+- name: Is the existing quadlet file already from stage 8a?
+  ansible.builtin.command: grep -qE "Stufe 8a|Stage 8a" {{ backup_s3_quadlet_dir }}/{{ backup_s3_container_name }}.container
+  register: backup_s3_quadlet_own
+  changed_when: false
+  failed_when: backup_s3_quadlet_own.rc > 1
+  check_mode: false
+  when: backup_s3_quadlet_old.stat.exists
+
+- name: Back up the existing quadlet file once (way back)
+  ansible.builtin.copy:
+    src: "{{ backup_s3_quadlet_dir }}/{{ backup_s3_container_name }}.container"
+    dest: "{{ backup_s3_backup_dir }}/{{ backup_s3_container_name }}.container.before-stage8a"
+    remote_src: true
+    force: false
+    mode: "0600"
+  # In check mode the target directory does not exist yet on the first run.
+  when:
+    - backup_s3_quadlet_old.stat.exists
+    - backup_s3_quadlet_own.rc != 0
+    - not ansible_check_mode or backup_s3_backup_dir is directory
+
+# validate: copy the file into an empty directory and start the generator in
+# dry run; on errors the old file stays.
+- name: Write quadlet file
+  ansible.builtin.template:
+    src: rustfs.container.j2
+    dest: "{{ backup_s3_quadlet_dir }}/{{ backup_s3_container_name }}.container"
+    mode: "0644"
+    validate: >-
+      /bin/sh -c 'd=$(mktemp -d) && cp "$1" "$d/{{ backup_s3_container_name }}.container"
+      && QUADLET_UNIT_DIRS="$d" {{ backup_s3_quadlet_bin }} -dryrun -user > "$d/out" 2>&1
+      && grep -q "^ExecStart=" "$d/out"; r=$?; [ $r -eq 0 ] || cat "$d/out" >&2; rm -rf "$d"; exit $r' quadlet-check %s
+  notify: Restart rustfs
+
+- name: Read linger status (service starts at boot without login)
+  ansible.builtin.stat:
+    path: /var/lib/systemd/linger/{{ ansible_facts['user_id'] }}
+  register: backup_s3_linger
+
+- name: Enable linger (sudo)
+  ansible.builtin.command: loginctl enable-linger {{ ansible_facts['user_id'] }}
+  become: true
+  changed_when: true
+  when: not backup_s3_linger.stat.exists
+
+- name: Restart now if the quadlet file is new
+  ansible.builtin.meta: flush_handlers
+
+- name: Service runs
+  ansible.builtin.systemd_service:
+    name: "{{ backup_s3_container_name }}.service"
+    scope: user
+    state: started
+  # In the --check run before the first installation the unit does not exist yet.
+  ignore_errors: "{{ ansible_check_mode }}"
+
+- name: Wait until rustfs is healthy (/health local)
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ backup_s3_port }}/health"
+    return_content: true
+  register: backup_s3_health
+  until: backup_s3_health.status == 200 and (backup_s3_health.json.status | default('')) == 'ok'
+  retries: 30
+  delay: 2
+  when: not ansible_check_mode

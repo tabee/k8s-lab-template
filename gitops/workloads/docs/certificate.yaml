@@ -1,0 +1,32 @@
+---
+# TLS certificate for docs.lab.example from the lab CA (ClusterIssuer
+# lab-ca). cert-manager creates the secret docs-tls here in the namespace and
+# renews it itself. ECDSA P-256 like the CA, 90 days lifetime, renewal
+# 30 days before (same as whoami and argocd-ingress).
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: docs
+  namespace: docs
+  annotations:
+    # The CRD comes from the app cert-manager. Until then the sync fails
+    # and Argo CD tries again (retry in apps/docs.yaml).
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+spec:
+  secretName: docs-tls
+  dnsNames:
+    - docs.lab.example
+  duration: 2160h
+  renewBefore: 720h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    # A new key on every renewal.
+    rotationPolicy: Always
+  usages:
+    - digital signature
+    - server auth
+  issuerRef:
+    group: cert-manager.io
+    kind: ClusterIssuer
+    name: lab-ca

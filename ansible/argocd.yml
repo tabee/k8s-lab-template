@@ -1,0 +1,45 @@
+---
+# Stage 4: bootstrap Argo CD (once, afterwards Git steers the cluster).
+# Ansible lights the rocket, afterwards it flies with Git as control.
+# Runs on the control machine and talks only to the k8s API (kubeconfig).
+# Beforehand: commit and push gitops/ (otherwise the root app finds nothing).
+# Check first: ansible-playbook argocd.yml --check --diff
+# Afterwards (read only): ansible-playbook verify-argocd.yml
+# Runbook: docs/learning-path/stage-4-argocd.md
+# Stage 6: role lab_ca creates namespace cert-manager and the CA secret
+# (Runbook docs/learning-path/stage-6-certmanager.md, check with verify-certmanager.yml).
+# Stage 6c: argocd-server without its own TLS (server.insecure), the UI comes
+# via Traefik from gitops/workloads/argocd (runbook docs/learning-path/stage-6c-argocd-ingress.md).
+# Sidequest docs site: role docs_site creates namespace docs and the repo secret
+# for the builder (runbook docs/how-to/docs-site.md, check with
+# verify-docs.yml).
+# Sidequest notes: role notes_sites reads gitops/sites.yaml and creates per
+# notebook namespace, deploy key, password and secrets, plus the
+# AppProject notes (runbook docs/how-to/notes-sites.md, check with verify-notes.yml).
+# Stage 7 (KSOPS): argocd_bootstrap creates the age key as secret
+# argocd/sops-age and gives the repo-server ksops; the CA secret now comes
+# encrypted from secrets/ (runbook docs/learning-path/stage-7-ksops.md, check
+# with verify-ksops.yml).
+
+- name: Argo CD bootstrappen
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: "{{ argocd_kubeconfig }}"
+    group/kubernetes.core.helm:
+      kubeconfig: "{{ argocd_kubeconfig }}"
+  roles:
+    - role: argocd_bootstrap
+    # Namespace cert-manager (PSA); waits until Argo CD has created the CA secret from
+    # secrets/cert-manager has created, and stores lab-ca.crt (stage 7).
+    - role: lab_ca
+    # Namespace docs + repo secret (deploy key) for the docs site.
+    # Stays with Ansible: the same key as the repo secret of Argo CD
+    # (docs/learning-path/stage-7-ksops.md, section "Was bleibt bei Ansible").
+    - role: docs_site
+    # Notes sites from gitops/sites.yaml: namespaces, deploy keys, basic auth,
+    # AppProject notes. Secrets stay with Ansible for now (it creates them
+    # itself), pattern for later: docs/learning-path/stage-7-ksops.md.
+    - role: notes_sites

@@ -1,0 +1,154 @@
+---
+# Stage 8a: backup target rustfs (S3) on the owner's PC (group backup_host).
+# Runbook: docs/learning-path/stage-8a-backup-target.md. Each value is defined only here;
+# the role backup_s3 deliberately has no defaults/.
+# The backup host is the control machine itself (ansible_connection: local),
+# so HOME comes from the environment of the Ansible run.
+
+backup_s3_home: "{{ lookup('ansible.builtin.env', 'HOME') }}"
+
+# ---------- Container (Quadlet, rootless, systemd --user) ----------
+# rustfs 1.0.3, pinned by digest (index, amd64 + arm64).
+# yamllint disable-line rule:line-length
+backup_s3_image: docker.io/rustfs/rustfs:1.0.3@sha256:9ca9559533b537d10482fe923288b676ad08f92a7069d9a17327fbae3cab688b
+# This version is reported by /health; verify-backup-s3.yml compares it.
+backup_s3_version: "1.0.3"
+backup_s3_container_name: rustfs
+backup_s3_quadlet_dir: "{{ backup_s3_home }}/.config/containers/systemd"
+# quadlet generator (Ubuntu/Debian); checks the unit before it is replaced.
+backup_s3_quadlet_bin: /usr/libexec/podman/quadlet
+# Quadlet health keys exist since podman 4.5 (Ubuntu 24.04: 4.9.3).
+backup_s3_podman_min_version: "4.5"
+
+# Data and logs: same places as before (rustfs already ran here before stage 8a).
+backup_s3_data_dir: "{{ backup_s3_home }}/k8s-lab-data/backups"
+backup_s3_log_dir: "{{ backup_s3_home }}/k8s-lab-data/rustfs-logs"
+# Root key of rustfs. Never overwritten; if the file is missing, the role
+# creates it with random keys (0600).
+backup_s3_root_env: "{{ backup_s3_home }}/.config/rustfs/rustfs.env"
+# Location for backup copies (old quadlet file before stage 8a).
+backup_s3_backup_dir: "{{ backup_s3_home }}/.config/k8s-lab/backup"
+
+# ---------- Network ----------
+# Listens on all IPv4 addresses: no waiting for a bridge (virbr0) at
+# boot (power outage 2026-10-20). Who may connect is decided by ufw (below).
+backup_s3_bind_address: "0.0.0.0"
+backup_s3_port: 9000
+# Web console local only (http://127.0.0.1:9001), empty = not published.
+# Whether it runs is decided by RUSTFS_CONSOLE_ENABLE in rustfs.env.
+backup_s3_console_bind: "127.0.0.1"
+backup_s3_console_port: 9001
+# This is how the k3s-lab VM and its pods (flannel masquerades to the VM IP)
+# reach the storage. Stage 8b takes exactly this endpoint.
+backup_s3_vm_gateway: "{{ lab.gateway }}"
+backup_s3_vm_endpoint: "http://{{ backup_s3_vm_gateway }}:{{ backup_s3_port }}"
+
+# ---------- Start after boot and check of the network path ----------
+# Failure on 2026-10-28 (reboot of the PC): rustfs accepted connections from the VM
+# but never answered; the healthcheck in the container (127.0.0.1) stayed
+# green, CNPG backups failed silently for two days. Cause (assumption, backed
+# by sources): pasta reads routes and addresses of the host only at start.
+# Countermeasure: (1) wait for default route and address before the start
+# (rustfs-wait-net.sh), (2) check from outside and restart
+# (rustfs-watchdog.sh, systemd user timer). Details and sources:
+# docs/learning-path/stage-8a-backup-target.md, section "Warten auf das Netz und Watchdog".
+# Timeout of the rustfs start (without the wait for the network), seconds.
+backup_s3_start_timeout: 120
+# This is how long ExecStartPre waits for the default route (afterwards rustfs starts anyway).
+backup_s3_wait_net_timeout: 90
+backup_s3_script_dir: "{{ backup_s3_home }}/.local/lib/k8s-lab"
+backup_s3_systemd_user_dir: "{{ backup_s3_home }}/.config/systemd/user"
+# Check like the VM: via the address of the bridge (host side), not 127.0.0.1.
+backup_s3_probe_url: "http://{{ backup_s3_vm_gateway }}:{{ backup_s3_port }}/health"
+# Interval of the checks and grace period after the start of rustfs (seconds).
+backup_s3_watchdog_interval: 60
+backup_s3_watchdog_grace: 180
+# Per check this many requests with pause (seconds) and timeout (seconds).
+backup_s3_watchdog_tries: 3
+backup_s3_watchdog_pause: 5
+backup_s3_watchdog_curl_timeout: 5
+# After this many unsuccessful restarts in a row the watchdog gives up (exit 1).
+backup_s3_watchdog_max_restarts: 5
+
+# ufw (on the owner's PC, needs sudo: start the playbook with -K).
+# Allows only these sources on port backup_s3_port, then "deny" for everyone.
+# Remove a source: set state: absent (do not delete), run once.
+backup_s3_ufw_comment: k8s-lab backup_s3
+backup_s3_ufw_sources:
+  - { name: k3s-lab VM-Netz, cidr: "{{ lab.vm_cidr }}", interface: virbr0, state: present }
+# These sources must never get in again: every ufw rule with this source
+# (any port) or with a matching comment is deleted by the role,
+# on every run (idempotent). 192.168.39.0/24 = minikube network (gone).
+backup_s3_ufw_purge_cidrs: [192.168.39.0/24]
+backup_s3_ufw_purge_comment_regex: "(?i)minikube"
+# Later in the cloud: WireGuard network of the nodes, e.g. ["10.10.0.0/24"] and wg0.
+# Empty = no rule.
+backup_s3_wireguard_cidrs: []
+backup_s3_wireguard_interface: ""
+
+# ---------- Bucket for CNPG (k3s-lab) ----------
+backup_s3_bucket: cnpg-k3s-lab
+backup_s3_user: cnpg-k3s-lab
+backup_s3_policy_name: cnpg-k3s-lab-rw
+# Keys of the bucket user (ACCESS_KEY_ID / ACCESS_SECRET_KEY, 0600).
+# Stage 8b turns them into a SOPS secret (ansible/scripts/sops-secret.sh from-env).
+backup_s3_user_env: "{{ backup_s3_home }}/.config/k8s-lab/s3-{{ backup_s3_bucket }}.env"
+# Versioning: deleting with the CNPG key leaves only a
+# delete marker, the old version stays (only root can fetch/delete it).
+backup_s3_versioning: true
+# Old versions and orphaned delete markers are removed after this many days
+# (0 = never, then the storage grows with every retention run).
+backup_s3_noncurrent_days: 14
+# May only work in its bucket (no ListAllMyBuckets, no admin).
+backup_s3_policy:
+  Version: "2012-10-17"
+  Statement:
+    - Effect: Allow
+      Action: [s3:GetBucketLocation, s3:ListBucket, s3:ListBucketMultipartUploads]
+      Resource: ["arn:aws:s3:::{{ backup_s3_bucket }}"]
+    - Effect: Allow
+      Action: [s3:GetObject, s3:PutObject, s3:DeleteObject, s3:AbortMultipartUpload, s3:ListMultipartUploadParts]
+      Resource: ["arn:aws:s3:::{{ backup_s3_bucket }}/*"]
+# Foreign bucket names for verify: LIST and PUT with the CNPG key
+# must give 403 (rustfs checks the policy before existence, tested
+# with 1.0.3). A name that never exists: also works after cleanup.
+backup_s3_foreign_buckets: [stage8a-foreign-bucket]
+
+# ---------- Bucket for K8up (stage 8c, file backups with restic) ----------
+# Own bucket + user: the K8up key does not reach the
+# CNPG files, the CNPG key does not reach the restic repo.
+# Versioning and cleanup: backup_s3_versioning, backup_s3_noncurrent_days.
+# gitops/workloads/gitea/manifests/k8up-schedule.yaml has a COPY of
+# Bucket and endpoint, compared by verify-gitea.yml.
+backup_s3_k8up_bucket: k8up-k3s-lab
+backup_s3_k8up_user: k8up-k3s-lab
+backup_s3_k8up_policy_name: k8up-k3s-lab-rw
+# Keys of the K8up user (ACCESS_KEY_ID / ACCESS_SECRET_KEY, 0600).
+# Stage 8c turns them into the SOPS secret k8up-s3-creds (sops-secret.sh from-env).
+backup_s3_k8up_user_env: "{{ backup_s3_home }}/.config/k8s-lab/s3-{{ backup_s3_k8up_bucket }}.env"
+backup_s3_k8up_policy:
+  Version: "2012-10-17"
+  Statement:
+    - Effect: Allow
+      Action: [s3:GetBucketLocation, s3:ListBucket, s3:ListBucketMultipartUploads]
+      Resource: ["arn:aws:s3:::{{ backup_s3_k8up_bucket }}"]
+    - Effect: Allow
+      Action: [s3:GetObject, s3:PutObject, s3:DeleteObject, s3:AbortMultipartUpload, s3:ListMultipartUploadParts]
+      Resource: ["arn:aws:s3:::{{ backup_s3_k8up_bucket }}/*"]
+
+# ---------- Power outage ----------
+# true = VM k3s-lab starts with libvirt (virsh autostart), decision of
+# owner 2026-10-26. false = change nothing (also no disabling).
+backup_s3_vm_autostart: true
+backup_s3_vm_name: "{{ lab.vm_name }}"
+# libvirt network of the VM; also gets autostart with backup_s3_vm_autostart.
+backup_s3_vm_network: "{{ lab.network_name }}"
+backup_s3_libvirt_uri: "{{ lab.libvirt_uri }}"
+
+# ---------- verify-backup-s3.yml ----------
+# Test in the cluster: pod (PSA restricted) in a throwaway namespace.
+# yamllint disable-line rule:line-length
+backup_s3_verify_image: docker.io/curlimages/curl:8.17.0@sha256:935d9100e9ba842cdb060de42472c7ca90cfe9a7c96e4dacb55e79e560b3ff40
+backup_s3_verify_namespace: stage8a-verify
+# Test objects end up here and are deleted for good afterwards (all versions).
+backup_s3_verify_prefix: stage8a-verify/

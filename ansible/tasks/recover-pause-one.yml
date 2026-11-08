@@ -1,0 +1,102 @@
+---
+# One workload. No loop in this file: until and register do not mix with loop.
+#
+# Why this is more than "remove automated, scale to zero" (first real run,
+# 2026-11-03): the Application is created by root and starts its first sync
+# at once. That sync (a) has to finish, because the ObjectStore of the CNPG
+# cluster lives in the same app and the database recovery needs it, and (b)
+# applies the Deployment. If the pause scales a Deployment that does not exist
+# yet ("not found" is fine), the in-flight sync creates it afterwards with
+# replicas 1, and its pod mounts the PVC that the restore wants to delete.
+# So: switch auto-sync off, let a running operation end, sync once by hand
+# when no sync ever succeeded (automated is off, nothing repeats it), and only
+# then scale to zero and wait until no pod mounts the PVC.
+- name: Wait until the Argo CD application exists
+  kubernetes.core.k8s_info:
+    api_version: argoproj.io/v1alpha1
+    kind: Application
+    namespace: argocd
+    name: "{{ target.app }}"
+  register: recover_app
+  retries: 24
+  delay: 5
+  until: recover_app.resources | default([]) | length == 1
+
+- name: Pause Argo CD auto-sync
+  when: recover_app.resources[0].spec.syncPolicy.automated is defined
+  kubernetes.core.k8s_json_patch:
+    api_version: argoproj.io/v1alpha1
+    kind: Application
+    namespace: argocd
+    name: "{{ target.app }}"
+    patch:
+      - op: remove
+        path: /spec/syncPolicy/automated
+
+# The application controller may have decided to sync a moment before it saw
+# the change. Give it that moment, then wait for the operation to end.
+- name: Let a sync that was just decided show up
+  when: (recover_settle | default(5) | int) > 0
+  ansible.builtin.wait_for:
+    timeout: "{{ recover_settle | default(5) }}"
+
+- name: Wait until a running sync operation has ended
+  ansible.builtin.include_tasks: recover-wait-op.yml
+
+- name: Read the application after its operation ended
+  kubernetes.core.k8s_info:
+    api_version: argoproj.io/v1alpha1
+    kind: Application
+    namespace: argocd
+    name: "{{ target.app }}"
+  register: recover_app_now
+
+# Without a successful sync there is no ObjectStore (the database recovery
+# waits for it) and no Deployment. Do what automated sync would have done
+# (prune, sync options and retry copied from the Application), once.
+- name: Sync once because no sync has succeeded yet
+  when: (recover_app_now.resources[0].status.operationState.phase | default('')) != 'Succeeded'
+  block:
+    - name: Build the one-off sync operation
+      ansible.builtin.set_fact:
+        recover_sync_op: >-
+          {{ {'initiatedBy': {'username': 'lab-recover'},
+              'sync': {'prune': (target.automated.prune | default(false)),
+                       'syncOptions': (recover_app_now.resources[0].spec.syncPolicy.syncOptions | default([]))}}
+             | combine({'retry': recover_app_now.resources[0].spec.syncPolicy.retry}
+                       if recover_app_now.resources[0].spec.syncPolicy.retry is defined else {}) }}
+
+    - name: Start the one-off sync
+      kubernetes.core.k8s:
+        state: patched
+        definition:
+          apiVersion: argoproj.io/v1alpha1
+          kind: Application
+          metadata:
+            name: "{{ target.app }}"
+            namespace: argocd
+          operation: "{{ recover_sync_op }}"
+
+    - name: Wait until the one-off sync has ended
+      ansible.builtin.include_tasks: recover-wait-op.yml
+
+    - name: Read the result of the one-off sync
+      kubernetes.core.k8s_info:
+        api_version: argoproj.io/v1alpha1
+        kind: Application
+        namespace: argocd
+        name: "{{ target.app }}"
+      register: recover_app_synced
+
+    - name: Stop when the one-off sync did not succeed
+      when: (recover_app_synced.resources[0].status.operationState.phase | default('')) != 'Succeeded'
+      ansible.builtin.fail:
+        msg: >-
+          The one-off sync of the Argo CD application {{ target.app }} ended with
+          {{ recover_app_synced.resources[0].status.operationState.phase | default('no result') }}:
+          {{ recover_app_synced.resources[0].status.operationState.message | default('') }}
+          Look: kubectl -n argocd describe applications.argoproj.io {{ target.app }}.
+          Fix the cause, then run: cd ansible && ansible-playbook recover-files.yml --tags pause
+
+- name: Scale the workload to zero and wait until no pod mounts the PVC
+  ansible.builtin.include_tasks: recover-quiesce-one.yml

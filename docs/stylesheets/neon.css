@@ -1,0 +1,46 @@
+/* Neon theme (cyberpunk) for the k8s-lab docs: dark purple, gradient
+   pink -> purple -> cyan. Colours only, no layout; the base is the "slate"
+   scheme from zensical.toml. */
+[data-md-color-scheme="slate"] {
+  --neon-pink: #ff2bd6;
+  --neon-purple: #9d4dff;
+  --neon-cyan: #00e5ff;
+  --neon-gradient: linear-gradient(90deg, var(--neon-pink), var(--neon-purple), var(--neon-cyan));
+  --md-hue: 270;
+  --md-default-bg-color: #0d0718;
+  --md-default-fg-color: #e9defc;
+  --md-code-bg-color: #160d2a;
+  --md-primary-fg-color: #1a0d33;
+  --md-accent-fg-color: var(--neon-pink);
+  --md-typeset-a-color: var(--neon-cyan);
+}
+
+[data-md-color-scheme="slate"] .md-header {
+  background: #12091f;
+  border-bottom: 2px solid transparent;
+  border-image: var(--neon-gradient) 1;
+  box-shadow: 0 0 18px rgb(157 77 255 / 45%);
+}
+
+[data-md-color-scheme="slate"] .md-typeset h1 {
+  background: var(--neon-gradient);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  font-weight: 700;
+}
+
+[data-md-color-scheme="slate"] .md-typeset h2 {
+  border-bottom: 1px solid rgb(157 77 255 / 50%);
+  color: var(--neon-pink);
+}
+
+[data-md-color-scheme="slate"] .md-typeset a:hover {
+  color: var(--neon-pink);
+  text-shadow: 0 0 6px rgb(255 43 214 / 60%);
+}
+
+[data-md-color-scheme="slate"] .md-typeset pre > code {
+  border-left: 3px solid var(--neon-purple);
+}
+

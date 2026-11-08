@@ -1,0 +1,53 @@
+# {{ ansible_managed }}
+# Stage 8a: rustfs (S3 backup target), rootless, systemd --user (linger).
+# Source: ansible/roles/backup_s3/templates/rustfs.container.j2,
+# Values: ansible/inventory/group_vars/all/backup_s3.yml.
+# Listens on {{ backup_s3_bind_address }}:{{ backup_s3_port }}: no waiting for a bridge at
+# boot; who may connect is decided by ufw.
+# Network at boot: ExecStartPre waits for the default route (pasta reads the
+# host network only at start); the external path is checked by rustfs-watchdog.timer.
+# Reasoning: docs/learning-path/stage-8a-backup-target.md, section "Warten auf das Netz und Watchdog".
+
+[Unit]
+Description=rustfs S3 (backup target k8s-lab)
+# After a power outage never give up (otherwise systemd stops after 5 failed starts).
+StartLimitIntervalSec=0
+
+[Container]
+ContainerName={{ backup_s3_container_name }}
+# rustfs {{ backup_s3_version }}, pinned by digest
+Image={{ backup_s3_image }}
+# The role pulls the image beforehand; at boot it is there (no network needed).
+Pull=missing
+EnvironmentFile={{ backup_s3_root_env }}
+# Wins against rustfs.env: inside the container always all addresses, port 9000.
+Environment=RUSTFS_ADDRESS=:9000
+# Container user rustfs (10001) = {{ ansible_facts['user_id'] }} on the host: files belong to {{ ansible_facts['user_id'] }}.
+UserNS=keep-id:uid=10001,gid=10001
+# U: adjust ownership once (data from before stage 8a).
+Volume={{ backup_s3_data_dir }}:/data:U
+Volume={{ backup_s3_log_dir }}:/logs:U
+PublishPort={{ backup_s3_bind_address }}:{{ backup_s3_port }}:9000
+{% if backup_s3_console_bind %}
+PublishPort={{ backup_s3_console_bind }}:{{ backup_s3_console_port }}:9001
+{% endif %}
+NoNewPrivileges=true
+DropCapability=all
+# If rustfs hangs, podman ends the container, systemd restarts it.
+HealthCmd=curl -fsS -o /dev/null http://127.0.0.1:9000/health
+HealthInterval=30s
+HealthTimeout=5s
+HealthRetries=3
+HealthStartPeriod=60s
+HealthOnFailure=kill
+
+[Service]
+Restart=always
+RestartSec=10
+# Waits up to {{ backup_s3_wait_net_timeout }} s for default route and address, then starts in any case.
+ExecStartPre={{ backup_s3_script_dir }}/rustfs-wait-net.sh {{ backup_s3_wait_net_timeout }}
+# Applies to ExecStartPre and start together.
+TimeoutStartSec={{ backup_s3_start_timeout + backup_s3_wait_net_timeout }}
+
+[Install]
+WantedBy=default.target

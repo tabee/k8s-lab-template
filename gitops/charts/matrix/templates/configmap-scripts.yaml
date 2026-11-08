@@ -1,0 +1,15 @@
+---
+# Startup scripts. Rendered from the chart files so the pod runs the same
+# bytes the offline tests import.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: matrix-scripts
+  namespace: {{ .Release.Namespace }}
+data:
+  entrypoint.py: |
+{{ .Files.Get "files/entrypoint.py" | indent 4 }}
+  ensure-admin.py: |
+{{ .Files.Get "files/ensure-admin.py" | indent 4 }}
+  check-login.py: |
+{{ .Files.Get "files/check-login.py" | indent 4 }}

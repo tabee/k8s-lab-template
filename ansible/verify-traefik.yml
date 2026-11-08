@@ -1,0 +1,310 @@
+---
+# Check stage 5 (Traefik), read only: k8s_info, HTTP requests from outside
+# (from the control machine) and a PSA test pod via server dry run (check_mode:
+# true, nothing is created).
+# Usage: ansible-playbook verify-traefik.yml
+# No /etc/hosts entry needed: the requests go to the IP, the host name
+# is in the Host header (HTTP) or comes via curl --resolve (HTTPS, SNI).
+# HTTPS needs curl on the control machine.
+
+- name: Check stage 5 Traefik
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: "{{ argocd_kubeconfig }}"
+  vars:
+    # Repetitions x pause (seconds) while waiting for sync/ready.
+    verify_retries: 30
+    verify_delay: 10
+    # Mirror of the GitOps values (gitops/apps/traefik.yaml,
+    # gitops/workloads/whoami/ingressroute.yaml); Ansible does not read gitops/.
+    verify_traefik_app: traefik
+    verify_traefik_namespace: traefik
+    verify_whoami_host: "whoami.{{ lab.domain }}"
+    # whoami runs through the admin entrypoint (admin networks only), port from
+    # gitops/platform/traefik/values.yaml (group_vars/all/traefik.yml).
+    verify_admin_port: "{{ traefik_admin_port }}"
+    verify_whoami_netpol: whoami-allow-traefik
+    # Ingress networks, as lab.yaml specifies them (edge_ingress_cidrs) and as Git holds them.
+    verify_ingress_expected: "{{ hostvars[verify_k3s_host]['firewall_ingress_cidrs'] | sort }}"
+    verify_ingress_git: "{{ traefik_values.service.spec.loadBalancerSourceRanges | default([]) | sort }}"
+    # First k3s host: its IP is the LoadBalancer address (ServiceLB).
+    verify_k3s_host: "{{ groups['k3s'] | first }}"
+    verify_lb_ip: "{{ hostvars[verify_k3s_host]['ansible_host'] }}"
+    # Ports that must be closed from outside: traefik (ping/API),
+    # 9000 (old dashboard port), metrics.
+    verify_closed_ports: [8080, 9000, 9100]
+  tasks:
+    # ---------- Argo CD ----------
+    - name: Read application traefik
+      kubernetes.core.k8s_info:
+        api_version: argoproj.io/v1alpha1
+        kind: Application
+        namespace: "{{ argocd_namespace }}"
+        name: "{{ verify_traefik_app }}"
+      register: verify_app
+      until: >-
+        verify_app.resources | length == 1 and
+        (verify_app.resources | first).status.sync.status | default('') == 'Synced' and
+        (verify_app.resources | first).status.health.status | default('') == 'Healthy'
+      retries: "{{ verify_retries }}"
+      delay: "{{ verify_delay }}"
+
+    - name: Traefik is Synced, Healthy and in project platform
+      ansible.builtin.assert:
+        that:
+          - verify_app_obj.status.sync.status == 'Synced'
+          - verify_app_obj.status.health.status == 'Healthy'
+          - verify_app_obj.spec.project == argocd_platform_project
+        fail_msg: "Application {{ verify_traefik_app }} not Synced/Healthy or wrong project"
+        quiet: true
+      vars:
+        verify_app_obj: "{{ verify_app.resources | first }}"
+
+    # ---------- Namespace and pod ----------
+    - name: Read namespace traefik
+      kubernetes.core.k8s_info:
+        kind: Namespace
+        name: "{{ verify_traefik_namespace }}"
+      register: verify_ns
+
+    - name: Namespace traefik enforces PSA restricted
+      ansible.builtin.assert:
+        that:
+          - verify_ns.resources | length == 1
+          - verify_ns_labels['pod-security.kubernetes.io/enforce'] | default('') == 'restricted'
+          - verify_ns_labels['pod-security.kubernetes.io/audit'] | default('') == 'restricted'
+          - verify_ns_labels['pod-security.kubernetes.io/warn'] | default('') == 'restricted'
+        fail_msg: "Namespace {{ verify_traefik_namespace }} is missing or does not have enforce/audit/warn=restricted"
+        quiet: true
+      vars:
+        verify_ns_labels: "{{ (verify_ns.resources | first).metadata.labels | default({}) }}"
+
+    - name: Read Traefik pods
+      kubernetes.core.k8s_info:
+        kind: Pod
+        namespace: "{{ verify_traefik_namespace }}"
+        label_selectors:
+          - app.kubernetes.io/name=traefik
+        field_selectors:
+          - status.phase=Running
+      register: verify_pods
+      until:
+        - verify_pods.resources | length > 0
+        - verify_pods_cs | select('equalto', []) | list | length == 0
+        - verify_pods_cs | flatten | rejectattr('ready') | list | length == 0
+      retries: "{{ verify_retries }}"
+      delay: "{{ verify_delay }}"
+      vars:
+        verify_pods_cs: "{{ verify_pods.resources | map(attribute='status.containerStatuses', default=[]) | list }}"
+
+    # Dashboard off: the argument comes from values.yaml (api.dashboard: false).
+    - name: Traefik pod is Ready and without dashboard
+      ansible.builtin.assert:
+        that:
+          - verify_pods.resources | length == 1
+          - "'--api.dashboard=false' in verify_args"
+          - verify_args | select('search', '^--api.insecure') | list | length == 0
+        fail_msg: "Traefik-Pod not Ready or dashboard/insecure API active"
+        success_msg: "Ready: {{ verify_pods.resources | map(attribute='metadata.name') | join(', ') }}"
+      vars:
+        verify_args: "{{ (verify_pods.resources | first).spec.containers[0].args | default([]) }}"
+
+    # ---------- Image pin (issue #10) ----------
+    # Argo CD cannot read Ansible variables, so the pin is compared three ways: values.yaml
+    # (digest) against the Deployment, the Deployment's chart label against the chart version
+    # in the live Application, and the digest that really runs against the pin.
+    - name: Read the Deployment traefik
+      kubernetes.core.k8s_info:
+        kind: Deployment
+        namespace: "{{ verify_traefik_namespace }}"
+        name: traefik
+      register: verify_traefik_deploy
+
+    - name: The running Traefik is the pinned digest of the pinned chart version
+      ansible.builtin.assert:
+        that:
+          - verify_traefik_deploy.resources | length == 1
+          - traefik_values.image.digest | default('') is match('^sha256:[a-f0-9]{64}$')
+          - traefik_values.versionOverride | default('') | length > 0
+          - verify_traefik_image == 'docker.io/traefik@' ~ traefik_values.image.digest
+          - verify_traefik_chart_label == 'traefik-' ~ verify_traefik_chart_rev
+          - verify_traefik_pods_image_ids | select('search', traefik_values.image.digest) | list | length == verify_pods.resources | length
+        fail_msg: >-
+          Traefik pin drift: Deployment image {{ verify_traefik_image | default('?') }},
+          chart label {{ verify_traefik_chart_label | default('?') }}, chart revision in the Application
+          {{ verify_traefik_chart_rev | default('?') }}, digest in values.yaml
+          {{ traefik_values.image.digest | default('(missing)') }}. Fix values.yaml and
+          gitops/apps/traefik.yaml together (comment at the top of values.yaml).
+        success_msg: >-
+          Traefik pin ok: {{ traefik_values.image.digest | default('') }}
+          ({{ traefik_values.versionOverride | default('') }}, chart {{ verify_traefik_chart_rev | default('') }})
+      vars:
+        verify_traefik_dep: "{{ verify_traefik_deploy.resources | first | default({}) }}"
+        verify_traefik_image: "{{ (verify_traefik_dep.spec.template.spec.containers | default([{}]) | first).image | default('') }}"
+        verify_traefik_chart_label: "{{ (verify_traefik_dep.metadata.labels | default({}))['helm.sh/chart'] | default('') }}"
+        verify_traefik_chart_rev: >-
+          {{ (verify_app_obj.spec.sources | default([]) | selectattr('chart', 'defined')
+          | selectattr('chart', 'equalto', 'traefik') | map(attribute='targetRevision') | list | first) | default('') }}
+        verify_app_obj: "{{ verify_app.resources | first }}"
+        verify_traefik_pods_image_ids: >-
+          {{ verify_pods.resources | map(attribute='status.containerStatuses') | flatten | map(attribute='imageID', default='') | list }}
+
+    # ---------- Service ----------
+    - name: Read service traefik
+      kubernetes.core.k8s_info:
+        kind: Service
+        namespace: "{{ verify_traefik_namespace }}"
+        name: traefik
+      register: verify_svc
+      until: >-
+        verify_svc.resources | length == 1 and
+        (verify_svc.resources | first).status.loadBalancer.ingress | default([]) | length > 0
+      retries: "{{ verify_retries }}"
+      delay: "{{ verify_delay }}"
+
+    # The source of the networks is edge_ingress_cidrs in lab.yaml (resolved to
+    # firewall_ingress_cidrs). "lab.sh customize" writes them into values.yaml (Git),
+    # Argo CD into the service. Drift at any of the three places fails here.
+    - name: Drift check 1, Git (values.yaml) matches lab.yaml
+      ansible.builtin.assert:
+        that: verify_ingress_git == verify_ingress_expected
+        fail_msg: >-
+          values.yaml (Git) has loadBalancerSourceRanges {{ verify_ingress_git }}, lab.yaml
+          says {{ verify_ingress_expected }}. Fix: bash scripts/lab.sh customize, commit, push.
+        quiet: true
+
+    - name: Service is limited to ingress networks, ports 80/443/admin and no NodePorts
+      ansible.builtin.assert:
+        that:
+          - verify_svc_spec.type == 'LoadBalancer'
+          - verify_svc_spec.loadBalancerSourceRanges | default([]) | sort == verify_ingress_expected
+          - verify_svc_spec.allocateLoadBalancerNodePorts | default(true) == false
+          - verify_svc_spec.externalTrafficPolicy | default('') == 'Cluster'
+          - verify_svc_spec.ports | map(attribute='port') | map('int') | sort == ([80, 443, verify_admin_port | int] | sort)
+          - verify_svc_spec.ports | selectattr('nodePort', 'defined') | list | length == 0
+          - verify_lb_ip in (verify_svc_status.loadBalancer.ingress | map(attribute='ip') | list)
+        fail_msg: >-
+          Service traefik: type, loadBalancerSourceRanges (drift check 2: service against lab.yaml),
+          Ports, NodePorts or LB IP do not match. Argo CD synced already?
+        quiet: true
+      vars:
+        verify_svc_spec: "{{ (verify_svc.resources | first).spec }}"
+        verify_svc_status: "{{ (verify_svc.resources | first).status }}"
+
+    # ---------- whoami is reachable only for Traefik ----------
+    - name: Read NetworkPolicies in namespace whoami
+      kubernetes.core.k8s_info:
+        api_version: networking.k8s.io/v1
+        kind: NetworkPolicy
+        namespace: whoami
+      register: verify_whoami_netpols
+
+    - name: In front of whoami stands only its own NetworkPolicy (Traefik only, port 8080 only)
+      ansible.builtin.assert:
+        that:
+          - verify_whoami_netpols.resources | map(attribute='metadata.name') | list == [verify_whoami_netpol]
+          - verify_whoami_np.spec.policyTypes == ['Ingress']
+          - verify_whoami_np.spec.ingress | length == 1
+          - verify_whoami_np.spec.ingress[0].ports | map(attribute='port') | list == [8080]
+          - verify_whoami_np.spec.ingress[0].from[0].podSelector.matchLabels['app.kubernetes.io/name'] == 'traefik'
+        fail_msg: >-
+          whoami: expects only {{ verify_whoami_netpol }} (ingress from Traefik, port 8080),
+          found: {{ verify_whoami_netpols.resources | map(attribute='metadata.name') | list }}
+        quiet: true
+      vars:
+        verify_whoami_np: "{{ verify_whoami_netpols.resources | first }}"
+
+    # ---------- From outside (control machine) ----------
+    - name: Query HTTP on port 80
+      ansible.builtin.uri:
+        url: "http://{{ verify_lb_ip }}/"
+        headers:
+          Host: "{{ verify_whoami_host }}"
+        follow_redirects: none
+        status_code: [301, 308]
+      register: verify_http
+      until: verify_http is not failed
+      retries: "{{ verify_retries }}"
+      delay: "{{ verify_delay }}"
+
+    - name: Port 80 redirects permanently to HTTPS
+      ansible.builtin.assert:
+        that: verify_http.location | default('') is match('https://')
+        fail_msg: "No redirect to https:// (Location: {{ verify_http.location | default('-') }})"
+        quiet: true
+
+    # Since stage 6 (sniStrict) the handshake needs the right SNI name;
+    # only curl --resolve sends it to the LB IP (uri cannot do that).
+    # --insecure: what is checked here is routing and headers; the certificate chain
+    # is checked by verify-certmanager.yml against the lab CA.
+    - name: Query whoami over HTTPS (admin port)  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        argv:
+          - curl
+          - --silent
+          - --show-error
+          - --insecure
+          - --include
+          - --max-time
+          - "10"
+          - --resolve
+          - "{{ verify_whoami_host }}:{{ verify_admin_port }}:{{ verify_lb_ip }}"
+          - "https://{{ verify_whoami_host }}:{{ verify_admin_port }}/"
+      register: verify_https
+      changed_when: false
+      check_mode: false
+      until: verify_https.rc == 0 and verify_https.stdout is search('^HTTP/\\S+ 200', multiline=true)
+      retries: "{{ verify_retries }}"
+      delay: "{{ verify_delay }}"
+
+    - name: Answer comes from whoami and carries the security headers
+      ansible.builtin.assert:
+        that:
+          - verify_https.stdout is search('Hostname:')
+          - verify_https.stdout is search('^strict-transport-security:[ ]*max-age=[1-9]', multiline=true, ignorecase=true)
+          - verify_https.stdout is search('^x-content-type-options:[ ]*nosniff', multiline=true, ignorecase=true)
+          - verify_https.stdout is search('^x-frame-options:[ ]*DENY', multiline=true, ignorecase=true)
+          - verify_https.stdout is search('^referrer-policy:[ ]*no-referrer', multiline=true, ignorecase=true)
+          - verify_https.stdout is not search('^server:', multiline=true, ignorecase=true)
+        fail_msg: "Answer without whoami content or security headers are missing (HSTS, nosniff, DENY, Referrer, Server)"
+        quiet: true
+
+    # state: stopped = connection setup must fail (rejected or dropped).
+    - name: Dashboard, ping and metrics ports are closed from outside
+      ansible.builtin.wait_for:
+        host: "{{ verify_lb_ip }}"
+        port: "{{ item }}"
+        state: stopped
+        connect_timeout: 3
+        timeout: 10
+        msg: "Port {{ item }} on {{ verify_lb_ip }} is reachable from outside"
+      loop: "{{ verify_closed_ports }}"
+
+    # ---------- PSA proof ----------
+    - name: Send PSA probe via server dry run
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: psa-probe
+            namespace: "{{ verify_traefik_namespace }}"
+          spec:
+            containers:
+              - name: probe
+                image: "{{ lab_probe_image }}"
+                securityContext:
+                  privileged: true
+      check_mode: true
+      register: verify_psa_probe
+      ignore_errors: true  # the assert reads failed and msg; failed_when: false resets them (ansible-core 2.19+)
+
+    - name: PSA rejects insecure pods in namespace traefik
+      ansible.builtin.assert:
+        that: verify_psa_probe.msg | default('') is search('violates PodSecurity')
+        fail_msg: "Namespace {{ verify_traefik_namespace }}: test pod was NOT rejected by PSA"
+        quiet: true

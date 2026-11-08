@@ -1,0 +1,15 @@
+# {{ ansible_managed }}
+# Issue #3: mirror of the rustfs data to the replica (oneshot, from the timer).
+# Source: ansible/roles/backup_replica/templates/replica-mirror.service.j2
+# Values: ansible/inventory/group_vars/all/backup_replica.yml (backup_replica_*).
+
+[Unit]
+Description=Mirror of the rustfs backup data to the replica
+
+[Service]
+Type=oneshot
+# One run at a time (the daily checksum run takes the same lock, so they never overlap).
+ExecStart=/usr/bin/flock -w 60 %t/{{ backup_replica_unit_prefix }}.lock {{ ansible_playbook_python }} {{ backup_replica_script }} mirror --config {{ backup_replica_config }}
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=3600

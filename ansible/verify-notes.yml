@@ -1,0 +1,77 @@
+---
+# Check sidequest notes, read only: per entry in gitops/sites.yaml
+# application, pod, login proxy, certificate, NetworkPolicy, login, knowledge graph and
+# that AGENTS.md is missing. HTTPS via curl --cacert (lab CA) with --resolve, no
+# /etc/hosts entry needed.
+# Login depends on auth in gitops/sites.yaml:
+#   sso (default): without session 302 to Keycloak; with an account a real login,
+#     the pages with the session, logout (session really over).
+#   basic: 401 without, 200 with password.
+# Usage: ansible-playbook verify-notes.yml
+#   only one site: ansible-playbook verify-notes.yml -e verify_notes_only=notes2
+#   with login (sso): NOTES_SSO_PASSWORD=... ansible-playbook verify-notes.yml -e verify_notes_sso_user=NAME
+#     (NAME = account in the group lab-users; the password never appears in the output)
+# basic: the playbook reads the password from the file (notes_password_dir) and gives
+# it to curl via stdin; it never appears in the output (no_log).
+# Runbook: docs/how-to/notes-sites.md
+
+- name: Check notes sites
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: "{{ argocd_kubeconfig }}"
+  vars:
+    verify_retries: 30
+    verify_delay: 10
+    # Mirror of the chart values (gitops/charts/notes-site).
+    verify_notes_cert: notes
+    verify_notes_netpol: notes-allow-traefik
+    # Egress policy (wave 2, issue #5), gitops/charts/notes-site/templates/networkpolicy.yaml.
+    verify_notes_netpol_egress: notes-allow-egress
+    # Only with auth sso (login proxy), same file.
+    verify_notes_netpol_proxy: notes-allow-proxy
+    verify_notes_netpol_proxy_egress: notes-oauth2-proxy-allow-egress
+    verify_notes_graph_path: /wissensgraph/
+    verify_notes_only: ""
+    verify_notes_all: "{{ lookup('ansible.builtin.file', notes_sites_file) | from_yaml | default([], true) }}"
+    verify_notes_sites: >-
+      {{ verify_notes_all | selectattr('name', 'equalto', verify_notes_only) | list
+         if verify_notes_only else verify_notes_all }}
+    verify_k3s_host: "{{ groups['k3s'] | first }}"
+    verify_lb_ip: "{{ hostvars[verify_k3s_host]['ansible_host'] }}"
+  tasks:
+    - name: Unknown site for verify_notes_only
+      ansible.builtin.assert:
+        that: verify_notes_sites | length > 0
+        fail_msg: "verify_notes_only={{ verify_notes_only }} is not in {{ notes_sites_file }}"
+        quiet: true
+      when: verify_notes_only | length > 0
+
+    - name: Empty list is not an error
+      ansible.builtin.debug:
+        msg: "No notes sites in {{ notes_sites_file }} entered: nothing to check."
+      when: verify_notes_sites | length == 0
+
+    - name: End play if no site is entered
+      ansible.builtin.meta: end_play
+      when: verify_notes_sites | length == 0
+
+    - name: Find public CA certificate
+      ansible.builtin.stat:
+        path: "{{ lab_ca_cert_path | expanduser }}"
+      register: verify_ca_crt
+
+    - name: Public CA certificate is present
+      ansible.builtin.assert:
+        that: verify_ca_crt.stat.exists
+        fail_msg: "{{ lab_ca_cert_path }} is missing: run ansible-playbook argocd.yml first"
+        quiet: true
+
+    - name: Check every site
+      ansible.builtin.include_tasks: tasks/verify-notes-site.yml
+      loop: "{{ verify_notes_sites }}"
+      loop_control:
+        loop_var: verify_site
+        label: "{{ verify_site.name }}"

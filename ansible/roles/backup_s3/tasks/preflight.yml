@@ -1,0 +1,85 @@
+---
+- name: Runs locally as a normal user (rootless podman)
+  ansible.builtin.assert:
+    that:
+      - ansible_connection == 'local'
+      - ansible_facts['user_uid'] | int != 0
+      - backup_s3_home == ansible_facts['user_dir']
+    fail_msg: >-
+      backup_s3 runs only locally (ansible_connection: local) as the owner, not
+      as root and not with sudo ansible-playbook. HOME={{ backup_s3_home }},
+      user home={{ ansible_facts['user_dir'] }}.
+    quiet: true
+
+- name: Read Podman version
+  ansible.builtin.command: podman version --format "{{ '{{' }}.Client.Version{{ '}}' }}"
+  register: backup_s3_podman_version
+  changed_when: false
+  check_mode: false
+
+- name: Podman is new enough (HealthOnFailure, keep-id with uid)
+  ansible.builtin.assert:
+    that:
+      - backup_s3_podman_version.stdout is version(backup_s3_podman_min_version, '>=')
+    fail_msg: "podman {{ backup_s3_podman_version.stdout }} is too old, at least {{ backup_s3_podman_min_version }}."
+    quiet: true
+
+- name: Quadlet generator is present
+  ansible.builtin.stat:
+    path: "{{ backup_s3_quadlet_bin }}"
+  register: backup_s3_quadlet_stat
+
+- name: Quadlet generator found
+  ansible.builtin.assert:
+    that:
+      - backup_s3_quadlet_stat.stat.exists
+    fail_msg: "{{ backup_s3_quadlet_bin }} is missing (package podman?). Adjust the path in backup_s3_quadlet_bin."
+    quiet: true
+
+- name: Assemble sources for ufw (lab networks + WireGuard)
+  ansible.builtin.set_fact:
+    backup_s3_ufw_rules: >-
+      {{ backup_s3_ufw_sources
+         + (backup_s3_wireguard_cidrs
+            | map('community.general.dict_kv', 'cidr')
+            | map('combine', {'name': 'WireGuard', 'interface': backup_s3_wireguard_interface, 'state': 'present'})
+            | list) }}
+
+- name: Sources are valid networks
+  ansible.builtin.assert:
+    that:
+      - item.cidr is match('^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$')
+      - item.state | default('present') in ['present', 'absent']
+      - item.state | default('present') == 'absent' or item.cidr not in backup_s3_ufw_purge_cidrs
+      - "not ((backup_s3_ufw_comment ~ ': ' ~ item.name) is search(backup_s3_ufw_purge_comment_regex))"
+    fail_msg: >-
+      ufw source {{ item.name }}: cidr {{ item.cidr }} (IPv4/network) or state invalid,
+      or the source matches backup_s3_ufw_purge_cidrs / _comment_regex.
+    quiet: true
+  loop: "{{ backup_s3_ufw_rules }}"
+  loop_control:
+    label: "{{ item.name }} {{ item.cidr }}"
+
+- name: Check ufw is installed
+  ansible.builtin.stat:
+    path: /usr/sbin/ufw
+  register: backup_s3_ufw_bin
+
+- name: Read ufw status (sudo)
+  ansible.builtin.command: /usr/sbin/ufw status
+  become: true
+  register: backup_s3_ufw_status
+  changed_when: false
+  check_mode: false
+  when: backup_s3_ufw_bin.stat.exists
+
+- name: Check ufw is active (otherwise the S3 port would be open on the LAN)
+  ansible.builtin.assert:
+    that:
+      - backup_s3_ufw_bin.stat.exists
+      - "'Status: active' in backup_s3_ufw_status.stdout"
+    fail_msg: >-
+      ufw is missing or not active. rustfs now listens on {{ backup_s3_bind_address }},
+      without ufw this would be open to the whole LAN. Nothing changed. Enable:
+      docs/learning-path/stage-8a-backup-target.md, section "ufw einschalten".
+    quiet: true

@@ -1,0 +1,60 @@
+---
+# Local checks before commit and push (docs/how-to/security-scan.md). Optional but recommended:
+#   pipx install pre-commit   (not part of ci/requirements-security.txt: the CI does not need it)
+#   pre-commit install --install-hooks --hook-type pre-commit --hook-type pre-push
+# Only local hooks that call the same pinned tools as the CI (bash scripts/install-security-tools.sh); no third-party
+# hook repositories, so there is nothing to pin and nothing to trust besides the tools themselves.
+# A missing tool is a visible failure with the install hint, never a silent green.
+default_install_hook_types: [pre-commit, pre-push]
+repos:
+  - repo: local
+    hooks:
+      - id: gitleaks-staged
+        name: gitleaks (staged changes, values redacted)
+        description: Secrets in what is about to be committed
+        entry: >-
+          bash -c 'command -v gitleaks > /dev/null || { echo "gitleaks is missing: bash scripts/install-security-tools.sh" >&2; exit 1; }; exec gitleaks git --pre-commit --staged --redact --no-banner --no-color --verbose --ignore-gitleaks-allow --config .gitleaks.toml'
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]
+      # The rules (config, excluded files, severity) live in scripts/ci-lint.sh, the same as in the CI.
+      - id: yamllint
+        name: yamllint (scripts/ci-lint.sh yaml)
+        entry: bash scripts/ci-lint.sh yaml
+        language: system
+        pass_filenames: false
+        files: \.ya?ml$
+        stages: [pre-commit]
+      - id: shellcheck
+        name: shellcheck (scripts/ci-lint.sh shell)
+        entry: bash scripts/ci-lint.sh shell
+        language: system
+        pass_filenames: false
+        files: \.sh$
+        stages: [pre-commit]
+      - id: actionlint
+        name: actionlint (workflow files)
+        entry: >-
+          bash -c 'command -v actionlint > /dev/null || { echo "actionlint is missing: bash scripts/install-security-tools.sh" >&2; exit 1; }; exec actionlint -color=false "$@"' --
+        language: system
+        files: ^\.(github|gitea)/workflows/.*\.ya?ml$
+        stages: [pre-commit]
+      - id: tree-and-pii
+        name: public tree check and personal-data rules (public clone only)
+        description: In the private repository the real domain is allowed, there the export runs these checks.
+        entry: >-
+          bash -c '[ -f scripts/public/lab-public.py ] && exit 0; exec bash scripts/security-scan.sh tree pii'
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+      - id: commit-identity
+        name: no personal e-mail address in the pushed commits (public clone only)
+        description: A commit address is public with the repository and cannot be removed afterwards.
+        entry: >-
+          bash -c '[ -f scripts/public/lab-public.py ] && exit 0; exec bash scripts/security/check-commit-identity.sh "${PRE_COMMIT_FROM_REF:-HEAD~1}..${PRE_COMMIT_TO_REF:-HEAD}"'
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]

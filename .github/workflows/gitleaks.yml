@@ -1,0 +1,49 @@
+---
+# Secret scan over the whole Git history with gitleaks (docs: docs/how-to/secret-scan.md).
+# This is the ONLY place for the gitleaks version: tag AND digest of the
+# container image are in the line "image:" below. scripts/gitleaks-local.sh
+# reads the line from here. New version: replace tag and digest here together.
+# The scan options are only in scripts/gitleaks-local.sh (--direct).
+#
+# No actions/checkout and no gitleaks-action: the gitleaks image has no
+# Node.js, so the first step fetches the history itself with git.
+"on":
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    # act_runner would otherwise use "sh -e"; the image brings bash.
+    shell: bash
+
+jobs:
+  gitleaks:
+    name: Secret scan (full history)
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/gitleaks/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
+    steps:
+      - name: Fetch the repository with full history
+        env:
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}.git
+          REPO_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          auth=$(printf 'x-access-token:%s' "$REPO_TOKEN" | base64 | tr -d '\n')
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0=http.extraHeader
+          export GIT_CONFIG_VALUE_0="Authorization: Basic $auth"
+          git init --quiet .
+          git remote add origin "$REPO_URL"
+          git fetch --quiet origin '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*' '+refs/pull/*/head:refs/remotes/pull/*'
+          git checkout --quiet --detach "$GITHUB_SHA"
+          echo "Commits in the history: $(git rev-list --all --count)"
+
+      - name: gitleaks (history, values redacted)
+        run: bash scripts/gitleaks-local.sh --direct

@@ -1,0 +1,52 @@
+---
+# The runner's identity. It may only manage job pods in gitea-runner-jobs (the verbs of the upstream example
+# examples/kubernetes/kubernetes-pods.yaml of gitea/runner 5.4.1). No ClusterRole, no rights in its own
+# namespace: a stolen runner token cannot read the registration secret through the API, and a pod it creates
+# lands in a namespace with PSA restricted, a quota and no way to the API server.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gitea-runner
+  namespace: gitea-runner
+---
+# The default service account of the job namespace gets no token either (a job pod could ask for one).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: default
+  namespace: gitea-runner-jobs
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: gitea-runner
+  namespace: gitea-runner-jobs
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "get", "list", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create", "get"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  # Only for service containers (env values); no get/list, so the runner cannot read other secrets.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gitea-runner
+  namespace: gitea-runner-jobs
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: gitea-runner
+subjects:
+  - kind: ServiceAccount
+    name: gitea-runner
+    namespace: gitea-runner

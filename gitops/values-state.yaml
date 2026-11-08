@@ -1,0 +1,11 @@
+# Maintained by "bash scripts/lab.sh customize", do not edit by hand.
+# These values are currently hard-coded in gitops/ and zensical.toml (Argo CD only reads Git).
+# Source of the values: infra/envs/local/lab.yaml and lab.local.yaml. If a value there
+# differs, "customize" writes it into the files and in here. Then commit and push.
+domain: lab.example
+repo_url: ssh://git@github.com/YOUR-NAME/k8s-lab.git
+gateway: 192.168.122.1
+vm_cidr: 192.168.122.0/24
+vm_ip: 192.168.122.50
+edge_ingress_cidrs: 192.168.122.0/24
+secrets_repo_url: ssh://git@git.example.org/YOUR-NAME/k8s-lab-secrets.git

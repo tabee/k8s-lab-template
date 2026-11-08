@@ -1,0 +1,91 @@
+---
+# Values for the cert-manager chart (version only in gitops/apps/cert-manager.yaml).
+# Guideline: as little as possible, everything unnecessary off.
+# The chart defaults are already PSA-restricted-capable (runAsNonRoot,
+# seccomp RuntimeDefault, drop ALL, readOnlyRootFilesystem); they are listed here
+# nevertheless explicit, so that a chart update does not change them silently.
+
+crds:
+  # CRDs come with the chart (one source, same version as the pods).
+  enabled: true
+  # Chart sets helm.sh/resource-policy: keep; Argo CD turns that into
+  # Delete=false: deleting the application deletes the CRDs (and thus all
+  # Certificates/Issuers in the cluster) NOT.
+  keep: true
+
+global:
+  # Default would be kube-system (role/rolebinding there). The project platform
+  # may not go to kube-system, and it does not belong there either.
+  leaderElection:
+    namespace: cert-manager
+  revisionHistoryLimit: 3
+
+# No Prometheus annotations/ServiceMonitor: there is (still) no monitoring.
+prometheus:
+  enabled: false
+
+# No Helm hook job: Argo CD would restart it on every sync (own
+# ServiceAccount, Role, Job). Whether the API is ready is shown by the health checks
+# of Argo CD and ansible/verify-certmanager.yml.
+startupapicheck:
+  enabled: false
+
+# ingress-shim off: otherwise any Ingress annotation in any namespace can
+# order certificates from the ClusterIssuer. Certificates exist only via
+# explicit Certificate objects in Git.
+extraArgs:
+  - --controllers=*,-ingress-shim
+
+# Certificate secrets stay when a Certificate is deleted (no
+# outage if CRDs or Certificates disappear by mistake).
+enableCertificateOwnerRef: false
+
+securityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: [ALL]
+  readOnlyRootFilesystem: true
+
+# Requests for scheduling, memory limit against leaks. No CPU limit
+# (throttling brings nothing in the lab, same line as Traefik).
+resources:
+  requests: { cpu: 10m, memory: 64Mi }
+  limits: { memory: 64Mi }  # lab-limit: cert-manager/cert-manager/cert-manager-controller
+
+webhook:
+  # Port 10250 in the pod (chart default, no hostNetwork). The API server
+  # calls it via the service; networkpolicy.yaml allows exactly that.
+  securePort: 10250
+  hostNetwork: false
+  securityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop: [ALL]
+    readOnlyRootFilesystem: true
+  resources:
+    requests: { cpu: 10m, memory: 32Mi }
+    limits: { memory: 64Mi }  # lab-limit: cert-manager/cert-manager-webhook/cert-manager-webhook
+
+cainjector:
+  # Needed: puts the CA bundle of the webhook into the webhook configurations.
+  enabled: true
+  securityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop: [ALL]
+    readOnlyRootFilesystem: true
+  resources:
+    requests: { cpu: 10m, memory: 64Mi }
+    limits: { memory: 64Mi }  # lab-limit: cert-manager/cert-manager-cainjector/cert-manager-cainjector

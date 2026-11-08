@@ -1,0 +1,17 @@
+---
+# Public probe (issue #7, optional): second ClusterIssuer lab-acme (ACME DNS-01) and
+# a certificate for a name OUTSIDE the lab domain. Without the four acme_* values in
+# lab.local.yaml a SKIP without change. Runs on the control machine against the k8s API.
+# Prerequisite: argocd.yml has run and the applications cert-manager and traefik are
+# in sync (lab.sh up calls the playbook afterwards). Check: ansible-playbook verify-public.yml
+# Runbook: docs/how-to/public-certificate.md.
+
+- name: Set up public probe (optional)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: "{{ argocd_kubeconfig }}"
+  roles:
+    - role: lab_acme

@@ -1,0 +1,13 @@
+{{- include "notes.check" . }}
+---
+# Build tools from this repo: build.sh and requirements.txt are symlinks
+# to docs/ (same pins as the docs site, one place), notes-prepare.py
+# prepares the working copy. Change = new pod (checksum in the deployment).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: notes-build
+  labels:
+    {{- include "notes.labels" . | nindent 4 }}
+data:
+  {{- (.Files.Glob "files/*").AsConfig | nindent 2 }}

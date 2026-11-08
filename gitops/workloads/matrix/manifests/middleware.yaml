@@ -1,0 +1,16 @@
+---
+# Keeps /_synapse/admin away from the network (see ingressroute.yaml). The allow list holds one address from the
+# documentation range of RFC 5737 (TEST-NET-1), which is never routed and never a client or node address: every request
+# gets 403. 127.0.0.1 would not do, a kubectl port-forward into the Traefik pod arrives from there.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: deny-admin-api
+  namespace: matrix
+  annotations:
+    # CRD comes only with the app traefik (retry in apps/matrix.yaml).
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+spec:
+  ipAllowList:
+    sourceRange:
+      - 192.0.2.1/32

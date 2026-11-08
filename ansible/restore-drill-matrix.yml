@@ -1,0 +1,668 @@
+---
+# Restore drill for Matrix. Imported by restore-drill.yml after the Gitea play.
+# Proves that Synapse comes back from the CNPG archive and the K8up snapshot
+# alone: user count, admin count, signing-key checksum and a marker file.
+# The checksum is compared inside a short-lived pod and never printed.
+# A Synapse process in the throwaway namespace then logs in as the admin.
+# Nothing of the live namespace is deleted. The marker files are written on
+# the live volume before the fresh backup; that is the only live mutation.
+#
+# Values: group_vars/all/restore_drill.yml. Names: gitops/workloads/matrix.
+
+- name: Restore drill (Matrix from backup only)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: "{{ argocd_kubeconfig }}"
+  vars:
+    mx_repo: "{{ playbook_dir }}/.."
+    mx_mf: "{{ mx_repo }}/gitops/workloads/matrix/manifests"
+    mx_chart: "{{ mx_repo }}/gitops/charts/matrix"
+    mx_m_cluster: "{{ lookup('ansible.builtin.file', mx_mf ~ '/cluster.yaml') | from_yaml }}"
+    mx_m_os: "{{ lookup('ansible.builtin.file', mx_mf ~ '/objectstore.yaml') | from_yaml }}"
+    mx_m_sched: "{{ lookup('ansible.builtin.file', mx_mf ~ '/k8up-schedule.yaml') | from_yaml }}"
+    mx_m_podcfg: "{{ lookup('ansible.builtin.file', mx_mf ~ '/k8up-podconfig.yaml') | from_yaml }}"
+    mx_m_nsm: "{{ lookup('ansible.builtin.file', mx_mf ~ '/namespace.yaml') | from_yaml }}"
+    mx_m_pvc: "{{ lookup('ansible.builtin.file', mx_mf ~ '/pvc.yaml') | from_yaml }}"
+    mx_m_syn: "{{ lookup('ansible.builtin.file', mx_chart ~ '/templates/deployment-synapse.yaml') | from_yaml }}"
+    mx_ns: "{{ mx_m_cluster.metadata.namespace }}"
+    mx_cluster: "{{ mx_m_cluster.metadata.name }}"
+    mx_boot: "{{ mx_m_cluster.spec.bootstrap.initdb | default(mx_m_cluster.spec.bootstrap.recovery) }}"
+    mx_db: "{{ mx_boot.database }}"
+    mx_owner: "{{ mx_boot.owner }}"
+    mx_owner_secret: "{{ mx_boot.secret.name }}"
+    mx_server: "{{ (mx_m_cluster.spec.plugins | first).parameters.serverName }}"
+    mx_os_name: "{{ mx_m_os.metadata.name }}"
+    mx_s3: "{{ mx_m_sched.spec.backend.s3 }}"
+    mx_dns: "{{ mx_ns }}{{ restore_drill_ns_suffix }}"
+    mx_drill_cluster: "{{ mx_cluster }}-drill"
+    mx_db_host: "{{ mx_drill_cluster }}-rw.{{ mx_dns }}.svc"
+    mx_psql: "psql -XAtq -v ON_ERROR_STOP=1 -d {{ mx_db }} -c"
+    mx_sql: >-
+      SELECT count(*)::text || '|' || count(*) FILTER (WHERE admin <> 0)::text FROM users
+  tasks:
+    - name: Set the run ID and the start time
+      ansible.builtin.set_fact:
+        mx_run: "r{{ lookup('ansible.builtin.pipe', 'date -u +%Y%m%d%H%M%S') }}"
+        mx_t_start: "{{ lookup('ansible.builtin.pipe', 'date +%s') | int }}"
+
+    - name: Names of the Secrets and ConfigMaps the throwaway Synapse needs
+      ansible.builtin.set_fact:
+        mx_secrets: >-
+          {{
+            [
+              mx_m_os.spec.configuration.s3Credentials.accessKeyId.name,
+              mx_owner_secret,
+              mx_s3.accessKeyIDSecretRef.name,
+              mx_m_sched.spec.backend.repoPasswordSecretRef.name
+            ]
+            + (
+              mx_m_syn.spec.template.spec.volumes
+              | selectattr('secret', 'defined')
+              | map(attribute='secret.secretName')
+              | list
+            )
+          }}
+        mx_configmaps: >-
+          {{
+            mx_m_syn.spec.template.spec.volumes
+            | selectattr('configMap', 'defined')
+            | map(attribute='configMap.name')
+            | list
+          }}
+
+    - name: Read the live cluster
+      kubernetes.core.k8s_info:
+        api_version: postgresql.cnpg.io/v1
+        kind: Cluster
+        namespace: "{{ mx_ns }}"
+        name: "{{ mx_cluster }}"
+      register: mx_cl
+
+    - name: Live cluster is healthy
+      ansible.builtin.assert:
+        that:
+          - mx_cl.resources | length == 1
+          - (mx_cl.resources | first).status.phase | default('') == 'Cluster in healthy state'
+        fail_msg: "{{ mx_ns }}/{{ mx_cluster }} is not healthy."
+        quiet: true
+
+    - name: Remember the live primary and the Synapse pod
+      ansible.builtin.set_fact:
+        mx_primary: "{{ (mx_cl.resources | first).status.currentPrimary }}"
+
+    - name: Find the Synapse pod
+      kubernetes.core.k8s_info:
+        kind: Pod
+        namespace: "{{ mx_ns }}"
+        label_selectors:
+          - app.kubernetes.io/name=synapse
+      register: mx_pods
+
+    - name: Remember the running Synapse pod
+      ansible.builtin.set_fact:
+        mx_pod: "{{ (mx_pods.resources | selectattr('status.phase', 'equalto', 'Running') | first).metadata.name }}"
+
+    - name: Check that rustfs answers
+      ansible.builtin.uri:
+        url: "{{ backup_s3_probe_url }}"
+        timeout: 10
+        return_content: false
+      register: mx_probe
+      failed_when: false
+
+    - name: Backup host is reachable
+      ansible.builtin.assert:
+        that: mx_probe.status | default(0) == 200
+        fail_msg: "rustfs {{ backup_s3_probe_url }} does not answer."
+        quiet: true
+
+    - name: List CNPG backups
+      kubernetes.core.k8s_info:
+        api_version: postgresql.cnpg.io/v1
+        kind: Backup
+        namespace: "{{ mx_ns }}"
+      register: mx_bk_list
+
+    - name: List K8up backups
+      kubernetes.core.k8s_info:
+        api_version: k8up.io/v1
+        kind: Backup
+        namespace: "{{ mx_ns }}"
+      register: mx_k8_list
+
+    - name: Age of the newest completed backups
+      ansible.builtin.set_fact:
+        mx_cnpg_done: >-
+          {{ mx_bk_list.resources
+             | selectattr('spec.cluster.name', 'equalto', mx_cluster)
+             | selectattr('status.phase', 'defined') | selectattr('status.phase', 'equalto', 'completed')
+             | selectattr('status.stoppedAt', 'defined') | map(attribute='status.stoppedAt') | sort | list }}
+        mx_k8up_done: >-
+          {{ mx_k8_list.resources | map(attribute='status.conditions', default=[]) | flatten
+             | selectattr('type', 'equalto', 'Completed') | selectattr('status', 'equalto', 'True')
+             | selectattr('reason', 'equalto', 'Succeeded') | map(attribute='lastTransitionTime') | sort | list }}
+
+    - name: Convert both timestamps to epoch seconds
+      ansible.builtin.command: "date -u -d {{ item.ts | quote }} +%s"
+      loop:
+        - {name: cnpg, ts: "{{ mx_cnpg_done | last | default('1970-01-01T00:00:00Z') }}"}
+        - {name: k8up, ts: "{{ mx_k8up_done | last | default('1970-01-01T00:00:00Z') }}"}
+      register: mx_epoch
+      changed_when: false
+
+    - name: Both backups are fresh
+      ansible.builtin.assert:
+        that:
+          - mx_cnpg_done | length > 0
+          - mx_k8up_done | length > 0
+          - (mx_t_start | int) - (mx_epoch.results[0].stdout | int) < restore_drill_max_age_h * 3600
+          - (mx_t_start | int) - (mx_epoch.results[1].stdout | int) < restore_drill_max_age_h * 3600
+        fail_msg: >-
+          No fresh successful Matrix backup (max {{ restore_drill_max_age_h }} h).
+          CNPG: {{ mx_cnpg_done | last | default('none') }}, K8up: {{ mx_k8up_done | last | default('none') }}.
+          Run acceptance first so verify-matrix.yml leaves a K8up backup.
+        success_msg: "Newest Matrix backups: CNPG {{ mx_cnpg_done | last }}, K8up {{ mx_k8up_done | last }}"
+
+    - name: Remove a leftover throwaway namespace
+      kubernetes.core.k8s:
+        state: absent
+        kind: Namespace
+        name: "{{ mx_dns }}"
+        wait: true
+        wait_timeout: 600
+
+    - name: Drill
+      block:
+        - name: Write the marker files on the live volume
+          kubernetes.core.k8s_exec:
+            namespace: "{{ mx_ns }}"
+            pod: "{{ mx_pod }}"
+            command: >-
+              python -c "open('/data/drill-marker','w').write('{{ mx_run }}' + chr(10));
+              open('/data/media_store/drill-marker','w').write('{{ mx_run }}' + chr(10))"
+          changed_when: true
+
+        - name: Hash the live signing key (the hash is not printed)
+          kubernetes.core.k8s_exec:
+            namespace: "{{ mx_ns }}"
+            pod: "{{ mx_pod }}"
+            command: >-
+              python -c "import hashlib; print(hashlib.sha256(open('/data/signing.key','rb').read()).hexdigest())"
+          register: mx_hash
+          changed_when: false
+          no_log: true
+
+        - name: Start one-off file backup
+          kubernetes.core.k8s:
+            definition:
+              apiVersion: k8up.io/v1
+              kind: Backup
+              metadata:
+                name: "{{ restore_drill_backup_prefix }}-{{ mx_run }}"
+                namespace: "{{ mx_ns }}"
+              spec:
+                podConfigRef: "{{ mx_m_sched.spec.podConfigRef }}"
+                backend: "{{ mx_m_sched.spec.backend }}"
+                tags: ["{{ restore_drill_backup_prefix }}-{{ mx_run }}"]
+                successfulJobsHistoryLimit: 1
+                failedJobsHistoryLimit: 1
+
+        - name: Wait until the file backup is done
+          kubernetes.core.k8s_info:
+            api_version: k8up.io/v1
+            kind: Backup
+            namespace: "{{ mx_ns }}"
+            name: "{{ restore_drill_backup_prefix }}-{{ mx_run }}"
+          register: mx_kb
+          until: (mx_kb.resources | first).status.finished | default(false)
+          retries: "{{ restore_drill_retries }}"
+          delay: "{{ restore_drill_delay }}"
+
+        - name: File backup succeeded
+          ansible.builtin.assert:
+            that:
+              - mx_kb_done | length == 1
+              - mx_kb_done[0].status == 'True'
+              - mx_kb_done[0].reason == 'Succeeded'
+            fail_msg: "Matrix file backup did not succeed."
+            quiet: true
+          vars:
+            mx_kb_done: >-
+              {{ (mx_kb.resources | first).status.conditions | default([])
+                 | selectattr('type', 'equalto', 'Completed') | list }}
+
+        - name: Start one-off base backup
+          kubernetes.core.k8s:
+            definition:
+              apiVersion: postgresql.cnpg.io/v1
+              kind: Backup
+              metadata:
+                name: "{{ restore_drill_backup_prefix }}-{{ mx_run }}"
+                namespace: "{{ mx_ns }}"
+              spec:
+                cluster:
+                  name: "{{ mx_cluster }}"
+                method: plugin
+                pluginConfiguration:
+                  name: barman-cloud.cloudnative-pg.io
+
+        - name: Wait until the base backup is done
+          kubernetes.core.k8s_info:
+            api_version: postgresql.cnpg.io/v1
+            kind: Backup
+            namespace: "{{ mx_ns }}"
+            name: "{{ restore_drill_backup_prefix }}-{{ mx_run }}"
+          register: mx_cb
+          until: (mx_cb.resources | first).status.phase | default('') in ['completed', 'failed']
+          retries: "{{ restore_drill_retries }}"
+          delay: "{{ restore_drill_delay }}"
+
+        - name: Base backup succeeded
+          ansible.builtin.assert:
+            that: (mx_cb.resources | first).status.phase == 'completed'
+            fail_msg: "Matrix base backup failed."
+            quiet: true
+
+        - name: Fingerprint of the live database
+          kubernetes.core.k8s_exec:
+            namespace: "{{ mx_ns }}"
+            pod: "{{ mx_primary }}"
+            container: postgres
+            command: "{{ mx_psql }} \"{{ mx_sql }}\""
+          register: mx_live
+          changed_when: false
+
+        - name: Remember the live counts
+          ansible.builtin.set_fact:
+            mx_live_line: "{{ mx_live.stdout | trim }}"
+            mx_live_users: "{{ (mx_live.stdout | trim).split('|')[0] }}"
+            mx_live_admins: "{{ (mx_live.stdout | trim).split('|')[1] }}"
+
+        - name: Create the throwaway namespace
+          kubernetes.core.k8s:
+            definition:
+              apiVersion: v1
+              kind: Namespace
+              metadata:
+                name: "{{ mx_dns }}"
+                labels: "{{ mx_m_nsm.metadata.labels | combine({'app.kubernetes.io/managed-by': 'restore-drill'}) }}"
+
+        - name: Read the secrets of the real namespace (values are not printed)
+          kubernetes.core.k8s_info:
+            kind: Secret
+            namespace: "{{ mx_ns }}"
+            name: "{{ item }}"
+          register: mx_sec
+          loop: "{{ mx_secrets | unique }}"
+          no_log: true
+
+        - name: Copy the secrets
+          kubernetes.core.k8s:
+            definition:
+              apiVersion: v1
+              kind: Secret
+              type: "{{ (item.resources | first).type | default('Opaque') }}"
+              metadata:
+                name: "{{ item.item }}"
+                namespace: "{{ mx_dns }}"
+              data: "{{ (item.resources | first).data }}"
+          loop: "{{ mx_sec.results }}"
+          no_log: true
+
+        - name: Store the expected checksum and marker (neither is printed)
+          kubernetes.core.k8s:
+            definition:
+              apiVersion: v1
+              kind: Secret
+              type: Opaque
+              metadata:
+                name: drill-expect
+                namespace: "{{ mx_dns }}"
+              stringData:
+                hash: "{{ mx_hash.stdout | trim }}"
+                marker: "{{ mx_run }}"
+          no_log: true
+
+        - name: Read the live config maps
+          kubernetes.core.k8s_info:
+            kind: ConfigMap
+            namespace: "{{ mx_ns }}"
+            name: "{{ item }}"
+          register: mx_cm
+          loop: "{{ mx_configmaps }}"
+
+        - name: Copy the config maps
+          kubernetes.core.k8s:
+            definition:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: "{{ item.item }}"
+                namespace: "{{ mx_dns }}"
+              data: "{{ (item.resources | first).data }}"
+          loop: "{{ mx_cm.results }}"
+
+        - name: Copy ObjectStore and PodConfig
+          kubernetes.core.k8s:
+            definition: "{{ item | combine({'metadata': {'name': item.metadata.name, 'namespace': mx_dns}}) }}"
+          loop:
+            - "{{ mx_m_os }}"
+            - "{{ mx_m_podcfg }}"
+
+        - name: Time stamp before the database restore
+          ansible.builtin.set_fact:
+            mx_t_db0: "{{ lookup('ansible.builtin.pipe', 'date +%s') | int }}"
+
+        - name: Create the recovery cluster
+          kubernetes.core.k8s:
+            definition:
+              apiVersion: postgresql.cnpg.io/v1
+              kind: Cluster
+              metadata:
+                name: "{{ mx_drill_cluster }}"
+                namespace: "{{ mx_dns }}"
+              spec:
+                instances: 1
+                imageName: "{{ mx_m_cluster.spec.imageName }}"
+                enableSuperuserAccess: false
+                storage: "{{ mx_m_cluster.spec.storage }}"
+                resources: "{{ mx_m_cluster.spec.resources }}"
+                postgresql: "{{ mx_m_cluster.spec.postgresql }}"
+                bootstrap:
+                  recovery:
+                    source: origin
+                    database: "{{ mx_db }}"
+                    owner: "{{ mx_owner }}"
+                    secret:
+                      name: "{{ mx_owner_secret }}"
+                externalClusters:
+                  - name: origin
+                    plugin:
+                      name: barman-cloud.cloudnative-pg.io
+                      parameters:
+                        barmanObjectName: "{{ mx_os_name }}"
+                        serverName: "{{ mx_server }}"
+
+        - name: Wait until the recovery cluster is healthy
+          kubernetes.core.k8s_info:
+            api_version: postgresql.cnpg.io/v1
+            kind: Cluster
+            namespace: "{{ mx_dns }}"
+            name: "{{ mx_drill_cluster }}"
+          register: mx_dc
+          until: >-
+            (mx_dc.resources | first).status.phase | default('') == 'Cluster in healthy state' and
+            (mx_dc.resources | first).status.readyInstances | default(0) == 1
+          retries: "{{ restore_drill_retries }}"
+          delay: "{{ restore_drill_delay }}"
+          failed_when: false
+
+        - name: Recovery cluster is healthy
+          ansible.builtin.assert:
+            that: (mx_dc.resources | first).status.phase | default('') == 'Cluster in healthy state'
+            fail_msg: "{{ mx_drill_cluster }} did not become healthy."
+            quiet: true
+
+        - name: Time stamp after the database restore
+          ansible.builtin.set_fact:
+            mx_t_db1: "{{ lookup('ansible.builtin.pipe', 'date +%s') | int }}"
+
+        - name: Create the empty target volume
+          kubernetes.core.k8s:
+            definition:
+              apiVersion: v1
+              kind: PersistentVolumeClaim
+              metadata:
+                name: matrix-data
+                namespace: "{{ mx_dns }}"
+              spec:
+                accessModes: [ReadWriteOnce]
+                resources:
+                  requests:
+                    storage: "{{ mx_m_pvc.spec.resources.requests.storage }}"
+
+        - name: Start the file restore
+          kubernetes.core.k8s:
+            definition:
+              apiVersion: k8up.io/v1
+              kind: Restore
+              metadata:
+                name: "{{ restore_drill_backup_prefix }}-{{ mx_run }}"
+                namespace: "{{ mx_dns }}"
+              spec:
+                podConfigRef: "{{ mx_m_sched.spec.podConfigRef }}"
+                backend: "{{ mx_m_sched.spec.backend }}"
+                tags: ["{{ restore_drill_backup_prefix }}-{{ mx_run }}"]
+                restoreMethod:
+                  folder:
+                    claimName: matrix-data
+
+        - name: Wait until the file restore is done
+          kubernetes.core.k8s_info:
+            api_version: k8up.io/v1
+            kind: Restore
+            namespace: "{{ mx_dns }}"
+            name: "{{ restore_drill_backup_prefix }}-{{ mx_run }}"
+          register: mx_kr
+          until: (mx_kr.resources | first).status.finished | default(false)
+          retries: "{{ restore_drill_retries }}"
+          delay: "{{ restore_drill_delay }}"
+
+        - name: File restore succeeded
+          ansible.builtin.assert:
+            that:
+              - mx_kr_done | length == 1
+              - mx_kr_done[0].status == 'True'
+              - mx_kr_done[0].reason == 'Succeeded'
+            fail_msg: "Matrix file restore did not succeed."
+            quiet: true
+          vars:
+            mx_kr_done: >-
+              {{ (mx_kr.resources | first).status.conditions | default([])
+                 | selectattr('type', 'equalto', 'Completed') | list }}
+
+        - name: Time stamp after the file restore
+          ansible.builtin.set_fact:
+            mx_t_f1: "{{ lookup('ansible.builtin.pipe', 'date +%s') | int }}"
+
+        - name: Fingerprint of the restored database
+          kubernetes.core.k8s_exec:
+            namespace: "{{ mx_dns }}"
+            pod: "{{ (mx_dc.resources | first).status.currentPrimary }}"
+            container: postgres
+            command: "{{ mx_psql }} \"{{ mx_sql }}\""
+          register: mx_new
+          changed_when: false
+
+        - name: Start the check pod (checksum and marker, no values printed)
+          kubernetes.core.k8s:
+            definition:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                name: drill-files
+                namespace: "{{ mx_dns }}"
+              spec:
+                restartPolicy: Never
+                automountServiceAccountToken: false
+                securityContext:
+                  runAsNonRoot: true
+                  runAsUser: 991
+                  runAsGroup: 991
+                  fsGroup: 991
+                  seccompProfile:
+                    type: RuntimeDefault
+                containers:
+                  - name: check
+                    image: "{{ egress_probe_image }}"
+                    command: [python, -c]
+                    args:
+                      - |
+                        import hashlib, pathlib
+                        got = hashlib.sha256(pathlib.Path("/data/signing.key").read_bytes()).hexdigest()
+                        want = pathlib.Path("/expected/hash").read_text().strip()
+                        marks = []
+                        for rel in ("/data/drill-marker", "/data/media_store/drill-marker"):
+                            p = pathlib.Path(rel)
+                            marks.append(p.read_text().strip() if p.is_file() else "")
+                        want_m = pathlib.Path("/expected/marker").read_text().strip()
+                        print("MATCH" if got == want else "MISMATCH")
+                        print("MARKER" if marks == [want_m, want_m] and want_m else "MARKER-MISMATCH")
+                    securityContext:
+                      allowPrivilegeEscalation: false
+                      readOnlyRootFilesystem: true
+                      capabilities:
+                        drop: [ALL]
+                    volumeMounts:
+                      - name: data
+                        mountPath: /data
+                        readOnly: true
+                      - name: expected
+                        mountPath: /expected
+                        readOnly: true
+                      - name: tmp
+                        mountPath: /tmp
+                volumes:
+                  - name: data
+                    persistentVolumeClaim:
+                      claimName: matrix-data
+                  - name: expected
+                    secret:
+                      secretName: drill-expect
+                  - name: tmp
+                    emptyDir: {}
+
+        - name: Wait until the check pod is done
+          kubernetes.core.k8s_info:
+            kind: Pod
+            namespace: "{{ mx_dns }}"
+            name: drill-files
+          register: mx_check_pod
+          until: (mx_check_pod.resources | first).status.phase | default('') in ['Succeeded', 'Failed']
+          retries: 30
+          delay: 5
+
+        - name: Read the check pod log
+          kubernetes.core.k8s_log:
+            namespace: "{{ mx_dns }}"
+            name: drill-files
+          register: mx_files
+
+        - name: Delete the check pod so the volume can move to Synapse
+          kubernetes.core.k8s:
+            state: absent
+            kind: Pod
+            namespace: "{{ mx_dns }}"
+            name: drill-files
+            wait: true
+
+        - name: Checksum and marker match, and the user counts match
+          ansible.builtin.assert:
+            that:
+              - (mx_check_pod.resources | first).status.phase == 'Succeeded'
+              - "'MATCH' in mx_files.log"
+              - "'MISMATCH' not in mx_files.log"
+              - "'MARKER' in mx_files.log"
+              - "'MARKER-MISMATCH' not in mx_files.log"
+              - (mx_new.stdout | trim) == mx_live_line
+              - mx_live_admins | int >= 1
+            fail_msg: "Restored Matrix database or files do not match the live side."
+            quiet: true
+
+        - name: Build the drill Synapse container env
+          ansible.builtin.set_fact:
+            mx_ctr: "{{ mx_m_syn.spec.template.spec.containers[0] }}"
+
+        - name: Point DATABASE_HOST at the recovered primary
+          ansible.builtin.set_fact:
+            mx_ctr: >-
+              {{ mx_ctr | combine({'env':
+                 (mx_ctr.env | rejectattr('name', 'equalto', 'DATABASE_HOST') | list)
+                 + [{'name': 'DATABASE_HOST', 'value': mx_db_host}]}) }}
+
+        - name: Start Synapse against the restored database and volume
+          kubernetes.core.k8s:
+            definition:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: synapse
+                namespace: "{{ mx_dns }}"
+              spec:
+                replicas: 1
+                selector: "{{ mx_m_syn.spec.selector }}"
+                template:
+                  metadata:
+                    labels: "{{ mx_m_syn.spec.template.metadata.labels }}"
+                  spec: "{{ mx_m_syn.spec.template.spec | combine({'containers': [mx_ctr]}) }}"
+
+        - name: Wait until the drill Synapse is ready
+          kubernetes.core.k8s_info:
+            api_version: apps/v1
+            kind: Deployment
+            namespace: "{{ mx_dns }}"
+            name: synapse
+          register: mx_dep
+          until: (mx_dep.resources | first).status.readyReplicas | default(0) | int >= 1
+          retries: "{{ restore_drill_retries }}"
+          delay: "{{ restore_drill_delay }}"
+
+        - name: Find the drill Synapse pod
+          kubernetes.core.k8s_info:
+            kind: Pod
+            namespace: "{{ mx_dns }}"
+            label_selectors:
+              - app.kubernetes.io/name=synapse
+          register: mx_drill_pods
+
+        - name: Log in as the admin in the throwaway namespace
+          kubernetes.core.k8s_exec:
+            namespace: "{{ mx_dns }}"
+            pod: "{{ (mx_drill_pods.resources | selectattr('status.phase', 'equalto', 'Running') | first).metadata.name }}"
+            command: python /bootstrap/check-login.py
+          register: mx_login
+          changed_when: false
+          no_log: true
+
+        - name: Admin login on the restored homeserver works
+          ansible.builtin.assert:
+            that:
+              - mx_login.rc == 0
+              - mx_login.stdout is search('login ok')
+            fail_msg: "Admin login on the restored homeserver failed."
+            quiet: true
+
+        - name: Compute the timings
+          ansible.builtin.set_fact:
+            mx_db_s: "{{ (mx_t_db1 | int) - (mx_t_db0 | int) }}"
+            mx_files_s: "{{ (mx_t_f1 | int) - (mx_t_db1 | int) }}"
+            mx_total_s: "{{ (lookup('ansible.builtin.pipe', 'date +%s') | int) - (mx_t_start | int) }}"
+
+        - name: Result (one line for the acceptance evidence)
+          ansible.builtin.debug:
+            msg: >-
+              RESTORE-DRILL RESULT ok: matrix database {{ mx_db_s }} s, files {{ mx_files_s }} s,
+              total {{ mx_total_s }} s, users {{ mx_live_users }}, admin {{ mx_live_admins }}, run {{ mx_run }}
+
+      always:
+        - name: Throwaway namespace gone
+          kubernetes.core.k8s:
+            state: absent
+            kind: Namespace
+            name: "{{ mx_dns }}"
+            wait: true
+            wait_timeout: 600
+
+        - name: One-off backup objects gone (the snapshots stay until the retention)
+          kubernetes.core.k8s:
+            state: absent
+            api_version: "{{ item }}"
+            kind: Backup
+            namespace: "{{ mx_ns }}"
+            name: "{{ restore_drill_backup_prefix }}-{{ mx_run }}"
+          loop:
+            - k8up.io/v1
+            - postgresql.cnpg.io/v1

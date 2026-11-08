@@ -1,0 +1,20 @@
+# Template for acme-dns01-token.sops.yaml: API token of the DNS provider for ACME DNS-01
+# (ClusterIssuer lab-acme, only with acme_* in lab.local.yaml, docs/how-to/public-certificate.md).
+# Without the file ~/.config/k8s-lab/acme-dns01.token an encrypted file with an EMPTY
+# value is created (the secret name is then fixed, the probe stays off). Enter the token later:
+# 1. write the file (mode 600, one line), 2. delete secrets/cert-manager/acme-dns01-token.sops.yaml,
+# 3. lab.sh init (renders again), 4. commit and push.
+# Placeholder: @optional:NAME = content of the file of the entry NAME, or empty if it does not exist.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: acme-dns01-token
+  namespace: cert-manager
+  labels:
+    app.kubernetes.io/managed-by: argocd
+    app.kubernetes.io/part-of: lab-acme
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+type: Opaque
+stringData:
+  token: "@optional:acme-token"

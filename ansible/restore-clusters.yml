@@ -1,0 +1,247 @@
+---
+# Database half of `rebuild --restore` (ADR-0018). Git stays on initdb.
+# argocd.yml was started with lab_cnpg_restore=true, so Argo CD is not
+# creating Cluster resources yet. This play applies the rendered recovery
+# specs, then removes that exclusion. It does not edit the repo.
+- name: Apply CNPG recovery clusters without changing Git
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: "{{ argocd_kubeconfig }}"
+  vars:
+    restore_dir: /tmp/k8s-lab-restore-render
+    # The CNPG operator: Deployment label and namespace come from its Argo
+    # CD app (single source), the admission webhook Service name is fixed
+    # by the chart. A Cluster apply goes through that webhook, so it needs
+    # a ready endpoint, not only the CRD.
+    restore_op_app: "{{ lookup('ansible.builtin.file', playbook_dir ~ '/../gitops/apps/cnpg.yaml') | from_yaml }}"
+    restore_op_ns: "{{ restore_op_app.spec.destination.namespace }}"
+    restore_op_name: cloudnative-pg
+    restore_webhook_svc: cnpg-webhook-service
+    # The barman-cloud plugin (same namespace as the operator, chart
+    # plugin-barman-cloud). A recovery Cluster names it in externalClusters,
+    # and the operator talks to it over the Service below (CNPG-I, mTLS).
+    # The plugin Deployment is labelled by the chart, the Service name is
+    # fixed by the chart.
+    restore_plugin_name: plugin-barman-cloud
+    restore_plugin_svc: barman-cloud
+    # The plugin chart issues its own TLS pair with cert-manager (own self-signed
+    # Issuer, so the lab CA is not needed). Names are fixed by the chart.
+    restore_plugin_certs: [barman-cloud-client, barman-cloud-server]
+    restore_plugin_secrets: [barman-cloud-client-tls, barman-cloud-server-tls]
+    # cert-manager: namespace and release come from its Argo CD app (single
+    # source). The chart runs controller, webhook and CA injector.
+    restore_cm_app: "{{ lookup('ansible.builtin.file', playbook_dir ~ '/../gitops/apps/cert-manager.yaml') | from_yaml }}"
+    restore_cm_ns: "{{ restore_cm_app.spec.destination.namespace }}"
+    restore_cm_name: "{{ (restore_cm_app.spec.sources | selectattr('helm', 'defined') | first).helm.releaseName }}"
+    restore_cm_deployments: 3
+    # Errors of a webhook that is not ready yet. Every other error (for
+    # example a validation error) must fail at once.
+    restore_transient: 'webhook|InternalError|Internal error|no endpoints available|Service Unavailable|connection refused'
+    restore_cluster_files:
+      - "{{ playbook_dir }}/../gitops/workloads/db-lab/cluster.yaml"
+      - "{{ playbook_dir }}/../gitops/workloads/gitea/manifests/cluster.yaml"
+      - "{{ playbook_dir }}/../gitops/workloads/matrix/manifests/cluster.yaml"
+      - "{{ playbook_dir }}/../gitops/workloads/keycloak/manifests/cluster.yaml"
+  tasks:
+    - name: Read argocd-cm and refuse to run without the Cluster exclusion
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: ConfigMap
+        name: argocd-cm
+        namespace: "{{ argocd_namespace }}"
+      register: restore_cm
+
+    - name: The exclusion must name the CNPG Cluster
+      ansible.builtin.assert:
+        that:
+          - "'postgresql.cnpg.io' in restore_excl"
+          - "'Cluster' in restore_excl"
+        fail_msg: >-
+          argocd-cm has no Cluster exclusion. rebuild --restore passes
+          -e lab_cnpg_restore=true to argocd.yml. Nothing was applied.
+      vars:
+        restore_excl: "{{ restore_cm.resources[0].data['resource.exclusions'] | default('') }}"
+
+    - name: Read the four Git cluster manifests
+      ansible.builtin.set_fact:
+        restore_clusters: "{{ restore_clusters | default([]) + [lookup('file', item) | from_yaml] }}"
+      loop: "{{ restore_cluster_files }}"
+
+    - name: Wait until the CNPG Cluster CRD is established
+      kubernetes.core.k8s_info:
+        api_version: apiextensions.k8s.io/v1
+        kind: CustomResourceDefinition
+        name: clusters.postgresql.cnpg.io
+      register: restore_crd
+      retries: 60
+      delay: 10
+      until: >-
+        restore_crd.resources | default([]) | length == 1
+        and (restore_crd.resources[0].status.conditions | default([])
+        | selectattr('type', 'equalto', 'Established')
+        | selectattr('status', 'equalto', 'True') | list | length == 1)
+
+    - name: Wait until each workload namespace exists
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Namespace
+        name: "{{ item.metadata.namespace }}"
+      loop: "{{ restore_clusters }}"
+      loop_control:
+        label: "{{ item.metadata.namespace }}"
+      register: restore_ns
+      retries: 60
+      delay: 10
+      until: restore_ns.resources | default([]) | length == 1
+
+    - name: Wait until each initdb owner secret exists
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Secret
+        namespace: "{{ item.metadata.namespace }}"
+        name: "{{ item.spec.bootstrap.initdb.secret.name }}"
+      loop: "{{ restore_clusters }}"
+      loop_control:
+        label: "{{ item.metadata.namespace }}"
+      when: item.spec.bootstrap.initdb.secret is defined
+      register: restore_owner
+      retries: 60
+      delay: 10
+      until: restore_owner.resources | default([]) | length == 1
+
+    # The CRD is Established long before the operator pod serves its
+    # admission webhook. Without these two waits the apply below failed
+    # with 'no endpoints available for service cnpg-webhook-service'
+    # (first real rebuild --restore, 2026-11-02).
+    - name: Wait until the CNPG operator Deployment is Available
+      kubernetes.core.k8s_info:
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ restore_op_ns }}"
+        label_selectors:
+          - "app.kubernetes.io/name={{ restore_op_name }}"
+      register: restore_op
+      retries: 60
+      delay: 10
+      until: >-
+        restore_op.resources | default([]) | length == 1
+        and (restore_op.resources[0].status.conditions | default([])
+        | selectattr('type', 'equalto', 'Available')
+        | selectattr('status', 'equalto', 'True') | list | length == 1)
+
+    # EndpointSlice (discovery.k8s.io/v1), not Endpoints: Endpoints v1 is
+    # deprecated. A slice lists endpoints, each with conditions.ready.
+    - name: Wait until the CNPG webhook Service has a ready endpoint
+      kubernetes.core.k8s_info:
+        api_version: discovery.k8s.io/v1
+        kind: EndpointSlice
+        namespace: "{{ restore_op_ns }}"
+        label_selectors:
+          - "kubernetes.io/service-name={{ restore_webhook_svc }}"
+      register: restore_webhook
+      retries: 60
+      delay: 10
+      until: >-
+        restore_webhook.resources | default([])
+        | map(attribute='endpoints', default=[]) | flatten
+        | selectattr('conditions.ready', 'defined')
+        | selectattr('conditions.ready', 'equalto', true) | list | length > 0
+
+    # The plugin is a second pod in the same namespace and comes up
+    # independently of the operator. A recovery Cluster needs it right
+    # away: the operator calls it for the base backup and the WAL archive,
+    # and without a ready endpoint the first recovery pod fails to start.
+    # The plugin needs cert-manager to issue its TLS secrets first (third
+    # real run, 2026-11-03: the pod waited 12 minutes for them). The wait
+    # for cert-manager, the Certificates and the Deployment shares one
+    # budget, restore_plugin_timeout_min (group_vars/all/restore.yml).
+    - name: Wait until the barman-cloud plugin is ready (cert-manager, Certificates, Deployment)
+      ansible.builtin.include_tasks: tasks/restore-plugin-ready.yml
+
+    - name: Wait until the barman-cloud plugin Service has a ready endpoint
+      kubernetes.core.k8s_info:
+        api_version: discovery.k8s.io/v1
+        kind: EndpointSlice
+        namespace: "{{ restore_op_ns }}"
+        label_selectors:
+          - "kubernetes.io/service-name={{ restore_plugin_svc }}"
+      register: restore_plugin_ep
+      retries: 60
+      delay: 10
+      until: >-
+        restore_plugin_ep.resources | default([])
+        | map(attribute='endpoints', default=[]) | flatten
+        | selectattr('conditions.ready', 'defined')
+        | selectattr('conditions.ready', 'equalto', true) | list | length > 0
+
+    - name: Recreate the private render directory
+      ansible.builtin.file:
+        path: "{{ restore_dir }}"
+        state: "{{ item }}"
+        mode: "0700"
+      loop:
+        - absent
+        - directory
+
+    - name: Render the recovery specs outside the repo
+      block:
+        - name: Render recovery specs from the archives on disk
+          ansible.builtin.command:
+            argv:
+              - python3
+              - "{{ playbook_dir }}/../scripts/lab-restore-render.py"
+              - --repo
+              - "{{ playbook_dir }}/.."
+              - --data-dir
+              - "{{ backup_s3_data_dir }}"
+              - --out
+              - "{{ restore_dir }}"
+          changed_when: true
+
+        - name: Find the rendered specs
+          ansible.builtin.find:
+            paths: "{{ restore_dir }}"
+            patterns: "*.yaml"
+          register: restore_files
+
+        - name: Four recovery specs were rendered
+          ansible.builtin.assert:
+            that:
+              - restore_files.files | length == 4
+
+        - name: Apply one rendered cluster
+          kubernetes.core.k8s:
+            state: present
+            src: "{{ item }}"
+          loop: "{{ restore_files.files | map(attribute='path') | list }}"
+          loop_control:
+            label: "{{ item | basename }}"
+          register: restore_applied
+          # Belt and braces: a webhook that went away again (operator
+          # restart) is retried. Other errors fail at once.
+          retries: 12
+          delay: 10
+          until: >-
+            restore_applied is succeeded
+            or not ((restore_applied.msg | default('')) ~ ' '
+            ~ (restore_applied.reason | default('')) ~ ' '
+            ~ (restore_applied.error | default('') | string)) is search(restore_transient)
+
+        - name: Remove the temporary Cluster exclusion
+          kubernetes.core.k8s_json_patch:
+            kubeconfig: "{{ argocd_kubeconfig }}"
+            api_version: v1
+            kind: ConfigMap
+            namespace: "{{ argocd_namespace }}"
+            name: argocd-cm
+            patch:
+              - op: remove
+                path: /data/resource.exclusions
+      always:
+        - name: Remove the rendered specs
+          ansible.builtin.file:
+            path: "{{ restore_dir }}"
+            state: absent

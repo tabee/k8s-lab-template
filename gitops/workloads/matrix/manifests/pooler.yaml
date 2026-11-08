@@ -1,0 +1,29 @@
+---
+# PgBouncer in front of the primary (rw). Synapse connects to
+# matrix-db-pooler-rw.matrix.svc:5432. Session mode: Synapse uses
+# prepared statements, and a transaction pooler breaks them.
+apiVersion: postgresql.cnpg.io/v1
+kind: Pooler
+metadata:
+  name: matrix-db-pooler-rw
+  namespace: matrix
+spec:
+  cluster:
+    name: matrix-db
+  instances: 1
+  type: rw
+  pgbouncer:
+    poolMode: session
+    parameters:
+      max_client_conn: "100"
+      default_pool_size: "20"
+  template:
+    spec:
+      containers:
+        - name: pgbouncer
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 64Mi  # lab-limit: matrix/matrix-db-pooler-rw/pgbouncer

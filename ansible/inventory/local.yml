@@ -1,0 +1,42 @@
+---
+# Static inventory for the local VM (built by infra/envs/local).
+# No secrets: only the path to the private key is here.
+# For a cloud provider: own inventory (e.g. prod.yml) with the same structure.
+all:
+  children:
+    k3s:
+      hosts:
+        k3s-lab:
+          # Values from infra/envs/local/lab.yaml (+ lab.local.yaml), variable "lab"
+          # in group_vars/all/lab.yml. The name k3s-lab is only the Ansible name
+          # (and name of context and kubeconfig), not the name of the VM.
+          ansible_host: "{{ lab.vm_ip }}"
+          host_fqdn: "{{ lab.vm_name }}.{{ lab.domain }}"
+    # Stage 8a: backup target rustfs. Runs on the owner's PC itself (local, without SSH)
+    # and stays there, even if the cluster later runs in the cloud.
+    backup_host:
+      hosts:
+        steuerrechner:
+          ansible_connection: local
+          ansible_python_interpreter: "{{ ansible_playbook_python }}"
+          # sudo-rs (Ubuntu default) has its own password prompt that
+          # Ansible does not recognize. Hence the classic sudo here
+          # (same /etc/sudoers).
+          ansible_become_exe: /usr/bin/sudo
+    # Issue #3: off-host replica of the rustfs data (another machine of the home LAN, rootless).
+    # Host, user and port: only inventory/group_vars/all/backup_replica.yml. The personal key is used
+    # once, by backup-replica.yml, to install the restricted key; the mirror runs with its own key.
+    backup_replica:
+      hosts:
+        backup-replica:
+          ansible_host: "{{ backup_replica_host }}"
+          ansible_user: "{{ backup_replica_user }}"
+          ansible_port: "{{ backup_replica_port }}"
+          ansible_ssh_private_key_file: "{{ backup_replica_install_key }}"
+          ansible_python_interpreter: /usr/bin/python3
+          ansible_ssh_common_args: >-
+            -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o BatchMode=yes
+            -o UserKnownHostsFile={{ backup_replica_known_hosts }}
+  vars:
+    ansible_user: "{{ lab.ssh_user }}"
+    ansible_ssh_private_key_file: "{{ lab.ssh_key }}"

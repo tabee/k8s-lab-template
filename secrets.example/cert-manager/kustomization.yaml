@@ -1,0 +1,10 @@
+---
+# Stage 7: encrypted secrets for the namespace cert-manager.
+# Argo CD (Application secrets-cert-manager) renders this folder with
+# Kustomize; the generator ksops.yaml decrypts in the repo-server.
+# New secret: put a file *.sops.yaml here and enter it in ksops.yaml.
+# Runbook: docs/learning-path/stage-7-ksops.md
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+generators:
+  - ksops.yaml

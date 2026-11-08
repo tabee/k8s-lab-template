@@ -1,0 +1,95 @@
+---
+# Preflight: better abort early and understandably than in the middle of the install.
+# All read only (check_mode: false, changed_when: false).
+
+- name: Find Helm binary
+  ansible.builtin.command: helm version --short
+  register: argocd_bootstrap_helm
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Helm is installed
+  ansible.builtin.assert:
+    that: argocd_bootstrap_helm.rc | default(1) == 0
+    fail_msg: >-
+      helm is missing or does not run (rc={{ argocd_bootstrap_helm.rc | default('?') }}).
+      Installation, see docs/learning-path/stage-4-argocd.md, section "Voraussetzungen".
+    quiet: true
+
+- name: Test Python library kubernetes
+  ansible.builtin.command: "{{ ansible_playbook_python }} -c 'import kubernetes'"
+  register: argocd_bootstrap_pylib
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Python library kubernetes is importable
+  ansible.builtin.assert:
+    that: argocd_bootstrap_pylib.rc == 0
+    fail_msg: >-
+      Python module "kubernetes" is missing for {{ ansible_playbook_python }}
+      (the Python Ansible runs with). Installation, see
+      docs/learning-path/stage-4-argocd.md, section "Voraussetzungen".
+    quiet: true
+
+- name: Find kubeconfig
+  ansible.builtin.stat:
+    path: "{{ argocd_kubeconfig }}"
+  register: argocd_bootstrap_kubeconfig
+
+- name: Kubeconfig is present
+  ansible.builtin.assert:
+    that: argocd_bootstrap_kubeconfig.stat.exists
+    fail_msg: >-
+      Kubeconfig {{ argocd_kubeconfig }} is missing. Run site.yml first
+      (role k3s fetches the kubeconfig).
+    quiet: true
+
+- name: Find deploy key
+  ansible.builtin.stat:
+    path: "{{ argocd_repo_ssh_key_path | expanduser }}"
+  register: argocd_bootstrap_key
+
+- name: Deploy key is present and readable only by the owner
+  ansible.builtin.assert:
+    that:
+      - argocd_bootstrap_key.stat.exists
+      - argocd_bootstrap_key.stat.isreg
+      - argocd_bootstrap_key.stat.mode == '0600'
+    fail_msg: >-
+      Deploy-Key {{ argocd_repo_ssh_key_path }} is missing or does not have mode 0600
+      (is: {{ argocd_bootstrap_key.stat.mode | default('missing') }}).
+      Fix with: chmod 600 {{ argocd_repo_ssh_key_path }}
+    quiet: true
+
+- name: Host keys of the Git server are entered
+  ansible.builtin.assert:
+    that:
+      - argocd_repo_known_hosts | length > 0
+      - argocd_repo_known_hosts | reject('match', argocd_bootstrap_kh_prefix | regex_escape) | list | length == 0
+    fail_msg: >-
+      argocd_repo_known_hosts is empty or contains foreign lines.
+      All lines must start with "{{ argocd_bootstrap_kh_prefix }}" .
+      Fetch and enter (repo_known_hosts in lab.local.yaml):
+      bash scripts/lab.sh customize --fetch-host-keys
+    quiet: true
+  vars:
+    # Port 22 is in known_hosts without brackets, every other port as [Host]:Port.
+    argocd_bootstrap_kh_port: "{{ argocd_repo_url | urlsplit('port') | default(22, true) }}"
+    argocd_bootstrap_kh_host: "{{ argocd_repo_url | urlsplit('hostname') }}"
+    argocd_bootstrap_kh_prefix: >-
+      {{ argocd_bootstrap_kh_host if argocd_bootstrap_kh_port | string == '22'
+      else '[' ~ argocd_bootstrap_kh_host ~ ']:' ~ argocd_bootstrap_kh_port }}{{ ' ' }}
+
+- name: Reach Kubernetes API
+  kubernetes.core.k8s_info:
+    kind: Namespace
+    name: kube-system
+  register: argocd_bootstrap_api
+
+- name: Kubernetes API answers
+  ansible.builtin.assert:
+    that: argocd_bootstrap_api.resources | length == 1
+    fail_msg: "API via {{ argocd_kubeconfig }} not reachable or namespace kube-system is missing"
+    quiet: true

@@ -1,0 +1,21 @@
+---
+# Daily base backup of gitea-db. ONLY place for this time.
+# Cron with seconds (6 fields), time zone UTC (operator): 20:00 UTC =
+# 21:00 Zurich winter time (CET), in summer 22:00 (CEST). Same time as
+# pg-lab (the two backups are small). The repo files are backed up by K8up half
+# an hour later (k8up-schedule.yaml), so that both parts come from about
+# the same evening; in between PITR from the WAL archive helps.
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: gitea-db-daily
+  namespace: gitea
+spec:
+  schedule: "0 0 20 * * *"
+  immediate: true
+  backupOwnerReference: self
+  cluster:
+    name: gitea-db
+  method: plugin
+  pluginConfiguration:
+    name: barman-cloud.cloudnative-pg.io

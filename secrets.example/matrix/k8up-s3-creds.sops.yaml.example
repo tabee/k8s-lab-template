@@ -1,0 +1,15 @@
+# Template for k8up-s3-creds.sops.yaml: structure without real values.
+# lab.sh init fills the placeholders and encrypts immediately.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: k8up-s3-creds
+  namespace: matrix
+  labels:
+    app.kubernetes.io/managed-by: argocd
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+type: Opaque
+stringData:
+  ACCESS_KEY_ID: "@env:s3-k8up:ACCESS_KEY_ID"
+  ACCESS_SECRET_KEY: "@env:s3-k8up:ACCESS_SECRET_KEY"

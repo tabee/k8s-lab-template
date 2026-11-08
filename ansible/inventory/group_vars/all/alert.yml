@@ -1,0 +1,86 @@
+---
+# Issue #8: alerts when a backup or the edge fails. The ONE place for sinks, limits and paths.
+# lab-alert.py (systemd user timer on the owner's PC) reads one JSON file that the role backup_alert renders
+# from these values. Runbook: docs/how-to/alerts.md. The role has no defaults/.
+
+backup_alert_enabled: true
+backup_alert_config: "{{ backup_s3_home }}/.config/k8s-lab/alert.json"
+backup_alert_state_file: "{{ backup_s3_home }}/.cache/k8s-lab/alert-state.json"
+backup_alert_script: "{{ backup_s3_script_dir }}/lab-alert.py"
+backup_alert_unit_prefix: lab-alert
+
+# ---------- Cadence ----------
+backup_alert_interval_min: 10
+backup_alert_boot_delay_min: 3
+# A failing check is repeated as a reminder after this many hours (and once when it recovers).
+backup_alert_repeat_hours: 24
+
+# ---------- Maintenance marker (issue #21) ----------
+# lab.sh up/rebuild/down/purge write this file while they run (VM missing on purpose) and remove it at
+# the end, also after an abort. While it is valid, lab-alert.py run stays silent. It is ignored when its
+# process is gone or when it is older than the limit, so a stale file cannot hide a real outage for long.
+backup_alert_maintenance_file: "{{ backup_s3_home }}/.cache/k8s-lab/alert-maintenance.json"
+backup_alert_maintenance_max_hours: 3
+
+# ---------- Sinks (pluggable, see scripts/lab-alert.py) ----------
+# Sinks used for every alert, in this order. Known: matrix, desktop, journal, exec, file.
+backup_alert_sinks: [matrix, desktop]
+# Used when no listed sink is switched on or one of them failed. The journal is always written by the unit.
+backup_alert_fallback_sinks: [desktop, journal]
+
+
+# ---------- External heartbeat (decision 2026-11-06, issue #8) ----------
+# healthchecks.io-compatible HTTP GET to a ping URL. The URL (and optional fail URL) live in a
+# SOPS file on the control PC, never in git. Provider is whatever answers that URL
+# (healthchecks.io, Better Stack, Uptime Kuma push, …). Default OFF until you create the check
+# and the SOPS file (docs/how-to/alerts.md). When the control PC is off, no ping goes out and
+# the external service alerts — that is intentional: backups only run while the PC is on.
+backup_alert_heartbeat_enabled: false
+alert_heartbeat_url_file: "{{ backup_s3_home }}/.config/k8s-lab/alert-heartbeat.sops.yaml"
+backup_alert_heartbeat_ping_url_key: ping_url
+# Optional: key of a fail URL in the same SOPS file (empty = do not call a fail URL).
+backup_alert_heartbeat_fail_url_key: fail_url
+# Shared with the Matrix sink: same sops binary and age key.
+# Matrix sink (a bot user in one room). Synapse is up, but registration is closed and
+# no bot token is created by the lab, so the sink stays OFF until an admin creates one.
+# The token is a SOPS file (never in this repo, never in a log).
+backup_alert_matrix_enabled: false
+backup_alert_matrix_homeserver: ""
+backup_alert_matrix_room_id: ""
+alert_matrix_token_file: "{{ backup_s3_home }}/.config/k8s-lab/alert-matrix.sops.yaml"
+backup_alert_matrix_token_key: token
+backup_alert_sops_bin: sops
+backup_alert_age_key_file: "{{ argocd_sops_age_key_path | expanduser }}"
+
+# Desktop notification on the owner's PC (needs the graphical session; the timer runs in the user manager).
+backup_alert_desktop_bin: notify-send
+
+# Generic sink for anything else (a script that reads the message on stdin), empty = off.
+backup_alert_exec_argv: []
+
+# ---------- Checks ----------
+# Latest successful backup must not be older than this (CNPG: daily base backup, K8up: daily).
+backup_alert_cnpg_max_age_hours: 30
+backup_alert_k8up_max_age_hours: 30
+# CNPG clusters to check (namespace and name; a test compares them with gitops/).
+backup_alert_cnpg_clusters:
+  - { namespace: gitea, name: gitea-db }
+  - { namespace: db-lab, name: pg-lab }
+  - { namespace: matrix, name: matrix-db }
+  - { namespace: keycloak, name: keycloak-db }
+# K8up: namespaces with a Schedule. keycloak is not in the list on purpose: it has no PVC, all
+# its state is in keycloak-db (checked above).
+backup_alert_k8up_namespaces: [gitea, matrix]
+backup_alert_kubeconfig: "{{ argocd_kubeconfig | expanduser }}"
+backup_alert_kubectl_bin: kubectl
+backup_alert_kubectl_timeout: 30
+# rustfs reachability, the same URL as the watchdog (bridge address, the way the VM reaches it).
+backup_alert_rustfs_url: "{{ backup_s3_probe_url }}"
+backup_alert_http_timeout: 8
+# Edge: HTTPS request to the Traefik admin entrypoint (whoami), with the lab CA.
+backup_alert_edge_enabled: true
+backup_alert_edge_ip: "{{ lab.vm_ip }}"
+backup_alert_edge_port: "{{ traefik_admin_port }}"
+backup_alert_edge_host: "whoami.{{ lab.domain }}"
+backup_alert_edge_ca_file: "{{ lab_ca_cert_path | expanduser }}"
+backup_alert_edge_expect: Hostname

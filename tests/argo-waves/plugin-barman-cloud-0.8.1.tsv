@@ -1,0 +1,14 @@
+# chart plugin-barman-cloud 0.8.1, release plugin-barman-cloud, values-plugin.yaml, probe = takes commonAnnotations
+# regenerate: see tests/argo-waves-tests.sh (the live render check prints the diff)
+ServiceAccount	plugin-barman-cloud	yes
+ConfigMap	plugin-barman-cloud-config	no
+CustomResourceDefinition	objectstores.barmancloud.cnpg.io	no
+ClusterRole	plugin-barman-cloud	no
+ClusterRoleBinding	plugin-barman-cloud-binding	no
+Role	plugin-barman-cloud-leader-election-role	no
+RoleBinding	plugin-barman-cloud-leader-election-rolebinding	no
+Service	barman-cloud	yes
+Deployment	plugin-barman-cloud	yes
+Certificate	barman-cloud-client	no
+Certificate	barman-cloud-server	no
+Issuer	plugin-barman-cloud-selfsigned-issuer	no

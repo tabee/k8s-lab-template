@@ -1,0 +1,26 @@
+---
+# Values for stage 6: role "lab_ca" (playbook argocd.yml, runs on
+# localhost). Each value is defined only here; the role has no defaults/.
+# No secrets. Since stage 7 the CA secret comes encrypted from
+# secrets/cert-manager/ (Argo CD, KSOPS); the role only waits for it.
+
+# Namespace of cert-manager. Owned by Ansible (PSA labels); the applications
+# cert-manager and secrets-cert-manager do not create it.
+lab_ca_namespace: cert-manager
+lab_ca_psa_level: restricted
+lab_ca_psa_version: latest
+
+# Name in the cluster; must match spec.ca.secretName in
+# gitops/platform/cert-manager/manifests/clusterissuer-lab-ca.yaml and
+# secrets/cert-manager/lab-ca.sops.yaml.
+lab_ca_secret_name: lab-ca
+# Application that delivers the CA secret (gitops/apps/secrets-cert-manager.yaml).
+lab_ca_secret_app: secrets-cert-manager
+# This is how long the role waits for the secret from Argo CD (attempts x seconds).
+# Fresh bootstrap: repo-server starts, root app syncs, then KSOPS.
+lab_ca_wait_retries: 60
+lab_ca_wait_delay: 10
+
+# Public CA certificate (only tls.crt, no key). The role puts
+# it here; it serves as trust anchor (browser, verify-certmanager.yml).
+lab_ca_cert_path: ~/.config/k8s-lab/lab-ca.crt

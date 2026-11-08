@@ -1,0 +1,70 @@
+---
+# Role "backup_s3": rustfs (S3) as backup target on the owner's PC, rootless as
+# Podman quadlet (systemd --user), port limited to the lab networks by ufw,
+# own bucket + user for CNPG and (stage 8c) for K8up.
+# Runbook: docs/learning-path/stage-8a-backup-target.md.
+galaxy_info:
+  author: k8s-lab
+  description: rustfs as S3 backup target (quadlet, ufw, bucket/user for CNPG)
+  license: MIT
+  min_ansible_version: "2.17"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - noble
+dependencies: []
+
+# Required variables; values come from inventory/group_vars/all/backup_s3.yml.
+argument_specs:
+  main:
+    short_description: rustfs backup target (runs locally on the backup host, sudo only for ufw/linger)
+    options:
+      backup_s3_home: { type: str, required: true, description: "HOME of the user that owns rustfs" }
+      backup_s3_image: { type: str, required: true, description: "rustfs image with tag and @sha256 digest" }
+      backup_s3_version: { type: str, required: true, description: "Version that /health must report" }
+      backup_s3_container_name: { type: str, required: true, description: Container and unit name (rustfs) }
+      backup_s3_quadlet_dir: { type: str, required: true, description: Quadlet directory of the user }
+      backup_s3_quadlet_bin: { type: str, required: true, description: Path to the quadlet generator (check before replacing) }
+      backup_s3_podman_min_version: { type: str, required: true, description: Minimum podman version (HealthOnFailure) }
+      backup_s3_data_dir: { type: str, required: true, description: Data directory (/data in the container) }
+      backup_s3_log_dir: { type: str, required: true, description: Log directory (/logs in the container) }
+      backup_s3_root_env: { type: str, required: true, description: "rustfs.env with root keys (never overwritten)" }
+      backup_s3_backup_dir: { type: str, required: true, description: Location for backup copies (old quadlet file) }
+      backup_s3_bind_address: { type: str, required: true, description: "IPv4 address for the S3 port (0.0.0.0, limited by ufw)" }
+      backup_s3_port: { type: int, required: true, description: S3 port on the host }
+      backup_s3_console_bind: { type: str, required: true, description: "Address for the web console, empty = not published" }
+      backup_s3_console_port: { type: int, required: true, description: Port of the web console }
+      backup_s3_ufw_comment: { type: str, required: true, description: Comment of the ufw rules (visible in ufw status) }
+      backup_s3_ufw_sources:
+        type: list
+        elements: dict
+        required: true
+        description: "Allowed sources, name, cidr, interface (empty = all), state (present/absent)"
+      backup_s3_wireguard_cidrs: { type: list, elements: str, required: true, description: "WireGuard networks (later in the cloud), empty = no rule" }
+      backup_s3_wireguard_interface: { type: str, required: true, description: "WireGuard interface, empty = all" }
+      backup_s3_bucket: { type: str, required: true, description: Bucket for CNPG }
+      backup_s3_user: { type: str, required: true, description: "Access key (= user name) for the bucket" }
+      backup_s3_policy_name: { type: str, required: true, description: Name of the bucket policy in rustfs }
+      backup_s3_policy: { type: dict, required: true, description: "IAM policy (this bucket only)" }
+      backup_s3_user_env: { type: str, required: true, description: "Env file with ACCESS_KEY_ID/ACCESS_SECRET_KEY (0600)" }
+      backup_s3_versioning: { type: bool, required: true, description: Bucket-Versionierung }
+      backup_s3_noncurrent_days: { type: int, required: true, description: "Delete old versions after N days, 0 = never" }
+      backup_s3_k8up_bucket: { type: str, required: true, description: "Bucket for K8up/restic (stage 8c)" }
+      backup_s3_k8up_user: { type: str, required: true, description: "Access key (= user name) for the K8up bucket" }
+      backup_s3_k8up_policy_name: { type: str, required: true, description: Name of the K8up policy in rustfs }
+      backup_s3_k8up_policy: { type: dict, required: true, description: "IAM policy (the K8up bucket only)" }
+      backup_s3_k8up_user_env: { type: str, required: true, description: "Env file of the K8up user (0600)" }
+      backup_s3_vm_autostart: { type: bool, required: true, description: "Start the VM with libvirt (virsh autostart), false = do nothing" }
+      backup_s3_vm_name: { type: str, required: true, description: libvirt name of the VM }
+      backup_s3_libvirt_uri: { type: str, required: true, description: libvirt-URI }
+      backup_s3_start_timeout: { type: int, required: true, description: "Timeout of the rustfs start in seconds (without waiting for the network)" }
+      backup_s3_wait_net_timeout: { type: int, required: true, description: "How long ExecStartPre waits for the default route (seconds)" }
+      backup_s3_script_dir: { type: str, required: true, description: "Folder of the scripts (rustfs-wait-net.sh, rustfs-watchdog.sh)" }
+      backup_s3_systemd_user_dir: { type: str, required: true, description: "Folder of the systemd user units (watchdog)" }
+      backup_s3_probe_url: { type: str, required: true, description: "URL that the watchdog queries like the VM does (bridge address)" }
+      backup_s3_watchdog_interval: { type: int, required: true, description: "Interval of the watchdog checks in seconds" }
+      backup_s3_watchdog_grace: { type: int, required: true, description: "Grace period after the start of rustfs in seconds" }
+      backup_s3_watchdog_tries: { type: int, required: true, description: "Requests per check" }
+      backup_s3_watchdog_pause: { type: int, required: true, description: "Pause between the requests in seconds" }
+      backup_s3_watchdog_curl_timeout: { type: int, required: true, description: "Time limit per request in seconds" }
+      backup_s3_watchdog_max_restarts: { type: int, required: true, description: "Unsuccessful restarts in a row, after which the watchdog gives up" }

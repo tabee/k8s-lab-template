@@ -1,0 +1,55 @@
+---
+# Incoming in the namespace cnpg-system only what is needed:
+# - Default: nothing.
+# - Operator webhook: TCP 9443. The API server runs on k3s in the host network;
+#   its source IP is not stably predictable, hence without from (as with
+#   cert-manager-Webhook).
+# - Barman cloud plugin: TCP 9090 (gRPC, only with client certificate from the
+#   chart, mTLS). Caller is the operator in the same namespace.
+# Outgoing stays open (API server; the plugin itself does not talk to
+# S3, the sidecars in the Postgres pods do that).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: cnpg-system
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: operator-webhook-allow-apiserver
+  namespace: cnpg-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: cloudnative-pg
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - port: 9443
+          protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: barman-cloud-allow-operator
+  namespace: cnpg-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: plugin-barman-cloud
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: cloudnative-pg
+      ports:
+        - port: 9090
+          protocol: TCP

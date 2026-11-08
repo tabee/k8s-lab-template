@@ -1,0 +1,22 @@
+# {{ ansible_managed }}
+# Pod Security Admission: default for ALL namespaces without their own label.
+# Exception per namespace via label, e.g.
+#   pod-security.kubernetes.io/enforce: baseline
+apiVersion: apiserver.config.k8s.io/v1
+kind: AdmissionConfiguration
+plugins:
+  - name: PodSecurity
+    configuration:
+      apiVersion: pod-security.admission.config.k8s.io/v1
+      kind: PodSecurityConfiguration
+      defaults:
+        enforce: "{{ k3s_psa_level }}"
+        enforce-version: "{{ k3s_psa_version }}"
+        audit: "{{ k3s_psa_level }}"
+        audit-version: "{{ k3s_psa_version }}"
+        warn: "{{ k3s_psa_level }}"
+        warn-version: "{{ k3s_psa_version }}"
+      exemptions:
+        usernames: []
+        runtimeClasses: []
+        namespaces: {{ k3s_psa_exempt_namespaces | to_json }}

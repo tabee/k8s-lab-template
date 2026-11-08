@@ -1,0 +1,12 @@
+---
+# Units changed: reload and restart the timer.
+- name: Reload alert timer
+  ansible.builtin.systemd_service:
+    name: "{{ backup_alert_unit_prefix }}.timer"
+    scope: user
+    state: restarted
+    daemon_reload: true
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ ansible_facts['user_uid'] }}"
+  # In the --check run before the first installation the unit does not exist yet.
+  ignore_errors: "{{ ansible_check_mode }}"

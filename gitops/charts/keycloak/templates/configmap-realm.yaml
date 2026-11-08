@@ -1,0 +1,153 @@
+---
+# Realm definition for keycloak-config-cli (job-config.yaml). Client secrets are
+# not in here: config-cli replaces $(env:NAME) from the Secrets keycloak-oidc-clients
+# and keycloak-notes-client. The client notes (login of the notes sites) is generated from
+# gitops/sites.yaml: one redirect address per site with auth sso.
+# Self-registration, password reset by mail and implicit/direct grants are off.
+# Users are never part of the file: they are created by hand and are not deleted.
+# Second file realm-master.json: one attribute of the master realm (frontendUrl),
+# so the admin console works over the port-forward (see values.yaml adminUrl).
+{{- /* Client "notes": one client, the addresses come from gitops/sites.yaml (symlink files/sites.yaml): every site that is not auth basic. */ -}}
+{{- $callbacks := list -}}
+{{- $logoutUris := list -}}
+{{- range (fromYamlArray (.Files.Get "files/sites.yaml")) -}}
+{{- if ne (.auth | default "sso") "basic" -}}
+{{- $callbacks = append $callbacks (printf "https://%s/oauth2/callback" .host | quote) -}}
+{{- $logoutUris = append $logoutUris (printf "https://%s/" .host) -}}
+{{- end -}}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: keycloak-realm
+  namespace: {{ .Release.Namespace }}
+data:
+  realm-master.json: |
+    {
+      "realm": "master",
+      "attributes": {
+        "frontendUrl": {{ .Values.adminUrl | quote }}
+      }
+    }
+  realm.json: |
+    {
+      "realm": {{ .Values.realm | quote }},
+      "displayName": "Lab",
+      "enabled": true,
+      "sslRequired": "external",
+      "registrationAllowed": false,
+      "registrationEmailAsUsername": false,
+      "resetPasswordAllowed": false,
+      "rememberMe": false,
+      "verifyEmail": false,
+      "loginWithEmailAllowed": false,
+      "duplicateEmailsAllowed": false,
+      "editUsernameAllowed": false,
+      "bruteForceProtected": true,
+      "failureFactor": 5,
+      "maxFailureWaitSeconds": 900,
+      "passwordPolicy": "length(14) and notUsername",
+      "accessTokenLifespan": 300,
+      "ssoSessionIdleTimeout": 1800,
+      "ssoSessionMaxLifespan": 36000,
+      "eventsEnabled": true,
+      "eventsExpiration": 2592000,
+      "adminEventsEnabled": true,
+      "adminEventsDetailsEnabled": false,
+      "groups": [
+        { "name": "lab-users" },
+        { "name": "lab-admins" }
+      ],
+      "clientScopes": [
+        {
+          "name": "groups",
+          "description": "Names of the groups of the user (lab-users, lab-admins)",
+          "protocol": "openid-connect",
+          "attributes": {
+            "include.in.token.scope": "true",
+            "display.on.consent.screen": "false"
+          },
+          "protocolMappers": [
+            {
+              "name": "groups",
+              "protocol": "openid-connect",
+              "protocolMapper": "oidc-group-membership-mapper",
+              "consentRequired": false,
+              "config": {
+                "full.path": "false",
+                "claim.name": "groups",
+                "jsonType.label": "String",
+                "multivalued": "true",
+                "id.token.claim": "true",
+                "access.token.claim": "true",
+                "userinfo.token.claim": "true"
+              }
+            }
+          ]
+        }
+      ],
+      "clients": [
+        {
+          "clientId": "gitea",
+          "name": "Gitea",
+          "enabled": true,
+          "protocol": "openid-connect",
+          "publicClient": false,
+          "clientAuthenticatorType": "client-secret",
+          "secret": "$(env:GITEA_CLIENT_SECRET)",
+          "rootUrl": "https://git.{{ .Values.domain }}",
+          "baseUrl": "https://git.{{ .Values.domain }}",
+          "redirectUris": [ "https://git.{{ .Values.domain }}/user/oauth2/keycloak/callback" ],
+          "webOrigins": [],
+          "standardFlowEnabled": true,
+          "implicitFlowEnabled": false,
+          "directAccessGrantsEnabled": false,
+          "serviceAccountsEnabled": false,
+          "fullScopeAllowed": false,
+          "defaultClientScopes": [ "basic", "profile", "email", "groups" ],
+          "optionalClientScopes": []
+        },
+        {
+          "clientId": "synapse",
+          "name": "Matrix (Synapse)",
+          "enabled": true,
+          "protocol": "openid-connect",
+          "publicClient": false,
+          "clientAuthenticatorType": "client-secret",
+          "secret": "$(env:SYNAPSE_CLIENT_SECRET)",
+          "rootUrl": "https://matrix.{{ .Values.domain }}",
+          "baseUrl": "https://matrix.{{ .Values.domain }}",
+          "redirectUris": [ "https://matrix.{{ .Values.domain }}/_synapse/client/oidc/callback" ],
+          "webOrigins": [],
+          "standardFlowEnabled": true,
+          "implicitFlowEnabled": false,
+          "directAccessGrantsEnabled": false,
+          "serviceAccountsEnabled": false,
+          "fullScopeAllowed": false,
+          "defaultClientScopes": [ "basic", "profile", "email", "groups" ],
+          "optionalClientScopes": []
+        },
+        {
+          "clientId": "notes",
+          "name": "Notes sites (oauth2-proxy)",
+          "enabled": true,
+          "protocol": "openid-connect",
+          "publicClient": false,
+          "clientAuthenticatorType": "client-secret",
+          "secret": "$(env:NOTES_CLIENT_SECRET)",
+          "redirectUris": [ {{ $callbacks | join ", " }} ],
+          "webOrigins": [],
+          "standardFlowEnabled": true,
+          "implicitFlowEnabled": false,
+          "directAccessGrantsEnabled": false,
+          "serviceAccountsEnabled": false,
+          "fullScopeAllowed": false,
+          "attributes": {
+            "pkce.code.challenge.method": "S256",
+            "post.logout.redirect.uris": {{ $logoutUris | join "##" | quote }}
+          },
+          "defaultClientScopes": [ "basic", "profile", "email", "groups" ],
+          "optionalClientScopes": []
+        }
+      ]
+    }

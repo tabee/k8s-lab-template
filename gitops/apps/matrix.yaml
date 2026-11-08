@@ -1,0 +1,51 @@
+---
+# Child application of the root app: Synapse and Element Web.
+# Source 1: local chart gitops/charts/matrix (homeserver config, Element
+#           config, startup scripts). No chart registry.
+# Source 2: raw manifests under gitops/workloads/matrix/manifests
+#           (namespace, CNPG, K8up, certificate, ingress, deployments).
+# Secrets come from the app secrets-matrix.
+# Federation is off. See docs/how-to/matrix.md and ADR-0016.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: matrix
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: lab
+  sources:
+    - repoURL: ssh://git@github.com/YOUR-NAME/k8s-lab.git
+      targetRevision: main
+      path: gitops/charts/matrix
+      helm:
+        releaseName: matrix
+    - repoURL: ssh://git@github.com/YOUR-NAME/k8s-lab.git
+      targetRevision: main
+      path: gitops/workloads/matrix/manifests
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: matrix
+  # Runtime recovery (rebuild --restore) may differ here. Git stays initdb. ADR-0018.
+  ignoreDifferences:
+    - group: postgresql.cnpg.io
+      kind: Cluster
+      jqPathExpressions:
+        - .spec.bootstrap
+        - .spec.externalClusters
+        - .spec.plugins[].parameters.serverName
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - RespectIgnoreDifferences=true
+      - SkipDryRunOnMissingResource=true
+      - ServerSideApply=true
+    retry:
+      limit: 10
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 3m

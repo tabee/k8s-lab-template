@@ -1,0 +1,29 @@
+---
+# Values for stage 7: SOPS+age with KSOPS (role argocd_bootstrap, playbook
+# argocd.yml, runs on localhost). Every value is defined only here.
+# No secrets: of the age key only the path is here.
+# Runbook: docs/learning-path/stage-7-ksops.md
+
+# Private age key on the control machine (mode 0600, never into Git).
+# Ansible reads it only to make the secret in the namespace argocd from it
+# (no_log, diff: false). Every identity in the file must be a recipient in
+# .sops.yaml, otherwise the preflight aborts (so no foreign
+# key ends up in the cluster).
+argocd_sops_age_key_path: ~/.config/sops/age/keys.txt
+# Optional offline break-glass key (issue 11): written once by
+# `lab.sh init --break-glass`, 0600. Its PUBLIC key is the LAST recipient in
+# .sops.yaml. It must never be copied to argocd_sops_age_key_path or the
+# cluster (the preflight and verify-ksops.yml check this by public key only).
+argocd_sops_break_glass_key_path: ~/.config/k8s-lab/break-glass-age.txt
+# Name of the secret in namespace argocd; the repo-server mounts it under
+# /sops-age (file keys.txt).
+argocd_sops_age_secret_name: sops-age
+# Rules of SOPS in the repo root; the preflight reads the recipients from it.
+argocd_sops_config_path: "{{ playbook_dir }}/../.sops.yaml"
+
+# KSOPS (Kustomize generator, decrypts *.sops.yaml on rendering in the
+# repo-server). Pinned with tag and digest (manifest list, amd64+arm64),
+# As of 2026-10-26: v4.5.1 = sops v3.12.2, kustomize api v0.19.0.
+# Source: https://github.com/viaduct-ai/kustomize-sops/releases
+# yamllint disable-line rule:line-length
+argocd_ksops_image: quay.io/viaductoss/ksops:v4.5.1@sha256:4def9fdd4e2f850265740ebe9592c5455d19b76891e88e602df8b52d74b95334

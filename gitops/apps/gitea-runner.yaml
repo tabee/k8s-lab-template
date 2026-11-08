@@ -1,0 +1,36 @@
+---
+# Child application of the root app: the Gitea Actions runner (issue #115, ADR 0030).
+# gitops/workloads/gitea-runner: namespaces gitea-runner and gitea-runner-jobs, runner Deployment,
+# RBAC (job pods only), quota, LimitRanges, NetworkPolicies. The registration token comes from the app
+# secrets-gitea-runner (and, for Gitea, from secrets-gitea). Runbook: docs/how-to/gitea-actions.md
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: gitea-runner
+  namespace: argocd
+  # Deleting this file removes the runner and its objects; the namespaces stay (Delete=false).
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: lab
+  source:
+    repoURL: ssh://git@github.com/YOUR-NAME/k8s-lab.git
+    targetRevision: main
+    path: gitops/workloads/gitea-runner
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: gitea-runner
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - ServerSideApply=true
+    # Until the registration secret is there the runner pod waits (CreateContainerConfigError); retry covers
+    # the order of a fresh build.
+    retry:
+      limit: 10
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 3m

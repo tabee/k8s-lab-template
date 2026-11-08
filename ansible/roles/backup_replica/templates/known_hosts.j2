@@ -1,0 +1,2 @@
+{# One line: the pinned host key of the replica (backup_replica_host_key). #}
+{% if backup_replica_port | int == 22 %}{{ backup_replica_host }}{% else %}[{{ backup_replica_host }}]:{{ backup_replica_port }}{% endif %} {{ backup_replica_host_key }}

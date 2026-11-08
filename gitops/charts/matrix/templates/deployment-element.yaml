@@ -1,0 +1,102 @@
+---
+# Element Web. The unprivileged nginx image listens on ELEMENT_WEB_PORT
+# (default 80, which a non-root user cannot bind). 8080 is the container
+# port. emptyDirs cover the paths nginx writes on a read-only root:
+# templates stay in /etc/nginx/templates and are rendered into conf.d.
+# Templated by the chart for the checksum annotation: config.json is mounted
+# with subPath, which Kubernetes never updates in a running pod. A changed
+# rendered ConfigMap changes the annotation and rolls the pod.
+# The namespace is written out and the YAML stays plain data (Ansible reads it).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: element
+  namespace: matrix
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: element
+  template:
+    metadata:
+      annotations:
+        checksum/config: '{{ include (print $.Template.BasePath "/configmap-element.yaml") . | sha256sum }}'
+      labels:
+        app.kubernetes.io/name: element
+        app.kubernetes.io/part-of: matrix
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
+        runAsGroup: 101
+        fsGroup: 101
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: element
+          image: ghcr.io/element-hq/element-web:v1.12.33@sha256:b0aa4b5a4fc1afaaff62e2dbd0c92d57e2b20724f3ccb2fef53aae949088c3d2
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: ELEMENT_WEB_PORT
+              value: "8080"
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 20
+          startupProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 5
+            failureThreshold: 12
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - "ALL"
+          resources:
+            requests:
+              cpu: 10m
+              memory: 64Mi
+            limits:
+              memory: 64Mi  # lab-limit: matrix/element/element
+          volumeMounts:
+            - name: config
+              mountPath: /app/config.json
+              subPath: config.json
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            - name: cache
+              mountPath: /var/cache/nginx
+            - name: run
+              mountPath: /var/run
+            - name: confd
+              mountPath: /etc/nginx/conf.d
+            - name: log
+              mountPath: /var/log/nginx
+      volumes:
+        - name: config
+          configMap:
+            name: matrix-element-config
+        - name: tmp
+          emptyDir: {}
+        - name: cache
+          emptyDir: {}
+        - name: run
+          emptyDir: {}
+        - name: confd
+          emptyDir: {}
+        - name: log
+          emptyDir: {}

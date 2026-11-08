@@ -1,0 +1,19 @@
+---
+# Matrix (Synapse + Element Web). Only the locations of the secret files on
+# the operator machine are here. All other values are in gitops/workloads/matrix/,
+# gitops/charts/matrix/ and lab.yaml (matrix_server_name). verify-matrix.yml
+# reads the names from the manifests.
+#
+# lab.sh init creates the files when they are missing (mode 0600, random
+# values, never shown) and renders secrets/matrix/*.sops.yaml. The signing
+# key is optional: a missing file means "generate on first start".
+
+matrix_secret_dir: "{{ lookup('ansible.builtin.env', 'HOME') }}/.config/k8s-lab"
+matrix_db_password_file: "{{ matrix_secret_dir }}/matrix-k3s-lab-db.pw"
+matrix_admin_user_file: "{{ matrix_secret_dir }}/matrix-k3s-lab-admin.user"
+matrix_admin_password_file: "{{ matrix_secret_dir }}/matrix-k3s-lab-admin.pw"
+matrix_registration_secret_file: "{{ matrix_secret_dir }}/matrix-k3s-lab-registration.secret"
+# Not in lab_values.secret_files: preflight must not fail when the operator
+# wants the first start to generate the key. Loss of the key makes the
+# homeserver unable to prove its identity, so keep a copy once it exists.
+matrix_signing_key_file: "{{ matrix_secret_dir }}/matrix-k3s-lab-signing.key"

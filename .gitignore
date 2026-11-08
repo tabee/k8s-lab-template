@@ -1,0 +1,27 @@
+*.key
+*.pem
+*.tgz
+.env
+# OpenTofu: state and provider cache never in Git (state may contain secrets)
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+# locally generated files
+ansible/inventory/generated.ini
+*.kubeconfig
+# OpenTofu plan (may contain plaintext values)
+tfplan
+*.tfplan
+# Secrets: never in this repo; they come from the private secrets repo
+# (bash scripts/lab.sh secrets-repo import DIR, ADR 0022).
+# Stage 7, docs/learning-path/stage-7-ksops.md
+/secrets/
+# ansible-lint Cache
+.ansible/
+# Lab rebuild: own values (template infra/envs/*/lab.local.yaml.example)
+infra/envs/*/lab.local.yaml
+# Docs site: build output and cache of docs/build.sh (zensical)
+/site/
+/.cache/
+__pycache__/

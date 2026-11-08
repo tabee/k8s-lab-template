@@ -1,0 +1,51 @@
+---
+# Directories and env files. Key files are only created
+# if they are missing (force: false), never overwritten, never shown.
+
+- name: Private directories (0700)
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0700"
+  loop:
+    - "{{ backup_s3_root_env | dirname }}"
+    - "{{ backup_s3_user_env | dirname }}"
+    - "{{ backup_s3_k8up_user_env | dirname }}"
+    - "{{ backup_s3_backup_dir }}"
+
+- name: Quadlet, data and log directory
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - "{{ backup_s3_quadlet_dir }}"
+    - "{{ backup_s3_data_dir | dirname }}"
+
+  # Do not set permissions: podman (volume option U) gives them to the container user.
+- name: Data and log directory of rustfs
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "{{ omit }}"
+  loop:
+    - "{{ backup_s3_data_dir }}"
+    - "{{ backup_s3_log_dir }}"
+
+  # Format and randomness come from scripts/lab-secrets.py (one source, as with
+  # lab.sh init). An existing file stays as it is.
+- name: Create root key of rustfs, only if rustfs.env is missing
+  ansible.builtin.include_tasks: "{{ role_path }}/../../tasks/secrets-generate.yml"
+  vars:
+    secret_names: [rustfs-root]
+
+- name: Check rustfs.env readable only for the owner (content stays)
+  ansible.builtin.file:
+    path: "{{ backup_s3_root_env }}"
+    mode: "0600"
+  when: not ansible_check_mode
+
+- name: Create keys for bucket users (CNPG, K8up), only if the file is missing
+  ansible.builtin.include_tasks: "{{ role_path }}/../../tasks/secrets-generate.yml"
+  vars:
+    secret_names: [s3-cnpg, s3-k8up]

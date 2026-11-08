@@ -1,0 +1,15 @@
+# {{ ansible_managed }}
+# Issue #3: cadence of the replica checksum check.
+# Source: ansible/roles/backup_replica/templates/replica-verify.timer.j2
+# Values: ansible/inventory/group_vars/all/backup_replica.yml (backup_replica_verify_calendar).
+
+[Unit]
+Description=Replica checksum check ({{ backup_replica_verify_calendar }})
+
+[Timer]
+OnCalendar={{ backup_replica_verify_calendar }}
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

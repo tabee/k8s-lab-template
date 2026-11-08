@@ -1,0 +1,21 @@
+---
+# KSOPS generator: decrypts the listed files when rendering
+# (repo-server, age key). lab.sh init renders the *.sops.yaml files
+# from the examples. Values never go into the bundle or the log.
+apiVersion: viaduct.ai/v1
+kind: ksops
+metadata:
+  name: secrets-matrix
+  annotations:
+    config.kubernetes.io/function: |
+      exec:
+        path: ksops
+files:
+  - ./backup-s3-creds.sops.yaml
+  - ./matrix-db-owner.sops.yaml
+  - ./matrix-admin.sops.yaml
+  - ./matrix-registration.sops.yaml
+  - ./matrix-signing-key.sops.yaml
+  - ./k8up-s3-creds.sops.yaml
+  - ./k8up-repo.sops.yaml
+  - ./matrix-oidc.sops.yaml

@@ -1,0 +1,141 @@
+---
+# Host firewall: own table "inet host_filter", hook input only.
+# No "flush ruleset": k3s (kube-proxy, flannel, network policy controller)
+# writes its own tables via iptables-nft, they must stay untouched.
+# A packet must pass ALL base chains at the same hook; our chain
+# can therefore only drop additionally, never lift anything from k3s.
+
+- name: Admin and ingress networks are valid, not world-open networks
+  ansible.builtin.assert:
+    that:
+      - firewall_admin_cidrs | length > 0
+      - firewall_ingress_cidrs | length > 0
+      - (firewall_admin_cidrs + firewall_ingress_cidrs) | reject('regex', firewall_cidr_muster) | list | length == 0
+      # Admin must never be world-open (SSH, API, NodePorts). Ingress may be (edge on the internet).
+      - firewall_admin_cidrs | select('regex', '/0$') | list | length == 0
+    fail_msg: >-
+      Network invalid or admin network world-open. Admin: {{ firewall_admin_cidrs }},
+      Ingress: {{ firewall_ingress_cidrs }}. Expected, CIDR like 192.168.122.0/24
+      (lab.yaml: edge_admin_cidrs, edge_ingress_cidrs, edge_profile_admin).
+    quiet: true
+  vars:
+    firewall_cidr_muster: '^([0-9]{1,3}(\.[0-9]{1,3}){3}/([0-9]|[12][0-9]|3[0-2])|[0-9a-fA-F:]+:[0-9a-fA-F:.]*/([0-9]|[1-9][0-9]|1[01][0-9]|12[0-8]))$'
+
+- name: Read sender IP of the Ansible connection
+  ansible.builtin.command: printenv SSH_CLIENT
+  become: false
+  register: firewall_ssh_client
+  changed_when: false
+  check_mode: false
+
+- name: Control machine is in an admin network (protection against lockout)
+  ansible.builtin.command:
+    argv: "{{ ['python3', '-c', firewall_cidr_check, firewall_ssh_client.stdout.split()[0]] + firewall_admin_cidrs }}"
+  vars:
+    firewall_cidr_check: |
+      import ipaddress, sys
+      src = ipaddress.ip_address(sys.argv[1])
+      sys.exit(0 if any(src in ipaddress.ip_network(n, strict=False) for n in sys.argv[2:]) else 1)
+  register: firewall_admin_check
+  changed_when: false
+  failed_when: firewall_admin_check.rc != 0
+  check_mode: false
+
+- name: Check whether UFW is present
+  ansible.builtin.stat:
+    path: /usr/sbin/ufw
+  register: firewall_ufw_bin
+
+- name: Read UFW status
+  ansible.builtin.command: /usr/sbin/ufw status
+  register: firewall_ufw_status
+  changed_when: false
+  check_mode: false
+  when: firewall_ufw_bin.stat.exists
+
+- name: UFW must not be active (two firewall managers do not get along)
+  ansible.builtin.assert:
+    that:
+      - "'Status: active' not in firewall_ufw_status.stdout"
+    fail_msg: "UFW is active. First 'sudo ufw disable', base_ufw_enabled stays false."
+    quiet: true
+  when: firewall_ufw_bin.stat.exists
+
+- name: Install nftables
+  ansible.builtin.apt:
+    name: nftables
+    state: present
+
+- name: Directory for own nftables files
+  ansible.builtin.file:
+    path: /etc/nftables.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Write rules of table host_filter (check with nft -c beforehand)
+  ansible.builtin.template:
+    src: host_filter.nft.j2
+    dest: /etc/nftables.d/host_filter.nft
+    owner: root
+    group: root
+    mode: "0600"
+    validate: /usr/sbin/nft -c -f %s
+  register: firewall_rules
+
+- name: /etc/nftables.conf without "flush ruleset", include only
+  ansible.builtin.template:
+    src: nftables.conf.j2
+    dest: /etc/nftables.conf
+    owner: root
+    group: root
+    mode: "0600"
+    validate: /usr/sbin/nft -c -f %s
+  register: firewall_conf
+
+- name: Directory for systemd drop-in of nftables.service
+  ansible.builtin.file:
+    path: /etc/systemd/system/nftables.service.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Drop-in so that stopping nftables.service does not delete k3s rules
+  ansible.builtin.template:
+    src: nftables-service-override.conf.j2
+    dest: /etc/systemd/system/nftables.service.d/10-k3s-safe.conf
+    owner: root
+    group: root
+    mode: "0644"
+  register: firewall_unit
+
+# Migration (release-prep): the drop-in used to be called 10-k3s-sicher.conf (German name). Same content, so
+# the old file must go, otherwise two drop-ins would sit side by side. Only the first run on an existing VM
+# changes anything (one normal firewall apply with the dead man's switch); every later run reports ok.
+# Can be deleted from this role once every VM has run it once.
+- name: Remove the drop-in under its old German name
+  ansible.builtin.file:
+    path: /etc/systemd/system/nftables.service.d/10-k3s-sicher.conf
+    state: absent
+  register: firewall_unit_old
+
+- name: Is the table host_filter already loaded?
+  ansible.builtin.command: /usr/sbin/nft list table inet host_filter
+  register: firewall_table
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Decide whether a reload is needed
+  ansible.builtin.set_fact:
+    firewall_needs_apply: >-
+      {{ firewall_rules.changed or firewall_conf.changed
+         or firewall_unit.changed or firewall_unit_old.changed or firewall_table.rc != 0 }}
+
+- name: Apply rules with dead man's switch
+  ansible.builtin.include_tasks: apply.yml
+  when:
+    - firewall_needs_apply | bool
+    - not ansible_check_mode

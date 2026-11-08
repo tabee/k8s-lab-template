@@ -1,0 +1,21 @@
+---
+# Namespace for Keycloak (single sign-on) and its database keycloak-db.
+# PSA restricted: Keycloak runs as uid 1000, CNPG as uid 26, the realm job
+# as uid 65534. Keycloak keeps no data on a volume (everything is in the
+# database), so there is no PVC and no K8up here.
+# Delete=false: removing the app keycloak keeps the namespace and the
+# secrets (app secrets-keycloak).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: keycloak
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+    argocd.argoproj.io/sync-wave: "-1"
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest

@@ -1,0 +1,7 @@
+---
+# Kustomize for the encrypted secrets in the namespace keycloak.
+# Only the KSOPS generator; the list of files is in ksops.yaml.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+generators:
+  - ksops.yaml

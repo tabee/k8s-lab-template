@@ -1,0 +1,325 @@
+---
+# Check sidequest docs site (https://docs.<domain>), read only:
+# k8s_info, HTTPS from outside via curl --cacert (lab CA) with --resolve and a
+# PSA test pod via server dry run (check_mode: true, nothing is created).
+# Usage: ansible-playbook verify-docs.yml
+# No /etc/hosts entry needed. Needs curl and lab_ca_cert_path
+# (creates argocd.yml). Runbook: docs/how-to/docs-site.md
+
+- name: Check docs site
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: "{{ argocd_kubeconfig }}"
+  vars:
+    # Repetitions x pause (seconds) while waiting for sync/ready/build.
+    verify_retries: 30
+    verify_delay: 10
+    # Mirror of the GitOps values (gitops/apps/docs.yaml, gitops/workloads/docs,
+    # zensical.toml); Ansible does not read gitops/.
+    verify_docs_app: docs
+    verify_docs_cert: docs
+    verify_docs_netpol: docs-allow-traefik
+    # Egress policy (wave 2, issue #5), gitops/workloads/docs/networkpolicy.yaml.
+    verify_docs_netpol_egress: docs-allow-egress
+    verify_docs_host: "docs.{{ lab.domain }}"
+    verify_docs_title: "<title>Start - k8s-lab Doku</title>"
+    # Spot checks: how-to, concept page and GitOps reference (subfolders of docs/).
+    verify_docs_pages:
+      - /how-to/rebuild/
+      - /concepts/architecture/
+      - /reference/gitops-layout/
+    # Page docs/graph.md (plugin v2) or title in zensical.toml (older).
+    verify_docs_graph_title: "<title>Wissensgraph - k8s-lab Doku</title>"
+    # false if the plugin is off in zensical.toml
+    # (ansible-playbook verify-docs.yml -e verify_docs_graph=false).
+    verify_docs_graph: false
+    # Self-hosted Mermaid (docs/vendor-mermaid.py): script and integrity hash in the page, file served by the site itself.
+    # false with MERMAID_SELF_HOST=0 in docs/build.sh (ansible-playbook verify-docs.yml -e verify_docs_mermaid=false).
+    verify_docs_mermaid: true
+    verify_docs_mermaid_min_bytes: 1000000
+    # First k3s host: its IP is the LoadBalancer address (ServiceLB).
+    verify_k3s_host: "{{ groups['k3s'] | first }}"
+    verify_lb_ip: "{{ hostvars[verify_k3s_host]['ansible_host'] }}"
+    # curl against the docs site, path is appended.
+    verify_curl:
+      - curl
+      - --silent
+      - --show-error
+      - --max-time
+      - "10"
+      - --cacert
+      - "{{ lab_ca_cert_path | expanduser }}"
+      - --resolve
+      - "{{ verify_docs_host }}:443:{{ verify_lb_ip }}"
+  tasks:
+    # ---------- Namespace ----------
+    - name: Read namespace docs
+      kubernetes.core.k8s_info:
+        kind: Namespace
+        name: "{{ docs_namespace }}"
+      register: verify_ns
+
+    - name: Namespace docs enforces PSA restricted
+      ansible.builtin.assert:
+        that:
+          - verify_ns.resources | length == 1
+          - verify_ns_labels['pod-security.kubernetes.io/enforce'] | default('') == 'restricted'
+          - verify_ns_labels['pod-security.kubernetes.io/audit'] | default('') == 'restricted'
+          - verify_ns_labels['pod-security.kubernetes.io/warn'] | default('') == 'restricted'
+        fail_msg: "Namespace {{ docs_namespace }} is missing or does not have enforce/audit/warn=restricted"
+        quiet: true
+      vars:
+        verify_ns_labels: "{{ (verify_ns.resources | first).metadata.labels | default({}) }}"
+
+    # ---------- Argo CD ----------
+    - name: Read application docs
+      kubernetes.core.k8s_info:
+        api_version: argoproj.io/v1alpha1
+        kind: Application
+        namespace: "{{ argocd_namespace }}"
+        name: "{{ verify_docs_app }}"
+      register: verify_app
+      until: >-
+        verify_app.resources | length == 1 and
+        (verify_app.resources | first).status.sync.status | default('') == 'Synced' and
+        (verify_app.resources | first).status.health.status | default('') == 'Healthy'
+      retries: "{{ verify_retries }}"
+      delay: "{{ verify_delay }}"
+
+    - name: Docs is Synced, Healthy and in project lab
+      ansible.builtin.assert:
+        that:
+          - verify_app_obj.status.sync.status == 'Synced'
+          - verify_app_obj.status.health.status == 'Healthy'
+          - verify_app_obj.spec.project == argocd_project
+        fail_msg: "Application {{ verify_docs_app }} not Synced/Healthy or wrong project"
+        success_msg: "Revision {{ verify_app_obj.status.sync.revision | default('-') }}"
+      vars:
+        verify_app_obj: "{{ verify_app.resources | first }}"
+
+    # ---------- Pod, Certificate, NetworkPolicy ----------
+    - name: Read docs pod
+      kubernetes.core.k8s_info:
+        kind: Pod
+        namespace: "{{ docs_namespace }}"
+        label_selectors:
+          - app.kubernetes.io/name=docs
+        field_selectors:
+          - status.phase=Running
+      register: verify_pods
+      until:
+        - verify_pods.resources | length > 0
+        - verify_pods_cs | select('equalto', []) | list | length == 0
+        - verify_pods_cs | flatten | rejectattr('ready') | list | length == 0
+      retries: "{{ verify_retries }}"
+      delay: "{{ verify_delay }}"
+      vars:
+        verify_pods_cs: "{{ verify_pods.resources | map(attribute='status.containerStatuses', default=[]) | list }}"
+
+    - name: Docs pod is Ready (builder and web)
+      ansible.builtin.assert:
+        that:
+          - verify_pods.resources | length == 1
+          - verify_names | sort == ['builder', 'web']
+        fail_msg: "Expected exactly one pod with builder and web, found: {{ verify_pods.resources | map(attribute='metadata.name') | list }}"
+        success_msg: "Ready: {{ verify_pods.resources | map(attribute='metadata.name') | join(', ') }}"
+      vars:
+        verify_names: "{{ (verify_pods.resources | first).status.containerStatuses | map(attribute='name') | list }}"
+
+    - name: Read Certificate docs
+      kubernetes.core.k8s_info:
+        api_version: cert-manager.io/v1
+        kind: Certificate
+        namespace: "{{ docs_namespace }}"
+        name: "{{ verify_docs_cert }}"
+      register: verify_cert
+      until: >-
+        verify_cert.resources | length == 1 and
+        ((verify_cert.resources | first).status.conditions | default([])
+          | selectattr('type', 'equalto', 'Ready') | selectattr('status', 'equalto', 'True') | list | length) == 1
+      retries: "{{ verify_retries }}"
+      delay: "{{ verify_delay }}"
+
+    - name: Certificate is Ready and issued for the docs name
+      ansible.builtin.assert:
+        that: verify_docs_host in (verify_cert.resources | first).spec.dnsNames
+        fail_msg: "Certificate {{ verify_docs_cert }} without {{ verify_docs_host }}"
+        success_msg: "Valid until {{ (verify_cert.resources | first).status.notAfter | default('-') }}"
+
+    - name: Read NetworkPolicies in namespace docs
+      kubernetes.core.k8s_info:
+        api_version: networking.k8s.io/v1
+        kind: NetworkPolicy
+        namespace: "{{ docs_namespace }}"
+      register: verify_netpols
+
+    - name: Namespace docs holds exactly the two own NetworkPolicies (ingress and egress)
+      ansible.builtin.assert:
+        that: verify_netpols.resources | map(attribute='metadata.name') | sort | list == [verify_docs_netpol, verify_docs_netpol_egress] | sort
+        fail_msg: >-
+          Expected {{ [verify_docs_netpol, verify_docs_netpol_egress] | sort }},
+          found: {{ verify_netpols.resources | map(attribute='metadata.name') | sort | list }}
+        quiet: true
+
+    # ---------- From outside (control machine) ----------
+    - name: Find the public CA certificate
+      ansible.builtin.stat:
+        path: "{{ lab_ca_cert_path | expanduser }}"
+      register: verify_ca_crt
+
+    - name: Public CA certificate is present
+      ansible.builtin.assert:
+        that: verify_ca_crt.stat.exists
+        fail_msg: "{{ lab_ca_cert_path }} is missing: first run ansible-playbook argocd.yml"
+        quiet: true
+
+    - name: Query HTTP on port 80
+      ansible.builtin.uri:
+        url: "http://{{ verify_lb_ip }}/"
+        headers:
+          Host: "{{ verify_docs_host }}"
+        follow_redirects: none
+        status_code: [301, 308]
+      register: verify_http
+
+    - name: Port 80 redirects to HTTPS
+      ansible.builtin.assert:
+        that: verify_http.location | default('') is match('https://' ~ verify_docs_host)
+        fail_msg: "No redirect to https://{{ verify_docs_host }} (Location: {{ verify_http.location | default('-') }})"
+        quiet: true
+
+    # curl instead of uri: only curl can specify the IP (--resolve) and still
+    # send the right SNI name. Without -k: the chain must be valid against the
+    # lab CA. 200 only after the first build (503 before).
+    - name: Query the start page over HTTPS with verification against the lab CA  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        argv: "{{ verify_curl + ['--include', 'https://' ~ verify_docs_host ~ '/'] }}"
+      register: verify_https
+      changed_when: false
+      check_mode: false
+      until: verify_https.rc == 0 and verify_https.stdout is search('^HTTP/\\S+ 200', multiline=true)
+      retries: "{{ verify_retries }}"
+      delay: "{{ verify_delay }}"
+
+    - name: Start page is the docs and carries the security headers
+      ansible.builtin.assert:
+        that:
+          - verify_docs_title in verify_https.stdout
+          - ('rel="canonical" href="https://' ~ verify_docs_host ~ '/"') in verify_https.stdout
+          - verify_https.stdout is search('^strict-transport-security:[ ]*max-age=[1-9]', multiline=true, ignorecase=true)
+          - verify_https.stdout is search('^x-content-type-options:[ ]*nosniff', multiline=true, ignorecase=true)
+          - verify_https.stdout is search('^x-frame-options:[ ]*DENY', multiline=true, ignorecase=true)
+          - verify_https.stdout is search('^referrer-policy:[ ]*no-referrer', multiline=true, ignorecase=true)
+          - verify_https.stdout is not search('^server:', multiline=true, ignorecase=true)
+          - verify_https.stdout is search('^cache-control:[ ]*no-cache\\s*$', multiline=true, ignorecase=true)
+        fail_msg: "HTTPS ok, but title or headers are missing (HSTS, nosniff, DENY, Referrer, Server, Cache-Control no-cache)"
+        quiet: true
+
+    - name: Start page carries the Content-Security-Policy (report only until it is switched to enforcing)
+      ansible.builtin.assert:
+        that:
+          - verify_https.stdout is search("^content-security-policy(-report-only)?:[ ]*default-src 'none'", multiline=true, ignorecase=true)
+          - verify_https.stdout is search("^content-security-policy(-report-only)?:[^\\n]*script-src 'self'", multiline=true, ignorecase=true)
+        fail_msg: "No Content-Security-Policy(-Report-Only) header with default-src 'none' and script-src 'self' (gitops/workloads/docs/middleware.yaml)"
+        quiet: true
+
+    - name: Mermaid comes from the docs site itself, with an integrity hash
+      ansible.builtin.assert:
+        that:
+          - verify_mermaid_src | length > 0
+          - verify_https.stdout is search('integrity="sha384-')
+        fail_msg: >-
+          The start page has no script assets/vendor/mermaid/mermaid-VERSION.min.js with an integrity attribute
+          (docs/build.sh calls docs/vendor-mermaid.py; MERMAID_SELF_HOST=0 turns it off: then -e verify_docs_mermaid=false)
+        quiet: true
+      vars:
+        verify_mermaid_src: "{{ verify_https.stdout | regex_search('assets/vendor/mermaid/mermaid-[0-9.]+[.]min[.]js') | default('', true) }}"
+      when: verify_docs_mermaid | bool
+
+    - name: Query the self-hosted Mermaid file  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        argv: >-
+          {{ verify_curl + ['--fail', '--output', '/dev/null', '--write-out', '%{size_download}',
+          'https://' ~ verify_docs_host ~ '/' ~ (verify_https.stdout | regex_search('assets/vendor/mermaid/mermaid-[0-9.]+[.]min[.]js')) ] }}
+      register: verify_mermaid_file
+      changed_when: false
+      check_mode: false
+      when: verify_docs_mermaid | bool
+
+    - name: The Mermaid file is served in full
+      ansible.builtin.assert:
+        that: (verify_mermaid_file.stdout | int) > verify_docs_mermaid_min_bytes
+        fail_msg: "Mermaid file too small: {{ verify_mermaid_file.stdout | default('?') }} bytes (expected more than {{ verify_docs_mermaid_min_bytes }})"
+        quiet: true
+      when: verify_docs_mermaid | bool
+
+    - name: Query docs pages  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        argv: "{{ verify_curl + ['--fail', '--output', '/dev/null', 'https://' ~ verify_docs_host ~ item] }}"
+      loop: "{{ verify_docs_pages }}"
+      changed_when: false
+      check_mode: false
+
+    - name: Query graph page  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        argv: "{{ verify_curl + ['--fail', 'https://' ~ verify_docs_host ~ '/graph/'] }}"
+      register: verify_graph_page
+      changed_when: false
+      check_mode: false
+      when: verify_docs_graph | bool
+
+    - name: Query graph data  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        argv: "{{ verify_curl + ['--fail', 'https://' ~ verify_docs_host ~ '/graph/graph.json'] }}"
+      register: verify_graph_json
+      changed_when: false
+      check_mode: false
+      when: verify_docs_graph | bool
+
+    - name: Knowledge graph exists and has pages and links
+      ansible.builtin.assert:
+        that:
+          - verify_docs_graph_title in verify_graph_page.stdout
+          - verify_graph.nodes | length > 1
+          - verify_graph.links | length > 0
+        fail_msg: "Graph page or graph.json is missing or empty (graph plugin)"
+        success_msg: "Graph: {{ verify_graph.nodes | length }} pages, {{ verify_graph.links | length }} links"
+      vars:
+        verify_graph: "{{ verify_graph_json.stdout | from_json }}"
+      when: verify_docs_graph | bool
+
+    # ---------- PSA proof ----------
+    - name: Send PSA probe via server dry run
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: psa-probe
+            namespace: "{{ docs_namespace }}"
+          spec:
+            containers:
+              - name: probe
+                image: "{{ lab_probe_image }}"
+                securityContext:
+                  privileged: true
+      check_mode: true
+      register: verify_psa_probe
+      ignore_errors: true  # the assert reads failed and msg; failed_when: false resets them (ansible-core 2.19+)
+
+    - name: PSA rejects insecure pods in namespace docs
+      ansible.builtin.assert:
+        that: verify_psa_probe.msg | default('') is search('violates PodSecurity')
+        fail_msg: "Namespace {{ docs_namespace }}: test pod was NOT rejected by PSA"
+        quiet: true
+
+    # Wave 2 (issue #5): namespace docs (control pod in a policy-free namespace first).
+    - name: Egress probes (allowed targets connect, everything else is blocked)
+      ansible.builtin.include_tasks: tasks/egress-probe.yml
+      vars:
+        egress_probes: "{{ egress_probe_control + egress_probe_docs }}"
+      tags: [egress]

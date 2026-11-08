@@ -1,0 +1,99 @@
+---
+# WireGuard tunnel (issue #60). Mode comes from the play (server on k3s, client on backup_host).
+# Private keys are files on disk (lab-secrets kind wireguard); this role never logs them.
+
+- name: Skip when WireGuard is off
+  ansible.builtin.meta: end_host
+  when: not (wireguard_enabled | bool)
+
+- name: Assert mode is server or client
+  ansible.builtin.assert:
+    that:
+      - wireguard_mode in ['server', 'client']
+      - wireguard_address | length > 0
+      - wireguard_private_key_path | length > 0
+      - wireguard_peer_public_key | length > 0
+      - wireguard_peer_allowed_ips | length > 0
+      - wireguard_mode != 'client' or (wireguard_peer_endpoint | length > 0)
+    fail_msg: >-
+      wireguard_mode={{ wireguard_mode }} needs address, private key path, peer public key,
+      AllowedIPs{{ ' and Endpoint' if wireguard_mode == 'client' else '' }}.
+    quiet: true
+
+- name: Install WireGuard tools
+  ansible.builtin.apt:
+    name:
+      - wireguard
+      - wireguard-tools
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: WireGuard config directory
+  ansible.builtin.file:
+    path: /etc/wireguard
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Private key is present and mode 600
+  ansible.builtin.stat:
+    path: "{{ wireguard_private_key_path }}"
+  register: wireguard_priv
+  no_log: true
+
+- name: Abort when the private key is missing
+  ansible.builtin.assert:
+    that:
+      - wireguard_priv.stat.exists
+      - wireguard_priv.stat.mode == '0600'
+    fail_msg: >-
+      Private key {{ wireguard_private_key_path }} is missing or not mode 600.
+      Generate it with lab-secrets (kind wireguard), see docs/how-to/wireguard-tunnel.md.
+    quiet: true
+  no_log: true
+
+# The private key lives on the control PC. For the server (node) Ansible copies it from the
+# controller. For the client (connection local) the same path is already on this host.
+- name: Install private key for local (client) from the key path
+  ansible.builtin.copy:
+    src: "{{ wireguard_private_key_path }}"
+    dest: "/etc/wireguard/{{ wireguard_interface }}.key"
+    owner: root
+    group: root
+    mode: "0600"
+    remote_src: true
+  when: wireguard_mode == 'client'
+  no_log: true
+  notify: Restart WireGuard
+
+- name: Install private key for remote (server) from the controller
+  ansible.builtin.copy:
+    src: "{{ wireguard_private_key_path }}"
+    dest: "/etc/wireguard/{{ wireguard_interface }}.key"
+    owner: root
+    group: root
+    mode: "0600"
+  when: wireguard_mode == 'server'
+  no_log: true
+  notify: Restart WireGuard
+
+- name: Point the conf PostUp at the installed key
+  ansible.builtin.set_fact:
+    wireguard_private_key_path: "/etc/wireguard/{{ wireguard_interface }}.key"
+
+- name: Deploy WireGuard configuration (no private key inside)
+  ansible.builtin.template:
+    src: wg0.conf.j2
+    dest: "/etc/wireguard/{{ wireguard_interface }}.conf"
+    owner: root
+    group: root
+    mode: "0600"
+  notify: Reload WireGuard peers
+
+- name: Enable and start WireGuard
+  ansible.builtin.systemd:
+    name: "wg-quick@{{ wireguard_interface }}"
+    state: started
+    enabled: true

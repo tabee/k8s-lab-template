@@ -1,0 +1,14 @@
+# Template for matrix-registration.sops.yaml: structure without real values.
+# Shared secret for the one admin registration. Not the admin password.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: matrix-registration
+  namespace: matrix
+  labels:
+    app.kubernetes.io/managed-by: argocd
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+type: Opaque
+stringData:
+  shared_secret: "@file:matrix-registration-secret"

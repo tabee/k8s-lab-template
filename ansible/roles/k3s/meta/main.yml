@@ -1,0 +1,42 @@
+---
+# Role "k3s": single-node server with a pinned, verified version.
+galaxy_info:
+  author: k8s-lab
+  description: Install the k3s server and fetch the kubeconfig
+  license: MIT
+  min_ansible_version: "2.17"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - noble
+dependencies: []
+
+# Required variables; values come from inventory/group_vars/k3s/main.yml.
+argument_specs:
+  main:
+    short_description: k3s-Server
+    options:
+      k3s_version: { type: str, required: true, description: Pinned k3s version }
+      k3s_binary_sha256: { type: dict, required: true, description: SHA256 per architecture }
+      k3s_install_script_sha256: { type: str, required: true, description: SHA256 of install.sh }
+      k3s_release_url: { type: str, required: true, description: Base URL of the release artifacts }
+      k3s_install_script_url: { type: str, required: true, description: URL of install.sh }
+      k3s_context_name: { type: str, required: true, description: Name im Kubeconfig }
+      k3s_api_endpoint: { type: str, required: true, description: API address for kubectl }
+      k3s_kubeconfig_local_path: { type: str, required: true, description: Local kubeconfig target }
+      k3s_cluster_cidr: { type: str, required: true, description: Pod-Netz }
+      k3s_service_cidr: { type: str, required: true, description: Service-Netz }
+      k3s_ready_retries: { type: int, required: true, description: Attempts until Ready }
+      k3s_ready_delay: { type: int, required: true, description: Pause per attempt }
+      k3s_server_config: { type: dict, required: true, description: Content of config.yaml }
+      k3s_server_data_dir: { type: str, required: true, description: Server data directory }
+      k3s_psa_config_path: { type: str, required: true, description: Path of the AdmissionConfiguration }
+      k3s_audit_policy_path: { type: str, required: true, description: Path of the audit policy }
+      k3s_audit_log_path: { type: str, required: true, description: Path of the audit log }
+      k3s_psa_level:
+        type: str
+        required: true
+        choices: [privileged, baseline, restricted]
+        description: PSA level for all namespaces
+      k3s_psa_version: { type: str, required: true, description: PSA version (latest or v1.x) }
+      k3s_psa_exempt_namespaces: { type: list, elements: str, required: true, description: PSA exemptions }

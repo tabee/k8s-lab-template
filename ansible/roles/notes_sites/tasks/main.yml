@@ -1,0 +1,75 @@
+---
+# Notes sites: read and check the list, AppProject, then per site
+# site.yml. Secrets never appear in the output: no_log and diff: false.
+
+- name: Read list of notebooks (gitops/sites.yaml)
+  ansible.builtin.set_fact:
+    notes_sites_list: "{{ lookup('ansible.builtin.file', notes_sites_file) | from_yaml | default([], true) }}"
+
+- name: List is valid (required fields, names, no duplicates)
+  ansible.builtin.assert:
+    that:
+      - notes_sites_list is sequence and notes_sites_list is not string
+      - notes_sites_list | rejectattr('name', 'defined') | list | length == 0
+      - notes_sites_list | rejectattr('repo', 'defined') | list | length == 0
+      - notes_sites_list | rejectattr('host', 'defined') | list | length == 0
+      - notes_sites_names | reject('match', '^[a-z0-9]([a-z0-9-]{0,18}[a-z0-9])?$') | list | length == 0
+      - notes_sites_list | map(attribute='repo') | reject('match', '^ssh://') | list | length == 0
+      - notes_sites_names | unique | length == notes_sites_names | length
+      - notes_sites_list | map(attribute='host') | unique | length == notes_sites_list | length
+      - notes_sites_list | map(attribute='auth', default=notes_auth_default) | difference(['sso', 'basic']) | length == 0
+    fail_msg: >-
+      {{ notes_sites_file }}: every entry needs name (a-z, 0-9, -, max. 20),
+      repo (ssh://...) and host; name and host only once each; auth (optional) is sso or basic.
+    quiet: true
+  vars:
+    notes_sites_names: "{{ notes_sites_list | map(attribute='name', default='') | map('string') | list }}"
+
+# CRD from the Argo chart: not there yet in check mode on the first run.
+- name: Create AppProject notes (only this repo, only notes-*, nothing cluster-wide)
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: argoproj.io/v1alpha1
+      kind: AppProject
+      metadata:
+        name: "{{ notes_project }}"
+        namespace: "{{ argocd_namespace }}"
+      spec:
+        description: Notes sites from gitops/sites.yaml, this repo only and namespaces notes-*
+        sourceRepos:
+          - "{{ argocd_repo_url }}"
+        destinations:
+          - server: "{{ argocd_destination_server }}"
+            namespace: "{{ notes_namespace_prefix }}*"
+        clusterResourceWhitelist: []
+  when: not ansible_check_mode
+
+- name: Per notebook namespace, deploy key, password or cookie key and secrets
+  ansible.builtin.include_tasks: site.yml
+  loop: "{{ notes_sites_list }}"
+  loop_control:
+    loop_var: notes_site
+    label: "{{ notes_site.name }}"
+
+# Removed entries: Argo CD cleans up the app, namespace, secrets, key and
+# password stay (they belong to Ansible, nothing is deleted automatically).
+- name: Find namespaces of notes sites
+  kubernetes.core.k8s_info:
+    kind: Namespace
+    label_selectors:
+      - app.kubernetes.io/part-of=notes
+      - app.kubernetes.io/managed-by=ansible
+  register: notes_sites_namespaces
+
+- name: Notice about namespaces without an entry in the list
+  ansible.builtin.debug:
+    msg:
+      - "Namespace {{ item }} has no entry anymore in {{ notes_sites_file | basename }}."
+      - "Argo CD removed the site; namespace and secrets stay. Clean up (deliberately by hand):"
+      - "  kubectl delete namespace {{ item }}"
+      - "  rm {{ notes_deploy_key_dir }}/{{ item }}-deploy{,.pub} {{ notes_password_dir }}/{{ item }}.passwort {{ notes_cookie_dir }}/{{ item }}.cookie"
+      - "  and delete the deploy key in Gitea."
+  loop: "{{ notes_sites_namespaces.resources | map(attribute='metadata.name') | difference(notes_sites_wanted) }}"
+  vars:
+    notes_sites_wanted: "{{ notes_sites_list | map(attribute='name') | map('regex_replace', '^', notes_namespace_prefix) | list }}"

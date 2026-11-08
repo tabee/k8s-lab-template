@@ -1,0 +1,24 @@
+---
+# Files for every job pod (mounted by the pod template in configmap.yaml).
+#   gitconfig  system git config (GIT_CONFIG_SYSTEM): the workflows clone from github.server_url, which is the public
+#              ROOT_URL of Gitea (https://<DOMAIN>/, certificate of the lab CA, name only in /etc/hosts of the
+#              operator). insteadOf sends the clone to the Service gitea-http inside the cluster instead. COPY of the
+#              DOMAIN in gitops/workloads/gitea/values-gitea.yaml; tests/gitea-runner-tests.sh compares them and
+#              "lab.sh customize" rewrites both. Plain HTTP stays on the node (one node, pod network).
+#   passwd,    uid/gid 1000 of the pod template. Replaces the image's files: root and the job user are enough for
+#   group      git, ssh-keygen, pip and ansible.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gitea-runner-job-env
+  namespace: gitea-runner-jobs
+data:
+  gitconfig: |
+    [url "http://gitea-http.gitea.svc:3000/"]
+      insteadOf = https://git.lab.example/
+  passwd: |
+    root:x:0:0:root:/root:/bin/sh
+    runner:x:1000:1000:Gitea Actions job:/tmp:/bin/sh
+  group: |
+    root:x:0:
+    runner:x:1000:

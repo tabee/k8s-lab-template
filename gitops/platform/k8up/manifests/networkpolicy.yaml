@@ -1,0 +1,14 @@
+---
+# Incoming in the namespace k8up: nothing. The operator has no webhook;
+# nobody in the lab needs its metrics port 8080 (no Prometheus).
+# Outgoing stays open (API server). Only the backup pods in the namespace gitea
+# talk to S3, not the operator.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: k8up
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress

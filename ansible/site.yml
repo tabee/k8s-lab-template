@@ -1,0 +1,34 @@
+---
+# Main playbook: base hardening, host firewall, then k3s.
+# Check first: ansible-playbook site.yml --check --diff
+# Afterwards (read only): ansible-playbook verify.yml
+
+- name: Set up k3s nodes
+  hosts: k3s
+  become: true
+  roles:
+    - role: base
+    - role: firewall
+    # WireGuard (issue #60): off by default (wireguard_enabled). Production turns it on
+    # before closing public SSH/API. Dead man's switch of the firewall role still applies.
+    - role: wireguard
+      vars:
+        wireguard_mode: server
+        wireguard_address: "{{ wireguard_address_server }}"
+        wireguard_private_key_path: "{{ wireguard_server_key_path }}"
+        wireguard_peer_public_key: "{{ lookup('ansible.builtin.file', wireguard_client_key_path ~ '.pub', errors='ignore') | default('', true) | trim }}"
+        wireguard_peer_allowed_ips: "{{ wireguard_allowed_ips_on_server }}"
+        wireguard_peer_endpoint: ""
+      when: wireguard_enabled | bool
+    - role: k3s
+    # GitOps with Argo CD: own playbook argocd.yml (stage 4, runs on
+    # localhost against the k8s API), see docs/learning-path/stage-4-argocd.md.
+  post_tasks:
+    # base runs before k3s and only watches paths that already exist.
+    # On a fresh VM /etc/rancher/k3s does not exist yet. Hence write the
+    # audit rules again after k3s: fresh VM done in one run,
+    # second run stays changed=0.
+    - name: Re-apply audit rules after k3s (k3s paths exist now)
+      ansible.builtin.import_role:
+        name: base
+        tasks_from: auditd

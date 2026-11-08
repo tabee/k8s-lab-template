@@ -1,0 +1,41 @@
+---
+# Hard ceiling of the job namespace. The memory budget counts ONE job pod with the limit of
+# the pod template in configmap.yaml (512 MiB). The quota makes that true even if the runner (or a stolen
+# runner token) creates more pods: a second pod or a bigger limit is rejected by the API server.
+# tests/gitea-runner-tests.sh checks that limits.memory equals the job limit and that pods is 1.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: gitea-runner-jobs
+  namespace: gitea-runner-jobs
+spec:
+  hard:
+    pods: "1"
+    limits.memory: 512Mi
+    requests.memory: 512Mi
+    requests.ephemeral-storage: 8Gi
+    limits.ephemeral-storage: 8Gi
+    count/secrets: "8"
+    count/configmaps: "4"
+    services: "0"
+    persistentvolumeclaims: "0"
+---
+# Net under the quota: a container without its own values gets these (the quota needs every pod to set
+# memory and ephemeral storage). Not a copy of lab-memory: the ceiling here is the job limit.
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: gitea-runner-jobs
+  namespace: gitea-runner-jobs
+spec:
+  limits:
+    - type: Container
+      default:
+        memory: 256Mi
+        ephemeral-storage: 1Gi
+      defaultRequest:
+        memory: 64Mi
+        ephemeral-storage: 256Mi
+      max:
+        memory: 512Mi
+        ephemeral-storage: 8Gi

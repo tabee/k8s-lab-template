@@ -1,0 +1,14 @@
+# {{ ansible_managed }}
+# Stage 8a: watchdog for the external path to rustfs (oneshot, from the timer).
+# Source: ansible/roles/backup_s3/templates/rustfs-watchdog.service.j2,
+# Values: ansible/inventory/group_vars/all/backup_s3.yml (backup_s3_watchdog_*).
+# Reasoning and flow: {{ backup_s3_script_dir }}/rustfs-watchdog.sh.
+
+[Unit]
+Description=rustfs: reachability via {{ backup_s3_probe_url }} check, restart on error
+
+[Service]
+Type=oneshot
+ExecStart={{ backup_s3_script_dir }}/rustfs-watchdog.sh {{ backup_s3_probe_url }} {{ backup_s3_container_name }}.service {{ backup_s3_watchdog_tries }} {{ backup_s3_watchdog_pause }} {{ backup_s3_watchdog_grace }} {{ backup_s3_watchdog_max_restarts }} {{ backup_s3_watchdog_curl_timeout }}
+# All attempts plus restart (rustfs needs up to start plus wait time): so that nothing ends midway.
+TimeoutStartSec={{ backup_s3_start_timeout + backup_s3_wait_net_timeout + backup_s3_watchdog_tries * (backup_s3_watchdog_curl_timeout + backup_s3_watchdog_pause) }}

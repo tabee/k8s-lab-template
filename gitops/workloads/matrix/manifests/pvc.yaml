@@ -1,0 +1,18 @@
+---
+# Media store, signing key, macaroon secret and form secret. K8up backs
+# this volume up; the database is a separate CNPG backup. Prune=false so
+# removing the app does not delete the files.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: matrix-data
+  namespace: matrix
+  annotations:
+    k8up.io/backup: "true"
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi

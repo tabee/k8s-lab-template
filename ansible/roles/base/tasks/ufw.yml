@@ -1,0 +1,22 @@
+---
+# Only active with base_ufw_enabled: true. First rules, then enable,
+# so that SSH is never locked out.
+- name: Install UFW
+  ansible.builtin.apt:
+    name: ufw
+    state: present
+
+- name: Set UFW rules
+  community.general.ufw:
+    rule: "{{ item.rule }}"
+    port: "{{ item.port | default(omit) }}"
+    proto: "{{ item.proto | default(omit) }}"
+    from_ip: "{{ item.from_ip | default(omit) }}"
+    comment: "{{ item.comment | default(omit) }}"
+  loop: "{{ base_ufw_rules }}"
+
+- name: Enable UFW (incoming blocked by default)
+  community.general.ufw:
+    state: enabled
+    policy: deny
+    direction: incoming

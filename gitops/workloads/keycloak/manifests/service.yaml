@@ -1,0 +1,15 @@
+---
+# Only the HTTP port. The management port 9000 (health) is for the kubelet
+# probes and is not published.
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak
+  namespace: keycloak
+spec:
+  selector:
+    app.kubernetes.io/name: keycloak
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

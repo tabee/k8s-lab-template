@@ -1,0 +1,17 @@
+# Template for gitea-oidc.sops.yaml: structure without real values.
+# OIDC client of Gitea at Keycloak. The chart (gitea.oauth, existingSecret)
+# reads the two keys key and secret. Same secret value as the client gitea in
+# secrets/keycloak/keycloak-oidc-clients.sops.yaml.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: gitea-oidc
+  namespace: gitea
+  labels:
+    app.kubernetes.io/managed-by: argocd
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+type: Opaque
+stringData:
+  key: "gitea"
+  secret: "@file:keycloak-gitea-client-secret"

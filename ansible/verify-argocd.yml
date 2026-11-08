@@ -1,0 +1,552 @@
+---
+# Check stage 4 (Argo CD), read only: k8s_info plus a PSA test pod that
+# is only sent via server dry run (check_mode: true, nothing is created).
+# Usage: ansible-playbook verify-argocd.yml
+# After the bootstrap the apps need some time; hence repetitions.
+# Exception (wave 2, last section): three temporary Applications without
+# automated sync prove that the AppProjects reject forbidden destinations;
+# they are removed again in an always block.
+# Stage 6c: UI through Traefik via curl --cacert (lab CA) with --resolve, no
+# /etc/hosts entry needed. Needs curl and lab_ca_cert_path (argocd.yml).
+
+- name: Check stage 4 Argo CD
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: "{{ argocd_kubeconfig }}"
+  vars:
+    # Repetitions x pause (seconds) while waiting for sync/ready.
+    verify_retries: 30
+    verify_delay: 10
+    verify_child_app: whoami
+    verify_child_namespace: whoami
+    # Stage 6c, mirror of the GitOps values (gitops/apps/argocd-ingress.yaml,
+    # gitops/workloads/argocd); Ansible does not read gitops/.
+    verify_ui_app: argocd-ingress
+    verify_ui_cert: argocd-ingress
+    verify_ui_netpol: argocd-server-allow-traefik
+    verify_ui_host: "argocd.{{ lab.domain }}"
+    # Admin entrypoint of Traefik (gitops/platform/traefik/values.yaml, ports.admin).
+    verify_admin_port: "{{ traefik_admin_port }}"
+    # First k3s host: its IP is the LoadBalancer address (ServiceLB).
+    verify_k3s_host: "{{ groups['k3s'] | first }}"
+    verify_lb_ip: "{{ hostvars[verify_k3s_host]['ansible_host'] }}"
+  tasks:
+    # ---------- Namespace and pods ----------
+    - name: Read namespace argocd
+      kubernetes.core.k8s_info:
+        kind: Namespace
+        name: "{{ argocd_namespace }}"
+      register: verify_ns
+
+    - name: Namespace enforces PSA restricted
+      ansible.builtin.assert:
+        that:
+          - verify_ns.resources | length == 1
+          - verify_ns_labels['pod-security.kubernetes.io/enforce'] | default('') == 'restricted'
+          - verify_ns_labels['pod-security.kubernetes.io/audit'] | default('') == 'restricted'
+          - verify_ns_labels['pod-security.kubernetes.io/warn'] | default('') == 'restricted'
+        fail_msg: "Namespace {{ argocd_namespace }} is missing or does not have enforce/audit/warn=restricted"
+        quiet: true
+      vars:
+        verify_ns_labels: "{{ (verify_ns.resources | first).metadata.labels | default({}) }}"
+
+      # Completed hook pods (redis-secret-init) do not count.
+    - name: Read Argo CD pods
+      kubernetes.core.k8s_info:
+        kind: Pod
+        namespace: "{{ argocd_namespace }}"
+        field_selectors:
+          - status.phase!=Succeeded
+      register: verify_pods
+      # Ready = every pod has container statuses and all containers are ready.
+      until:
+        - verify_pods.resources | length > 0
+        - verify_pods_cs | select('equalto', []) | list | length == 0
+        - verify_pods_cs | flatten | rejectattr('ready') | list | length == 0
+      retries: "{{ verify_retries }}"
+      delay: "{{ verify_delay }}"
+      vars:
+        verify_pods_cs: "{{ verify_pods.resources | map(attribute='status.containerStatuses', default=[]) | list }}"
+
+    - name: All Argo CD pods are Ready
+      ansible.builtin.assert:
+        that: verify_pods.resources | length >= 5
+        fail_msg: "Fewer Argo CD pods than expected: {{ verify_pods.resources | map(attribute='metadata.name') | list }}"
+        success_msg: "Ready: {{ verify_pods.resources | map(attribute='metadata.name') | list | join(', ') }}"
+
+    # ---------- UI-Theme (files/argocd-theme.css via configs.styles) ----------
+    - name: Read theme ConfigMap and argocd-cm
+      kubernetes.core.k8s_info:
+        kind: ConfigMap
+        namespace: "{{ argocd_namespace }}"
+        name: "{{ item }}"
+      register: verify_theme_cms
+      loop:
+        - argocd-styles-cm
+        - argocd-cm
+
+    - name: Theme is rolled out and hooked into argocd-cm
+      ansible.builtin.assert:
+        that:
+          - verify_styles_cm | length == 1
+          - (verify_styles_cm | first).data['custom.styles.css'] | default('') | length > 0
+          - verify_argocd_cm | length == 1
+          - (verify_argocd_cm | first).data['ui.cssurl'] | default('') is search('custom.styles.css')
+        fail_msg: "Theme missing: argocd-styles-cm without custom.styles.css or ui.cssurl not set in argocd-cm"
+        quiet: true
+      vars:
+        verify_styles_cm: "{{ verify_theme_cms.results[0].resources }}"
+        verify_argocd_cm: "{{ verify_theme_cms.results[1].resources }}"
+
+    # ---------- Repo secret (content is never read) ----------
+    - name: Find repo secret (metadata only)
+      kubernetes.core.k8s_info:
+        kind: Secret
+        namespace: "{{ argocd_namespace }}"
+        name: "{{ argocd_repo_secret_name }}"
+        metadata_only: true
+      register: verify_repo_secret
+      no_log: true
+
+    - name: Repo secret exists with the right label
+      ansible.builtin.assert:
+        that:
+          - verify_repo_secret.resources | length == 1
+          - (verify_repo_secret.resources | first).metadata.labels['argocd.argoproj.io/secret-type'] | default('') == 'repository'
+        fail_msg: "Secret {{ argocd_repo_secret_name }} is missing or label secret-type=repository is missing"
+        quiet: true
+
+    # ---------- Applications ----------
+    - name: Read applications root and whoami
+      kubernetes.core.k8s_info:
+        api_version: argoproj.io/v1alpha1
+        kind: Application
+        namespace: "{{ argocd_namespace }}"
+        name: "{{ item }}"
+      register: verify_apps
+      until: >-
+        verify_apps.resources | length == 1 and
+        (verify_apps.resources | first).status.sync.status | default('') == 'Synced' and
+        (verify_apps.resources | first).status.health.status | default('') == 'Healthy'
+      retries: "{{ verify_retries }}"
+      delay: "{{ verify_delay }}"
+      loop:
+        - "{{ argocd_root_app_name }}"
+        - "{{ verify_child_app }}"
+
+    - name: Root and whoami are Synced and Healthy
+      ansible.builtin.assert:
+        that:
+          - verify_app.status.sync.status == 'Synced'
+          - verify_app.status.health.status == 'Healthy'
+        fail_msg: "Application {{ verify_app.metadata.name }} not Synced/Healthy"
+        quiet: true
+      vars:
+        verify_app: "{{ item.resources | first }}"
+      loop: "{{ verify_apps.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    # The branch is in argocd.yml (argocd_repo_revision) and in every
+    # app file under gitops/apps/. Here it shows when one differs.
+    - name: Read Applications and ApplicationSets (branch check)
+      kubernetes.core.k8s_info:
+        api_version: argoproj.io/v1alpha1
+        kind: "{{ item }}"
+        namespace: "{{ argocd_namespace }}"
+      register: verify_branch
+      loop:
+        - Application
+        - ApplicationSet
+
+    - name: All sources from this repo point to argocd_repo_revision
+      ansible.builtin.assert:
+        that:
+          - verify_branch_wrong | trim == ''
+        fail_msg: >-
+          Wrong branch (expected {{ argocd_repo_revision }}): {{ verify_branch_wrong }}.
+          A 40-character value is the pin of a rebuild: release it with bash scripts/lab.sh trust release
+        success_msg: "All on branch {{ argocd_repo_revision }}"
+      vars:
+        verify_branch_wrong: >-
+          {%- set bad = [] -%}
+          {%- for r in verify_branch.results -%}
+          {%- for o in r.resources -%}
+          {%- set spec = o.spec.template.spec if o.kind == 'ApplicationSet' else o.spec -%}
+          {%- set srcs = ([spec.source] if spec.source is defined else []) + (spec.sources | default([]))
+                + (o.spec.generators | default([]) | selectattr('git', 'defined') | map(attribute='git') | list) -%}
+          {%- for s in srcs if s.repoURL | default('') == argocd_repo_url -%}
+          {%- set rev = s.targetRevision | default(s.revision | default('HEAD')) -%}
+          {%- if rev != argocd_repo_revision -%}
+          {%- set _ = bad.append(o.kind ~ '/' ~ o.metadata.name ~ '=' ~ rev) -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {%- endfor -%}
+          {%- endfor -%}
+          {{ bad | join(', ') }}
+
+    # ---------- Workload ----------
+    - name: Read whoami pods
+      kubernetes.core.k8s_info:
+        kind: Pod
+        namespace: "{{ verify_child_namespace }}"
+        label_selectors:
+          - app.kubernetes.io/name=whoami
+        field_selectors:
+          - status.phase=Running
+      register: verify_whoami
+      until: verify_whoami.resources | length > 0
+      retries: "{{ verify_retries }}"
+      delay: "{{ verify_delay }}"
+
+    - name: Check whoami pod runs in namespace whoami
+      ansible.builtin.assert:
+        that: verify_whoami.resources | length > 0
+        fail_msg: "No running whoami pod in namespace {{ verify_child_namespace }}"
+        success_msg: "Running: {{ verify_whoami.resources | map(attribute='metadata.name') | list | join(', ') }}"
+
+    # ---------- UI through Traefik (stage 6c) ----------
+    - name: Read Argo CD parameters (argocd-cmd-params-cm)
+      kubernetes.core.k8s_info:
+        kind: ConfigMap
+        namespace: "{{ argocd_namespace }}"
+        name: argocd-cmd-params-cm
+      register: verify_params
+
+    - name: Check server.insecure is active (TLS ends at Traefik)
+      ansible.builtin.assert:
+        that:
+          - verify_params.resources | length == 1
+          - (verify_params.resources | first).data['server.insecure'] | default('') == 'true'
+        fail_msg: "server.insecure is not true; run argocd.yml with the stage 6c values"
+        quiet: true
+
+    - name: Read application argocd-ingress
+      kubernetes.core.k8s_info:
+        api_version: argoproj.io/v1alpha1
+        kind: Application
+        namespace: "{{ argocd_namespace }}"
+        name: "{{ verify_ui_app }}"
+      register: verify_ui_app_info
+      until: >-
+        verify_ui_app_info.resources | length == 1 and
+        (verify_ui_app_info.resources | first).status.sync.status | default('') == 'Synced' and
+        (verify_ui_app_info.resources | first).status.health.status | default('') == 'Healthy'
+      retries: "{{ verify_retries }}"
+      delay: "{{ verify_delay }}"
+
+    - name: Read Certificate argocd-ingress
+      kubernetes.core.k8s_info:
+        api_version: cert-manager.io/v1
+        kind: Certificate
+        namespace: "{{ argocd_namespace }}"
+        name: "{{ verify_ui_cert }}"
+      register: verify_ui_cert_info
+      until: >-
+        verify_ui_cert_info.resources | length == 1 and
+        ((verify_ui_cert_info.resources | first).status.conditions | default([])
+          | selectattr('type', 'equalto', 'Ready') | selectattr('status', 'equalto', 'True') | list | length) == 1
+      retries: "{{ verify_retries }}"
+      delay: "{{ verify_delay }}"
+
+    - name: Certificate is Ready and issued for the UI name
+      ansible.builtin.assert:
+        that: verify_ui_host in (verify_ui_cert_info.resources | first).spec.dnsNames
+        fail_msg: "Certificate {{ verify_ui_cert }} without {{ verify_ui_host }}"
+        success_msg: "Valid until {{ (verify_ui_cert_info.resources | first).status.notAfter | default('-') }}"
+
+    # The chart policy argocd-server would allow everything and replaces its own.
+    - name: Read NetworkPolicies in namespace argocd
+      kubernetes.core.k8s_info:
+        api_version: networking.k8s.io/v1
+        kind: NetworkPolicy
+        namespace: "{{ argocd_namespace }}"
+      register: verify_netpols
+
+    - name: In front of argocd-server stands only its own NetworkPolicy
+      ansible.builtin.assert:
+        that:
+          - verify_netpol_names is contains(verify_ui_netpol)
+          - verify_netpol_names is not contains('argocd-server')
+        fail_msg: "Expected {{ verify_ui_netpol }} and no chart policy argocd-server, found: {{ verify_netpol_names }}"
+        quiet: true
+      vars:
+        verify_netpol_names: "{{ verify_netpols.resources | map(attribute='metadata.name') | list }}"
+
+    - name: Find the public CA certificate
+      ansible.builtin.stat:
+        path: "{{ lab_ca_cert_path | expanduser }}"
+      register: verify_ca_crt
+
+    - name: Public CA certificate is present
+      ansible.builtin.assert:
+        that: verify_ca_crt.stat.exists
+        fail_msg: "{{ lab_ca_cert_path }} is missing: first run ansible-playbook argocd.yml"
+        quiet: true
+
+    # curl instead of uri: only curl can specify the IP (--resolve) and still
+    # send the right SNI name. Without -k: the chain must be valid against the
+    # lab CA.
+    - name: Query the Argo CD UI over HTTPS with verification against the lab CA  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        argv:
+          - curl
+          - --silent
+          - --show-error
+          - --include
+          - --max-time
+          - "10"
+          - --cacert
+          - "{{ lab_ca_cert_path | expanduser }}"
+          - --resolve
+          - "{{ verify_ui_host }}:{{ verify_admin_port }}:{{ verify_lb_ip }}"
+          - "https://{{ verify_ui_host }}:{{ verify_admin_port }}/"
+      register: verify_ui_https
+      changed_when: false
+      check_mode: false
+      until: verify_ui_https.rc == 0 and verify_ui_https.stdout is search('^HTTP/\\S+ 200', multiline=true)
+      retries: "{{ verify_retries }}"
+      delay: "{{ verify_delay }}"
+
+    - name: Answer is the Argo CD UI (chain valid against lab CA)
+      ansible.builtin.assert:
+        that:
+          - verify_ui_https.stdout is search('<title>Argo CD</title>')
+          - verify_ui_https.stdout is search('^strict-transport-security:', multiline=true, ignorecase=true)
+        fail_msg: "HTTPS ok, but no Argo CD page or security headers are missing"
+        quiet: true
+
+    # The UI hangs only on the admin port. On the ingress port 443 it must not
+    # appear (sniStrict rejects the name or Traefik has no route).
+    - name: Argo CD UI is not reachable on the ingress port 443  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        argv:
+          - curl
+          - --silent
+          - --insecure
+          - --max-time
+          - "10"
+          - --resolve
+          - "{{ verify_ui_host }}:443:{{ verify_lb_ip }}"
+          - "https://{{ verify_ui_host }}/"
+      register: verify_ui_443
+      changed_when: false
+      check_mode: false
+      failed_when: false
+
+    - name: On port 443 Traefik does not serve the Argo CD page
+      ansible.builtin.assert:
+        that: verify_ui_443.stdout is not search('<title>Argo CD</title>')
+        fail_msg: "The Argo CD UI answers on port 443; IngressRoute argocd-ingress must be on entryPoints [admin]"
+        quiet: true
+
+    # ---------- PSA proof ----------
+    # Same test as in the role, for both namespaces: the API server
+    # must reject the insecure pod. Dry run, nothing is created.
+    - name: Send PSA probe via server dry run
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: psa-probe
+            namespace: "{{ item }}"
+          spec:
+            containers:
+              - name: probe
+                image: "{{ lab_probe_image }}"
+                securityContext:
+                  privileged: true
+      check_mode: true
+      register: verify_psa_probe
+      ignore_errors: true  # the assert reads failed and msg; failed_when: false resets them (ansible-core 2.19+)
+      loop:
+        - "{{ argocd_namespace }}"
+        - "{{ verify_child_namespace }}"
+
+    - name: PSA rejects insecure pods in both namespaces
+      ansible.builtin.assert:
+        that: item.msg | default('') is search('violates PodSecurity')
+        fail_msg: "Namespace {{ item.item }}: test pod was NOT rejected by PSA"
+        quiet: true
+      loop: "{{ verify_psa_probe.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    # ---------- Project boundaries (wave 2) ----------
+    # The projects are the only technical fence between a pushed commit and the
+    # cluster. Read them, check them and prove with temporary Applications that
+    # Argo CD really rejects what the projects forbid.
+    - name: Read the AppProjects
+      kubernetes.core.k8s_info:
+        api_version: argoproj.io/v1alpha1
+        kind: AppProject
+        namespace: "{{ argocd_namespace }}"
+      register: verify_projects
+
+    - name: Project default is closed
+      ansible.builtin.assert:
+        that:
+          - verify_proj_default.spec.sourceRepos is defined
+          - verify_proj_default.spec.sourceRepos | length == 0
+          - verify_proj_default.spec.destinations | default([]) | length == 0
+          - verify_proj_default.spec.clusterResourceWhitelist is defined
+          - verify_proj_default.spec.clusterResourceWhitelist | length == 0
+          - verify_proj_default.spec.namespaceResourceWhitelist is defined
+          - verify_proj_default.spec.namespaceResourceWhitelist | length == 0
+        fail_msg: "Project {{ argocd_default_project }} is not closed: run ansible-playbook argocd.yml"
+        quiet: true
+      vars:
+        verify_proj_default: "{{ verify_projects.resources | selectattr('metadata.name', 'equalto', argocd_default_project) | first }}"
+
+    - name: Project root may only create Application and ApplicationSet in the Argo CD namespace
+      ansible.builtin.assert:
+        that:
+          - verify_proj_root.spec.clusterResourceWhitelist is defined
+          - verify_proj_root.spec.clusterResourceWhitelist | length == 0
+          - verify_proj_root.spec.namespaceResourceWhitelist | map(attribute='kind') | sort == ['Application', 'ApplicationSet']
+          - verify_proj_root.spec.namespaceResourceWhitelist | map(attribute='group') | unique | list == ['argoproj.io']
+          - verify_proj_root.spec.destinations | length == 1
+          - verify_proj_root.spec.destinations[0].namespace == argocd_namespace
+          - verify_proj_root.spec.sourceRepos == [argocd_repo_url]
+        fail_msg: "Project {{ argocd_root_project }} is wider than allowed: run ansible-playbook argocd.yml"
+        quiet: true
+      vars:
+        verify_proj_root: "{{ verify_projects.resources | selectattr('metadata.name', 'equalto', argocd_root_project) | first }}"
+
+    - name: Project lab has lost the Argo CD namespace
+      ansible.builtin.assert:
+        that:
+          - verify_proj_lab.spec.destinations | map(attribute='namespace') | list is not contains(argocd_namespace)
+          - verify_proj_ui.spec.clusterResourceWhitelist | length == 0
+          - verify_proj_ui.spec.namespaceResourceWhitelist | map(attribute='kind') | sort == ['Certificate', 'IngressRoute', 'NetworkPolicy']
+        fail_msg: "Project {{ argocd_project }} still lists {{ argocd_namespace }} or project {{ argocd_ui_project }} is too wide"
+        quiet: true
+      vars:
+        verify_proj_lab: "{{ verify_projects.resources | selectattr('metadata.name', 'equalto', argocd_project) | first }}"
+        verify_proj_ui: "{{ verify_projects.resources | selectattr('metadata.name', 'equalto', argocd_ui_project) | first }}"
+
+    - name: Read all Applications for the project check
+      kubernetes.core.k8s_info:
+        api_version: argoproj.io/v1alpha1
+        kind: Application
+        namespace: "{{ argocd_namespace }}"
+      register: verify_all_apps
+
+    - name: Applications sit in the right projects
+      ansible.builtin.assert:
+        that:
+          - verify_apps_projects[argocd_root_app_name] == argocd_root_project
+          - verify_apps_projects[verify_ui_app] == argocd_ui_project
+          - verify_apps_projects.values() | list is not contains(argocd_default_project)
+          - verify_lab_to_argocd | trim == ''
+        fail_msg: >-
+          Wrong project: {{ verify_apps_projects }}. Application in project {{ argocd_project }} with
+          destination namespace {{ argocd_namespace }}: {{ verify_lab_to_argocd }}
+        quiet: true
+      vars:
+        verify_apps_projects: >-
+          {{ dict(verify_all_apps.resources | map(attribute='metadata.name') | list
+                  | zip(verify_all_apps.resources | map(attribute='spec.project') | list)) }}
+        verify_lab_to_argocd: >-
+          {{ verify_all_apps.resources
+             | selectattr('spec.project', 'equalto', argocd_project)
+             | selectattr('spec.destination.namespace', 'defined')
+             | selectattr('spec.destination.namespace', 'equalto', argocd_namespace)
+             | map(attribute='metadata.name') | join(', ') }}
+
+    # Temporary Applications WITHOUT automated sync: even if a project let one
+    # through, nothing would be synced. No finalizer: deleting them removes
+    # nothing in the cluster. The block always cleans up.
+    - name: Rejection test with temporary Applications
+      vars:
+        verify_reject_cases:
+          - { name: verify-reject-default, project: "{{ argocd_default_project }}", namespace: "{{ verify_child_namespace }}" }
+          - { name: verify-reject-lab-argocd, project: "{{ argocd_project }}", namespace: "{{ argocd_namespace }}" }
+          - { name: verify-reject-root-other, project: "{{ argocd_root_project }}", namespace: kube-system }
+      block:
+        - name: Remove leftovers of an earlier aborted run
+          kubernetes.core.k8s:
+            state: absent
+            api_version: argoproj.io/v1alpha1
+            kind: Application
+            namespace: "{{ argocd_namespace }}"
+            name: "{{ item.name }}"
+          loop: "{{ verify_reject_cases }}"
+          loop_control:
+            label: "{{ item.name }}"
+
+        - name: Create the temporary Applications
+          kubernetes.core.k8s:
+            state: present
+            definition:
+              apiVersion: argoproj.io/v1alpha1
+              kind: Application
+              metadata:
+                name: "{{ item.name }}"
+                namespace: "{{ argocd_namespace }}"
+                labels:
+                  app.kubernetes.io/part-of: verify-reject
+              spec:
+                project: "{{ item.project }}"
+                source:
+                  repoURL: "{{ argocd_repo_url }}"
+                  targetRevision: "{{ argocd_repo_revision }}"
+                  path: "{{ argocd_root_app_path }}"
+                destination:
+                  server: "{{ argocd_destination_server }}"
+                  namespace: "{{ item.namespace }}"
+          loop: "{{ verify_reject_cases }}"
+          loop_control:
+            label: "{{ item.name }}"
+
+        - name: Wait until Argo CD marks each one as invalid
+          kubernetes.core.k8s_info:
+            api_version: argoproj.io/v1alpha1
+            kind: Application
+            namespace: "{{ argocd_namespace }}"
+            name: "{{ item.name }}"
+          register: verify_reject_result
+          until: >-
+            verify_reject_result.resources | length == 1 and
+            (((verify_reject_result.resources | first).status | default({})).conditions | default([])
+              | selectattr('type', 'equalto', 'InvalidSpecError') | list | length) > 0
+          retries: "{{ verify_retries }}"
+          delay: "{{ verify_delay }}"
+          loop: "{{ verify_reject_cases }}"
+          loop_control:
+            label: "{{ item.name }}"
+
+        - name: Each rejection names the project that refused
+          ansible.builtin.assert:
+            that: >-
+              (item.resources | first).status.conditions
+              | selectattr('type', 'equalto', 'InvalidSpecError')
+              | map(attribute='message') | join(' ') is search("project '" ~ item.item.project ~ "'")
+            fail_msg: "{{ item.item.name }}: InvalidSpecError does not name project {{ item.item.project }}"
+            quiet: true
+          loop: "{{ verify_reject_result.results }}"
+          loop_control:
+            label: "{{ item.item.name }}"
+      always:
+        - name: Remove the temporary Applications
+          kubernetes.core.k8s:
+            state: absent
+            api_version: argoproj.io/v1alpha1
+            kind: Application
+            namespace: "{{ argocd_namespace }}"
+            name: "{{ item.name }}"
+          loop: "{{ verify_reject_cases }}"
+          loop_control:
+            label: "{{ item.name }}"
+
+    # Wave 2 (issue #5): repo-server in namespace argocd (control pod first).
+    - name: Egress probes (allowed targets connect, everything else is blocked)
+      ansible.builtin.include_tasks: tasks/egress-probe.yml
+      vars:
+        egress_probes: "{{ egress_probe_control + egress_probe_argocd }}"
+      tags: [egress]

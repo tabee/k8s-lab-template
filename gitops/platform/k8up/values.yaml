@@ -1,0 +1,57 @@
+---
+# Values for the chart k8up (operator for volume backups with restic),
+# stage 8c. Chart, repo and version are only in gitops/apps/k8up.yaml.
+# Check on every chart update:
+#   helm show values k8up/k8up --version <Version>
+#   helm template k8up k8up/k8up --version <Version> -n k8up -f values.yaml
+
+# Image pinned with digest (index, amd64 + arm64). The chart joins
+# registry/repository:tag, hence the digest is in the tag.
+# The same image runs as backup/restore pod (BACKUP_IMAGE, restic
+# built in) and in the cleanup hook of the chart.
+# Tag = appVersion of the chart 4.10.1 (as of 2026-10-27).
+image:
+  registry: ghcr.io
+  repository: k8up-io/k8up
+  tag: v2.16.1@sha256:f59bfa37c51511d5ad67e53816fb55c62d0e6411890e59bb6b965923129f30b5
+
+k8up:
+  # Back up only PVCs with the annotation k8up.io/backup: "true". Without that
+  # K8up would also take the Postgres PVCs of CNPG (unnecessary and
+  # inconsistent, Barman exists for that).
+  skipWithoutAnnotation: true
+  # Times of day in the schedules (gitops/workloads/gitea/manifests/
+  # k8up-schedule.yaml) are in UTC, like with CNPG.
+  timezone: UTC
+  # One operator, no election needed.
+  enableLeaderElection: false
+
+# No Prometheus operator in the lab.
+metrics:
+  serviceMonitor:
+    enabled: false
+  prometheusRule:
+    enabled: false
+  grafanaDashboard:
+    enabled: false
+
+resources:
+  requests:
+    cpu: 20m
+    memory: 64Mi
+  limits:
+    memory: 64Mi  # lab-limit: k8up/k8up/k8up-operator
+
+# PSA restricted (namespace k8up). Applies to the operator and the
+# cleanup job of the chart. The backup/restore pods in the namespace gitea
+# get their security from the PodConfig k8up-restricted.
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - "ALL"

@@ -1,0 +1,831 @@
+---
+# Check stage 8c (Gitea via Argo CD on CNPG, file backup with K8up).
+# Usage (from ansible/):
+#   ansible-playbook verify-gitea.yml                    everything, including the restore test (~10 min)
+#   ansible-playbook verify-gitea.yml --tags repo        repo only, without a cluster (before the commit)
+#   ansible-playbook verify-gitea.yml --tags repo,cluster    without restore test
+# Prerequisite: argocd.yml has run, the state is pushed.
+#
+# Names (namespace, cluster, pooler, schedule, secrets, host) read by the
+# playbook from the manifests under gitops/ (single place). Endpoint and
+# buckets come from group_vars/all/backup_s3.yml; objectstore.yaml and
+# k8up-schedule.yaml hold copies that are compared here. The locations
+# of the password files are in group_vars/all/gitea.yml.
+#
+# Restore test (tag restore), file side (the DB side is checked by
+# verify-cnpg.yml for db-lab; gitea-db uses the same path):
+#   1. Create a test repo with the file verify.txt via the Gitea API.
+#   2. One-off backup (K8up Backup, restic tag = run ID) and wait.
+#   3. Restore this snapshot into an empty PVC in the throwaway namespace
+#      <ns>-verify (K8up Restore, same tag selection).
+#   4. A pod reads verify.txt with git from the restored repo:
+#      commit and SHA-256 must match the original.
+#   5. Clean up (also on error): test repo, backup object, namespace.
+#      The snapshot stays in the bucket and expires after the retention.
+#
+# Secrets: only metadata and key names, never values. The admin password
+# goes to curl via stdin (-K -), never on the command line; all tasks
+# that use it have no_log.
+#
+# Network: curl queries https://<host>/ with --connect-to to the VM IP and
+# checks the certificate against the lab CA (no /etc/hosts entry needed).
+
+- name: Check stage 8c Gitea
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: "{{ argocd_kubeconfig }}"
+  vars:
+    verify_retries: 60
+    verify_delay: 10
+    verify_repo: "{{ playbook_dir }}/.."
+    verify_wl: "{{ verify_repo }}/gitops/workloads/gitea"
+    verify_mf: "{{ verify_wl }}/manifests"
+    verify_k3s_host: "{{ groups['k3s'] | first }}"
+    verify_lb_ip: "{{ hostvars[verify_k3s_host]['ansible_host'] }}"
+    # Manifests from the repo (source for all names).
+    verify_m_cluster: "{{ lookup('ansible.builtin.file', verify_mf ~ '/cluster.yaml') | from_yaml }}"
+    verify_m_pooler: "{{ lookup('ansible.builtin.file', verify_mf ~ '/pooler.yaml') | from_yaml }}"
+    verify_m_os: "{{ lookup('ansible.builtin.file', verify_mf ~ '/objectstore.yaml') | from_yaml }}"
+    verify_m_sb: "{{ lookup('ansible.builtin.file', verify_mf ~ '/scheduledbackup.yaml') | from_yaml }}"
+    verify_m_sched: "{{ lookup('ansible.builtin.file', verify_mf ~ '/k8up-schedule.yaml') | from_yaml }}"
+    verify_m_podcfg: "{{ lookup('ansible.builtin.file', verify_mf ~ '/k8up-podconfig.yaml') | from_yaml }}"
+    verify_m_values: "{{ lookup('ansible.builtin.file', verify_wl ~ '/values-gitea.yaml') | from_yaml }}"
+    # Certificate and IngressRoute are in extraDeploy of the values (Helm template).
+    verify_m_cert: "{{ verify_m_values.extraDeploy | selectattr('kind', 'eq', 'Certificate') | first }}"
+    verify_m_route: "{{ verify_m_values.extraDeploy | selectattr('kind', 'eq', 'IngressRoute') | first }}"
+    # This is how the host appears in the templates; the real value is DOMAIN (verify_host).
+    verify_host_tpl: "{{ '{{ .Values.gitea.config.server.DOMAIN }}' }}"
+    verify_m_app: "{{ lookup('ansible.builtin.file', verify_repo ~ '/gitops/apps/gitea.yaml') | from_yaml }}"
+    verify_m_app_sec: "{{ lookup('ansible.builtin.file', verify_repo ~ '/gitops/apps/secrets-gitea.yaml') | from_yaml }}"
+    verify_m_app_k8up: "{{ lookup('ansible.builtin.file', verify_repo ~ '/gitops/apps/k8up.yaml') | from_yaml }}"
+    verify_ns: "{{ verify_m_cluster.metadata.namespace }}"
+    verify_cluster: "{{ verify_m_cluster.metadata.name }}"
+    verify_boot: "{{ verify_m_cluster.spec.bootstrap.initdb | default(verify_m_cluster.spec.bootstrap.recovery) }}"
+    verify_k8up_ns: "{{ verify_m_app_k8up.spec.destination.namespace }}"
+    verify_gcfg: "{{ verify_m_values.gitea.config }}"
+    verify_host: "{{ verify_gcfg.server.DOMAIN }}"
+    verify_pvc: "{{ verify_m_values.persistence.claimName }}"
+    verify_s3: "{{ verify_m_sched.spec.backend.s3 }}"
+    # All secrets from secrets/gitea/ with their keys; the names
+    # come from the manifests that point to them.
+    verify_secrets:
+      - name: "{{ verify_m_os.spec.configuration.s3Credentials.accessKeyId.name }}"
+        keys: [ACCESS_KEY_ID, ACCESS_SECRET_KEY]
+      - name: "{{ verify_boot.secret.name }}"
+        keys: [password, username]
+      - name: "{{ verify_m_values.gitea.admin.existingSecret }}"
+        keys: [password, username]
+      - name: "{{ verify_s3.accessKeyIDSecretRef.name }}"
+        keys: [ACCESS_KEY_ID, ACCESS_SECRET_KEY]
+      - name: "{{ verify_m_sched.spec.backend.repoPasswordSecretRef.name }}"
+        keys: [password]
+    verify_apps:
+      - "{{ verify_m_app_k8up.metadata.name }}"
+      - "{{ verify_m_app_sec.metadata.name }}"
+      - "{{ verify_m_app.metadata.name }}"
+    # curl against Gitea. For a test without Traefik the base URL
+    # and network arguments can be overridden with -e (docs/learning-path/stage-8c-gitea.md).
+    verify_gitea_url: "https://{{ verify_host }}"
+    verify_curl_net:
+      - --cacert
+      - "{{ lab_ca_cert_path | expanduser }}"
+      - --connect-to
+      - "{{ verify_host }}:443:{{ verify_lb_ip }}:443"
+    verify_curl: "{{ ['curl', '--silent', '--show-error', '--max-time', '20', '--write-out', '\n%{http_code}'] + verify_curl_net }}"
+    verify_restore_ns: "{{ verify_ns }}-verify"
+    # Pod-Security wie im Gitea-Pod (rootless, uid/gid 1000).
+    verify_pod_sc:
+      runAsNonRoot: true
+      runAsUser: 1000
+      runAsGroup: 1000
+      seccompProfile:
+        type: RuntimeDefault
+    verify_ctr_sc:
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop: [ALL]
+  tasks:
+    - name: Set the run ID (once, not anew on every access)
+      ansible.builtin.set_fact:
+        verify_run: "r{{ lookup('ansible.builtin.pipe', 'date -u +%Y%m%d%H%M%S') }}"
+      tags: [always]
+
+    # ================= Repo (without cluster) =================
+    - name: Check repo
+      tags: [repo]
+      block:
+        - name: Endpoint and buckets in objectstore.yaml and k8up-schedule.yaml = backup_s3.yml (copies checked)
+          ansible.builtin.assert:
+            that:
+              - verify_m_os.spec.configuration.endpointURL == backup_s3_vm_endpoint
+              - verify_m_os.spec.configuration.destinationPath == 's3://' ~ backup_s3_bucket ~ '/' ~ verify_ns
+              - verify_s3.endpoint == backup_s3_vm_endpoint
+              - verify_s3.bucket == backup_s3_k8up_bucket
+              - verify_s3.bucket != backup_s3_bucket
+            fail_msg: >-
+              Copy differs from group_vars/all/backup_s3.yml: objectstore.yaml
+              {{ verify_m_os.spec.configuration.endpointURL }} {{ verify_m_os.spec.configuration.destinationPath }}
+              (expected {{ backup_s3_vm_endpoint }} s3://{{ backup_s3_bucket }}/{{ verify_ns }}),
+              k8up-schedule.yaml {{ verify_s3.endpoint }} {{ verify_s3.bucket }}
+              (expected {{ backup_s3_vm_endpoint }} {{ backup_s3_k8up_bucket }}). Source is backup_s3.yml.
+            success_msg: >-
+              CNPG s3://{{ backup_s3_bucket }}/{{ verify_ns }}, K8up {{ backup_s3_k8up_bucket }},
+              both {{ backup_s3_vm_endpoint }}
+
+        - name: Gitea, database, pooler and backups point at each other
+          ansible.builtin.assert:
+            that:
+              - verify_gcfg.database.DB_TYPE == 'postgres'
+              - verify_gcfg.database.HOST == verify_m_pooler.metadata.name ~ '.' ~ verify_ns ~ '.svc:5432'
+              - verify_gcfg.database.NAME == verify_boot.database
+              - verify_m_pooler.spec.cluster.name == verify_cluster
+              - verify_m_pooler.spec.type == 'rw'
+              - verify_m_sb.spec.cluster.name == verify_cluster
+              - >-
+                verify_m_cluster.spec.plugins | selectattr('isWALArchiver', 'defined')
+                | map(attribute='parameters.barmanObjectName') | list == [verify_m_os.metadata.name]
+              - "'@sha256:' in verify_m_cluster.spec.imageName"
+              - verify_m_values.image.digest is match('sha256:[0-9a-f]{64}$')
+              - verify_m_values.postgresql.enabled == false
+              - verify_m_values['postgresql-ha'].enabled == false
+              - verify_m_values.valkey.enabled == false
+              - verify_m_values['valkey-cluster'].enabled == false
+              - verify_gcfg.server.ROOT_URL == 'https://%(DOMAIN)s/'
+              - verify_m_values.extraDeploy | length == 2
+              - verify_m_cert.spec.dnsNames == [verify_host_tpl]
+              - verify_m_route.spec.routes | map(attribute='match') | select('search', '`' ~ (verify_host_tpl | regex_escape) ~ '`') | list | length == 1
+              - verify_m_route.spec.tls.secretName == verify_m_cert.spec.secretName
+              - verify_m_values.persistence.annotations['k8up.io/backup'] == 'true'
+              - verify_m_sched.spec.podConfigRef.name == verify_m_podcfg.metadata.name
+              - verify_m_sched.metadata.namespace == verify_ns
+              - verify_m_podcfg.metadata.namespace == verify_ns
+              - verify_m_app.spec.destination.namespace == verify_ns
+              - verify_m_app_sec.spec.destination.namespace == verify_ns
+              - verify_m_app_sec.spec.source.path == 'secrets/' ~ verify_ns
+            fail_msg: "Manifests under gitops/ do not fit together (DB host, names, host, digest, backup annotation)"
+            success_msg: "Gitea {{ verify_host }} -> {{ verify_gcfg.database.HOST }}, Repos auf PVC {{ verify_pvc }}"
+
+        # Argo CD compares lists of CRDs as a whole: default values that the
+        # CRD or a webhook adds to list entries must be
+        # in Git, otherwise the app stays OutOfSync (docs/how-to/troubleshooting.md,
+        # heading "Argo-OutOfSync durch Operator-Defaults").
+        - name: List entries in the CNPG cluster set the CRD defaults explicitly
+          ansible.builtin.assert:
+            that:
+              - verify_m_cluster.spec.plugins | rejectattr('enabled', 'defined') | list | length == 0
+              - verify_m_cluster.spec.plugins | rejectattr('isWALArchiver', 'defined') | list | length == 0
+            fail_msg: >-
+              cluster.yaml: every entry under spec.plugins needs enabled and isWALArchiver explicitly
+              (CRD default enabled: true, isWALArchiver: false). If they are missing, the cluster adds them itself
+              and Argo CD shows the app permanently OutOfSync (docs/how-to/troubleshooting.md, heading "Argo-OutOfSync durch Operator-Defaults").
+            success_msg: "spec.plugins: enabled and isWALArchiver are in Git"
+
+        # Same format "minute hour ..." in both; only then is the
+        # order DB backup before file backup checkable. CNPG has a
+        # seconds field at the front.
+        - name: File backup runs after the DB backup (both UTC)
+          ansible.builtin.assert:
+            that:
+              - verify_t_db | length == 2
+              - verify_t_files | length == 2
+              - (verify_t_files[1] | int) * 60 + (verify_t_files[0] | int) > (verify_t_db[1] | int) * 60 + (verify_t_db[0] | int)
+            fail_msg: "K8up backup {{ verify_m_sched.spec.backup.schedule }} is not after CNPG {{ verify_m_sb.spec.schedule }}"
+            success_msg: >-
+              DB {{ verify_t_db[1] }}:{{ verify_t_db[0] }} UTC, files {{ verify_t_files[1] }}:{{ verify_t_files[0] }} UTC
+          vars:
+            verify_t_db: "{{ (verify_m_sb.spec.schedule.split(' '))[1:3] | map('regex_replace', '^(\\d)$', '0\\1') | list }}"
+            verify_t_files: "{{ (verify_m_sched.spec.backup.schedule.split(' '))[0:2] | map('regex_replace', '^(\\d)$', '0\\1') | list }}"
+
+        - name: Argo CD projects allow namespaces and chart repos
+          ansible.builtin.assert:
+            that:
+              - verify_ns in argocd_project_namespaces
+              - verify_k8up_ns in argocd_platform_namespaces
+              - verify_m_app.spec.project == 'lab'
+              - verify_m_app_sec.spec.project == 'lab'
+              - verify_m_app_k8up.spec.project == 'platform'
+              - >-
+                verify_m_app.spec.sources | selectattr('chart', 'defined') | map(attribute='repoURL')
+                | unique | difference(argocd_project_chart_repos) | length == 0
+              - >-
+                verify_m_app_k8up.spec.sources | selectattr('chart', 'defined') | map(attribute='repoURL')
+                | unique | difference(argocd_platform_chart_repos) | length == 0
+            fail_msg: >-
+              group_vars/all/argocd.yml: {{ verify_ns }} in argocd_project_namespaces,
+              {{ verify_k8up_ns }} in argocd_platform_namespaces and the chart repos in
+              argocd_project_chart_repos / argocd_platform_chart_repos needed. Afterwards ansible-playbook argocd.yml.
+            quiet: true
+
+        - name: Read password files on this PC (mode only)
+          ansible.builtin.stat:
+            path: "{{ item }}"
+            get_checksum: false
+          register: verify_pwf
+          loop:
+            - "{{ gitea_db_password_file }}"
+            - "{{ gitea_admin_user_file }}"
+            - "{{ gitea_admin_password_file }}"
+            - "{{ gitea_k8up_repo_password_file }}"
+
+        - name: Password files exist and only the owner can read them (0600)
+          ansible.builtin.assert:
+            that:
+              - item.stat.exists
+              - item.stat.mode == '0600'
+              - item.stat.size > 0
+            fail_msg: "{{ item.item }}: missing or mode {{ item.stat.mode | default('-') }} (expected 0600). stufe8c-block-b.sh creates them."
+            quiet: true
+          loop: "{{ verify_pwf.results }}"
+          loop_control:
+            label: "{{ item.item }}"
+
+        - name: Read SOPS files (encrypted, values are not printed)
+          ansible.builtin.slurp:
+            src: "{{ verify_repo }}/secrets/{{ verify_ns }}/{{ item.name }}.sops.yaml"
+          register: verify_sops_raw
+          loop: "{{ verify_secrets }}"
+          no_log: true
+
+        - name: Reduce SOPS files to metadata
+          ansible.builtin.set_fact:
+            verify_sops_meta: >-
+              {{ verify_sops_meta | default([]) + [{
+                   'file': item.item.name,
+                   'want': item.item['keys'],
+                   'name': verify_doc.metadata.name | default(''),
+                   'namespace': verify_doc.metadata.namespace | default(''),
+                   'opts': (verify_doc.metadata.annotations | default({}))['argocd.argoproj.io/sync-options'] | default(''),
+                   'keys': (verify_doc.data | default({})).keys() | list | sort,
+                   'encrypted': (verify_doc.data | default({})).values() | reject('match', 'ENC\[AES256_GCM,') | list | length == 0,
+                   'has_sops': verify_doc.sops is defined}] }}
+          vars:
+            verify_doc: "{{ item.content | b64decode | from_yaml }}"
+          loop: "{{ verify_sops_raw.results }}"
+          no_log: true
+
+        - name: Secrets in the repo are encrypted, named correctly, listed in ksops.yaml and never deleted
+          ansible.builtin.assert:
+            that:
+              - item.has_sops
+              - item.encrypted
+              - item.name == item.file
+              - item.namespace == verify_ns
+              - item['keys'] == item.want
+              - "'Prune=false' in item.opts"
+              - "'Delete=false' in item.opts"
+              - "'./' ~ item.file ~ '.sops.yaml' in verify_ksops.files"
+            fail_msg: >-
+              secrets/{{ verify_ns }}/{{ item.file }}.sops.yaml: Name {{ item.name }}, Namespace {{ item.namespace }},
+              Keys {{ item['keys'] | join(',') }} (expected {{ item.want | join(',') }}), encrypted {{ item.encrypted }},
+              in ksops.yaml? Commands: head of secrets/{{ verify_ns }}/ksops.yaml.
+            success_msg: "{{ item.file }}: {{ item['keys'] | join(', ') }}, encrypted"
+          loop: "{{ verify_sops_meta }}"
+          loop_control:
+            label: "{{ item.file }}"
+          vars:
+            verify_ksops: "{{ lookup('ansible.builtin.file', verify_repo ~ '/secrets/' ~ verify_ns ~ '/ksops.yaml') | from_yaml }}"
+
+    # ================= Cluster =================
+    - name: Read Argo CD applications
+      kubernetes.core.k8s_info:
+        api_version: argoproj.io/v1alpha1
+        kind: Application
+        namespace: "{{ argocd_namespace }}"
+        name: "{{ item }}"
+      register: verify_app_info
+      until: >-
+        verify_app_info.resources | length == 1 and
+        (verify_app_info.resources | first).status.sync.status | default('') == 'Synced' and
+        (verify_app_info.resources | first).status.health.status | default('') == 'Healthy'
+      retries: "{{ verify_retries }}"
+      delay: "{{ verify_delay }}"
+      failed_when: false
+      loop: "{{ verify_apps }}"
+      tags: [cluster, restore]
+
+    - name: Applications are Synced and Healthy
+      ansible.builtin.assert:
+        that:
+          - item.resources | default([]) | length == 1
+          - (item.resources | first).status.sync.status | default('') == 'Synced'
+          - (item.resources | first).status.health.status | default('') == 'Healthy'
+        fail_msg: >-
+          Application {{ item.item }}: Sync={{ verify_app_cur.status.sync.status | default('-') }},
+          Health={{ verify_app_cur.status.health.status | default('-') }},
+          OutOfSync resources: {{ verify_app_oos or '(none reported)' }}.
+          Messages: {{ verify_app_cur.status.conditions | default([]) | map(attribute='message') | join(' | ') | truncate(400) }}.
+          If a resource stays OutOfSync despite waiting, usually an operator or the CRD adds
+          default values in a list entry (Argo CD compares lists of CRDs as a whole):
+          set the value explicitly in the manifest, see docs/learning-path/stage-8c-gitea.md,
+          heading "Argo-OutOfSync durch Operator-Defaults".
+        quiet: true
+      loop: "{{ verify_app_info.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      vars:
+        verify_app_cur: "{{ item.resources | first | default({}) }}"
+        # Kind/name (namespace) of every resource that Argo CD reports as OutOfSync
+        verify_app_oos: >-
+          {% for r in verify_app_cur.status.resources | default([])
+             if r.status | default('') == 'OutOfSync' -%}
+          {{ r.kind }}/{{ r.name }}{{ ' (' ~ r.namespace ~ ')' if r.namespace is defined else '' }}
+          {%- if not loop.last %}, {% endif -%}
+          {% endfor %}
+      tags: [cluster, restore]
+
+    - name: Read K8up operator
+      kubernetes.core.k8s_info:
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ verify_k8up_ns }}"
+        label_selectors:
+          - app.kubernetes.io/name=k8up
+      register: verify_k8up_op
+      until: >-
+        verify_k8up_op.resources | length == 1 and
+        (verify_k8up_op.resources | first).status.readyReplicas | default(0) >= 1
+      retries: "{{ verify_retries }}"
+      delay: "{{ verify_delay }}"
+      tags: [cluster, restore]
+
+    - name: Read database gitea-db (waits until healthy)
+      kubernetes.core.k8s_info:
+        api_version: postgresql.cnpg.io/v1
+        kind: Cluster
+        namespace: "{{ verify_ns }}"
+        name: "{{ verify_cluster }}"
+      register: verify_cl
+      until: >-
+        verify_cl.resources | length == 1 and
+        (verify_cl.resources | first).status.phase | default('') == 'Cluster in healthy state' and
+        (verify_cl.resources | first).status.readyInstances | default(0) == verify_m_cluster.spec.instances
+      retries: "{{ verify_retries }}"
+      delay: "{{ verify_delay }}"
+      failed_when: false
+      tags: [cluster, restore]
+
+    - name: Database is healthy and archives WAL
+      ansible.builtin.assert:
+        that:
+          - verify_cl_st.phase | default('') == 'Cluster in healthy state'
+          - verify_cl_st.readyInstances | default(0) == verify_m_cluster.spec.instances
+          - >-
+            verify_cl_st.conditions | default([]) | selectattr('type', 'equalto', 'ContinuousArchiving')
+            | selectattr('status', 'equalto', 'False') | list | length == 0
+        fail_msg: >-
+          Cluster {{ verify_ns }}/{{ verify_cluster }}: Phase '{{ verify_cl_st.phase | default('-') }}',
+          ready {{ verify_cl_st.readyInstances | default(0) }}/{{ verify_m_cluster.spec.instances }}
+        success_msg: "Primary {{ verify_cl_st.currentPrimary | default('-') }}, {{ verify_cl_st.readyInstances | default(0) }} instances"
+      vars:
+        verify_cl_st: "{{ (verify_cl.resources | first | default({})).status | default({}) }}"
+      tags: [cluster, restore]
+
+    - name: Read Gitea deployment
+      kubernetes.core.k8s_info:
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ verify_ns }}"
+        label_selectors:
+          - app.kubernetes.io/name=gitea
+      register: verify_gitea_dep
+      until: >-
+        verify_gitea_dep.resources | length == 1 and
+        (verify_gitea_dep.resources | first).status.readyReplicas | default(0) == 1
+      retries: "{{ verify_retries }}"
+      delay: "{{ verify_delay }}"
+      tags: [cluster, restore]
+
+    - name: Repo PVC has the backup annotation and stays on deletion
+      kubernetes.core.k8s_info:
+        kind: PersistentVolumeClaim
+        namespace: "{{ verify_ns }}"
+        name: "{{ verify_pvc }}"
+      register: verify_pvc_info
+      failed_when: >-
+        verify_pvc_info.resources | length != 1 or
+        (verify_pvc_info.resources | first).metadata.annotations['k8up.io/backup'] | default('') != 'true' or
+        (verify_pvc_info.resources | first).status.phase | default('') != 'Bound'
+      tags: [cluster, restore]
+
+    - name: Query Gitea over HTTPS (lab CA)  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        argv: "{{ verify_curl + [verify_gitea_url ~ '/api/healthz'] }}"
+      register: verify_health
+      changed_when: false
+      check_mode: false
+      until: verify_health.rc == 0 and verify_health.stdout_lines[-1] | default('') == '200'
+      retries: 30
+      delay: 10
+      tags: [cluster, restore]
+
+    - name: Assemble admin access from the password files (values stay hidden)
+      ansible.builtin.set_fact:
+        verify_auth: >-
+          user = "{{ lookup('ansible.builtin.file', gitea_admin_user_file) | trim }}:{{ lookup('ansible.builtin.file', gitea_admin_password_file) | trim }}"
+        verify_admin: "{{ lookup('ansible.builtin.file', gitea_admin_user_file) | trim }}"
+      no_log: true
+      tags: [cluster, restore]
+
+    - name: Log in as admin (API /user)  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        argv: "{{ verify_curl + ['-K', '-', verify_gitea_url ~ '/api/v1/user'] }}"
+        stdin: "{{ verify_auth }}"
+      register: verify_me
+      changed_when: false
+      check_mode: false
+      no_log: true
+      tags: [cluster, restore]
+
+    - name: Admin login works, account is admin
+      ansible.builtin.assert:
+        that:
+          - verify_me.rc == 0
+          - verify_me.stdout_lines[-1] | default('') == '200'
+          - verify_me_json.login | default('') == verify_admin
+          - verify_me_json.is_admin | default(false)
+        fail_msg: >-
+          Login as {{ verify_admin }}: rc {{ verify_me.rc }}, HTTP {{ verify_me.stdout_lines[-1] | default('-') }}.
+          Password only set on first start (passwordMode initialOnlyNoReset), runbook "Admin-Passwort".
+        success_msg: "logged in as {{ verify_admin }} (Admin)"
+      vars:
+        verify_me_json: "{{ (verify_me.stdout_lines[:-1] | join('\n')) | from_json if verify_me.rc == 0 and verify_me.stdout_lines | length > 1 else {} }}"
+      tags: [cluster, restore]
+
+    - name: Read K8up schedule in the cluster
+      kubernetes.core.k8s_info:
+        api_version: k8up.io/v1
+        kind: Schedule
+        namespace: "{{ verify_ns }}"
+        name: "{{ verify_m_sched.metadata.name }}"
+      register: verify_sched
+      tags: [cluster, restore]
+
+    - name: K8up-Schedule im Cluster = Repo
+      ansible.builtin.assert:
+        that:
+          - verify_sched.resources | length == 1
+          - (verify_sched.resources | first).spec.backend.s3 == verify_s3
+          - (verify_sched.resources | first).spec.backup.schedule == verify_m_sched.spec.backup.schedule
+        fail_msg: "Schedule {{ verify_m_sched.metadata.name }} is missing or differs. Argo CD not in sync yet?"
+        success_msg: >-
+          Backup {{ verify_m_sched.spec.backup.schedule }}, Prune {{ verify_m_sched.spec.prune.schedule }},
+          Check {{ verify_m_sched.spec.check.schedule }} (UTC)
+      tags: [cluster, restore]
+
+    # ================= Restore test (files) =================
+    - name: Restore test
+      tags: [restore]
+      vars:
+        verify_repo_name: "verify-k8up-{{ verify_run }}"
+        verify_tag: "verify-{{ verify_run }}"
+        verify_content: "Stage 8c restore test {{ verify_run }}\n"
+        verify_api_repo: "{{ verify_gitea_url }}/api/v1/repos/{{ verify_admin }}/{{ verify_repo_name }}"
+      block:
+        - name: Remove the old throwaway namespace (if an earlier run aborted)
+          kubernetes.core.k8s:
+            state: absent
+            kind: Namespace
+            name: "{{ verify_restore_ns }}"
+            wait: true
+            wait_timeout: 300
+
+        # 1. Test repo with file
+        - name: Create test repo  # noqa: command-instead-of-module
+          ansible.builtin.command:
+            argv: >-
+              {{ verify_curl + ['-K', '-', '-X', 'POST', '-H', 'Content-Type: application/json',
+                 '--data', {'name': verify_repo_name, 'private': true, 'auto_init': true,
+                            'default_branch': 'main', 'description': 'verify-gitea.yml, will be deleted'} | to_json,
+                 verify_gitea_url ~ '/api/v1/user/repos'] }}
+            stdin: "{{ verify_auth }}"
+          register: verify_mk
+          changed_when: true
+          no_log: true
+
+        - name: Test repo is created
+          ansible.builtin.assert:
+            that: verify_mk.rc == 0 and verify_mk.stdout_lines[-1] | default('') == '201'
+            fail_msg: "Repo {{ verify_repo_name }}: rc {{ verify_mk.rc }}, HTTP {{ verify_mk.stdout_lines[-1] | default('-') }}"
+            quiet: true
+
+        - name: Commit file verify.txt  # noqa: command-instead-of-module
+          ansible.builtin.command:
+            argv: >-
+              {{ verify_curl + ['-K', '-', '-X', 'POST', '-H', 'Content-Type: application/json',
+                 '--data', {'content': verify_content | b64encode, 'message': 'verify-gitea.yml ' ~ verify_run,
+                            'branch': 'main'} | to_json,
+                 verify_api_repo ~ '/contents/verify.txt'] }}
+            stdin: "{{ verify_auth }}"
+          register: verify_put
+          changed_when: true
+          no_log: true
+
+        - name: Remember commit and checksum of the original
+          ansible.builtin.set_fact:
+            verify_commit: "{{ ((verify_put.stdout_lines[:-1] | join('\n')) | from_json).commit.sha }}"
+            verify_sha: "{{ verify_content | hash('sha256') }}"
+          when: verify_put.rc == 0 and verify_put.stdout_lines[-1] | default('') == '201'
+
+        - name: File is committed
+          ansible.builtin.assert:
+            that: verify_commit is defined and verify_commit | length == 40
+            fail_msg: "verify.txt: rc {{ verify_put.rc }}, HTTP {{ verify_put.stdout_lines[-1] | default('-') }}"
+            success_msg: "{{ verify_repo_name }}: Commit {{ verify_commit }}"
+
+        # 2. One-off backup, only with the tag of this run
+        - name: Start one-off backup (same target as the schedule)
+          kubernetes.core.k8s:
+            definition:
+              apiVersion: k8up.io/v1
+              kind: Backup
+              metadata:
+                name: "{{ verify_tag }}"
+                namespace: "{{ verify_ns }}"
+              spec:
+                podConfigRef: "{{ verify_m_sched.spec.podConfigRef }}"
+                backend: "{{ verify_m_sched.spec.backend }}"
+                tags: ["{{ verify_tag }}"]
+                successfulJobsHistoryLimit: 1
+                failedJobsHistoryLimit: 1
+
+        - name: Wait until the backup is done
+          kubernetes.core.k8s_info:
+            api_version: k8up.io/v1
+            kind: Backup
+            namespace: "{{ verify_ns }}"
+            name: "{{ verify_tag }}"
+          register: verify_bk
+          until: (verify_bk.resources | first).status.finished | default(false)
+          retries: 60
+          delay: 10
+
+        - name: Backup is successful
+          ansible.builtin.assert:
+            that:
+              - verify_bk_done | length == 1
+              - verify_bk_done[0].status == 'True'
+              - verify_bk_done[0].reason == 'Succeeded'
+            fail_msg: >-
+              Backup {{ verify_tag }}: {{ verify_bk_done | map(attribute='message', default='-') | join(' ') }}.
+              Logs: kubectl -n {{ verify_ns }} logs -l k8up.io/owned-by=backup_{{ verify_tag }}
+            success_msg: "Backup {{ verify_tag }} done"
+          vars:
+            verify_bk_done: >-
+              {{ (verify_bk.resources | first).status.conditions | default([])
+                 | selectattr('type', 'equalto', 'Completed') | list }}
+
+        # 2b. Delete the original: the restore below must not benefit from the
+        #     live repo, only from the snapshot. Afterwards the API must report 404.
+        - name: Delete test repo before the restore  # noqa: command-instead-of-module
+          ansible.builtin.command:
+            argv: "{{ verify_curl + ['-K', '-', '-X', 'DELETE', verify_api_repo] }}"
+            stdin: "{{ verify_auth }}"
+          register: verify_pre_del
+          changed_when: true
+          no_log: true
+
+        - name: Test repo is deleted (204)
+          ansible.builtin.assert:
+            that: verify_pre_del.rc == 0 and verify_pre_del.stdout_lines[-1] | default('') == '204'
+            fail_msg: "Repo {{ verify_repo_name }} delete: rc {{ verify_pre_del.rc }}, HTTP {{ verify_pre_del.stdout_lines[-1] | default('-') }}"
+            quiet: true
+
+        - name: Query test repo via API (must be gone)  # noqa: command-instead-of-module
+          ansible.builtin.command:
+            argv: "{{ verify_curl + ['-K', '-', verify_api_repo] }}"
+            stdin: "{{ verify_auth }}"
+          register: verify_pre_get
+          changed_when: false
+          no_log: true
+
+        - name: Original is gone (404), only the restore brings it back
+          ansible.builtin.assert:
+            that: verify_pre_get.stdout_lines[-1] | default('') == '404'
+            fail_msg: "Repo {{ verify_repo_name }} still exists after deletion (HTTP {{ verify_pre_get.stdout_lines[-1] | default('-') }})"
+            success_msg: "{{ verify_repo_name }} deleted (404), commit {{ verify_commit }} now only exists in the backup"
+
+        # 3. Restore into a throwaway namespace
+        - name: Create throwaway namespace (PSA restricted like gitea)
+          kubernetes.core.k8s:
+            definition:
+              apiVersion: v1
+              kind: Namespace
+              metadata:
+                name: "{{ verify_restore_ns }}"
+                labels:
+                  pod-security.kubernetes.io/enforce: restricted
+                  app.kubernetes.io/managed-by: verify-gitea
+
+        - name: Read S3 and restic secret (values are not printed)
+          kubernetes.core.k8s_info:
+            kind: Secret
+            namespace: "{{ verify_ns }}"
+            name: "{{ item }}"
+          register: verify_k8up_sec
+          loop:
+            - "{{ verify_s3.accessKeyIDSecretRef.name }}"
+            - "{{ verify_m_sched.spec.backend.repoPasswordSecretRef.name }}"
+          no_log: true
+
+        - name: Copy secrets to the throwaway namespace
+          kubernetes.core.k8s:
+            definition:
+              apiVersion: v1
+              kind: Secret
+              type: Opaque
+              metadata:
+                name: "{{ item.item }}"
+                namespace: "{{ verify_restore_ns }}"
+              data: "{{ (item.resources | first).data }}"
+          loop: "{{ verify_k8up_sec.results }}"
+          no_log: true
+
+        - name: Copy PodConfig to the throwaway namespace
+          kubernetes.core.k8s:
+            definition:
+              apiVersion: "{{ verify_m_podcfg.apiVersion }}"
+              kind: PodConfig
+              metadata:
+                name: "{{ verify_m_podcfg.metadata.name }}"
+                namespace: "{{ verify_restore_ns }}"
+              spec: "{{ verify_m_podcfg.spec }}"
+
+        - name: Create empty target PVC (same size as the original)
+          kubernetes.core.k8s:
+            definition:
+              apiVersion: v1
+              kind: PersistentVolumeClaim
+              metadata:
+                name: restore-target
+                namespace: "{{ verify_restore_ns }}"
+              spec:
+                accessModes: [ReadWriteOnce]
+                resources:
+                  requests:
+                    storage: "{{ verify_m_values.persistence.size }}"
+
+        - name: Start restore (snapshot with the tag of this run)
+          kubernetes.core.k8s:
+            definition:
+              apiVersion: k8up.io/v1
+              kind: Restore
+              metadata:
+                name: "{{ verify_tag }}"
+                namespace: "{{ verify_restore_ns }}"
+              spec:
+                podConfigRef: "{{ verify_m_sched.spec.podConfigRef }}"
+                backend: "{{ verify_m_sched.spec.backend }}"
+                tags: ["{{ verify_tag }}"]
+                restoreMethod:
+                  folder:
+                    claimName: restore-target
+
+        - name: Wait until the restore is done
+          kubernetes.core.k8s_info:
+            api_version: k8up.io/v1
+            kind: Restore
+            namespace: "{{ verify_restore_ns }}"
+            name: "{{ verify_tag }}"
+          register: verify_rs
+          until: (verify_rs.resources | first).status.finished | default(false)
+          retries: 60
+          delay: 10
+
+        - name: Restore is successful
+          ansible.builtin.assert:
+            that:
+              - verify_rs_done | length == 1
+              - verify_rs_done[0].status == 'True'
+              - verify_rs_done[0].reason == 'Succeeded'
+            fail_msg: >-
+              Restore {{ verify_tag }}: {{ verify_rs_done | map(attribute='message', default='-') | join(' ') }}.
+              Logs: kubectl -n {{ verify_restore_ns }} logs -l k8up.io/owned-by=restore_{{ verify_tag }}
+            success_msg: "Restore {{ verify_tag }} done"
+          vars:
+            verify_rs_done: >-
+              {{ (verify_rs.resources | first).status.conditions | default([])
+                 | selectattr('type', 'equalto', 'Completed') | list }}
+
+        # 4. Comparison: git reads verify.txt from the restored repo
+        # No wait container needed: the pod only reads the PVC and talks to
+        # no service in the cluster. kube-router only knows a new pod after
+        # about a second (default-deny-ingress rejects the first connection,
+        # docs/how-to/troubleshooting.md, symptom "First connection of a new pod
+        # rejected"); this hits pods that talk to a service in the cluster protected by a NetworkPolicy.
+        # K8up backup/restore pods only talk to rustfs outside the
+        # cluster, curl goes from the PC through Traefik to Gitea. If a
+        # cluster target is added here, the pod needs an initContainer "wait" like
+        # verify-cnpg.yml (Pooler).
+        - name: Start check pod (Gitea image, read only)
+          kubernetes.core.k8s:
+            definition:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                name: verify-files
+                namespace: "{{ verify_restore_ns }}"
+              spec:
+                restartPolicy: Never
+                automountServiceAccountToken: false
+                securityContext: "{{ verify_pod_sc }}"
+                containers:
+                  - name: git
+                    image: >-
+                      {{ verify_m_values.image.registry }}/{{ verify_m_values.image.repository }}:{{ verify_m_values.image.tag
+                      }}-rootless@{{ verify_m_values.image.digest }}
+                    command: [/bin/sh, -c]
+                    args:
+                      - |
+                        set -eu
+                        r=$(find /restore -type d -path "*/gitea-repositories/$OWNER/$REPO.git" | head -n 1)
+                        if [ -z "$r" ]; then echo "MISSING $OWNER/$REPO.git"; find /restore -maxdepth 4 -type d; exit 1; fi
+                        echo "PATH $r"
+                        echo "COMMIT $(git -c safe.directory='*' --git-dir "$r" rev-parse refs/heads/main)"
+                        echo "SHA $(git -c safe.directory='*' --git-dir "$r" show main:verify.txt | sha256sum | cut -d' ' -f1)"
+                    env:
+                      - name: OWNER
+                        value: "{{ verify_admin | lower }}"
+                      - name: REPO
+                        value: "{{ verify_repo_name | lower }}"
+                      - name: HOME
+                        value: /tmp
+                    volumeMounts:
+                      - name: restore
+                        mountPath: /restore
+                        readOnly: true
+                      - name: tmp
+                        mountPath: /tmp
+                    securityContext: "{{ verify_ctr_sc }}"
+                    resources:
+                      requests: {cpu: 10m, memory: 32Mi}
+                      limits: {memory: 128Mi}
+                volumes:
+                  - name: restore
+                    persistentVolumeClaim:
+                      claimName: restore-target
+                      readOnly: true
+                  - name: tmp
+                    emptyDir: {}
+
+        - name: Wait until the check pod is done
+          kubernetes.core.k8s_info:
+            kind: Pod
+            namespace: "{{ verify_restore_ns }}"
+            name: verify-files
+          register: verify_fp
+          until: (verify_fp.resources | first).status.phase | default('') in ['Succeeded', 'Failed']
+          retries: 30
+          delay: 5
+
+        - name: Read the log of the check pod
+          kubernetes.core.k8s_log:
+            namespace: "{{ verify_restore_ns }}"
+            name: verify-files
+          register: verify_fp_log
+
+        - name: Restored repo = original (commit and SHA-256 of verify.txt)
+          ansible.builtin.assert:
+            that:
+              - (verify_fp.resources | first).status.phase == 'Succeeded'
+              - "'COMMIT ' ~ verify_commit in verify_fp_log.log_lines"
+              - "'SHA ' ~ verify_sha in verify_fp_log.log_lines"
+            fail_msg: "Check pod: {{ verify_fp_log.log | trim | truncate(600) }} (expected commit {{ verify_commit }}, SHA {{ verify_sha }})"
+            success_msg: "Restore ok: Commit {{ verify_commit }}, SHA-256 {{ verify_sha }}"
+
+      # 5. Clean up, also on error
+      always:
+        - name: Wegwerf-Namespace weg (Restore, PVC, Secrets, Pod)
+          kubernetes.core.k8s:
+            state: absent
+            kind: Namespace
+            name: "{{ verify_restore_ns }}"
+            wait: true
+            wait_timeout: 300
+
+        - name: Backup object gone (the snapshot stays until the retention)
+          kubernetes.core.k8s:
+            state: absent
+            api_version: k8up.io/v1
+            kind: Backup
+            namespace: "{{ verify_ns }}"
+            name: "{{ verify_tag }}"
+
+        - name: Delete test repo  # noqa: command-instead-of-module
+          ansible.builtin.command:
+            argv: "{{ verify_curl + ['-K', '-', '-X', 'DELETE', verify_api_repo] }}"
+            stdin: "{{ verify_auth }}"
+          register: verify_del
+          changed_when: verify_del.stdout_lines[-1] | default('') == '204'
+          failed_when: verify_del.stdout_lines[-1] | default('') not in ['204', '404']
+          no_log: true
+
+    # Wave 2 (issue #5): namespace gitea (control pod in a policy-free namespace first).
+    - name: Egress probes (allowed targets connect, everything else is blocked)
+      ansible.builtin.include_tasks: tasks/egress-probe.yml
+      vars:
+        egress_probes: "{{ egress_probe_control + egress_probe_gitea }}"
+      tags: [cluster, egress]

@@ -1,0 +1,21 @@
+---
+# Keycloak (single sign-on for Gitea and Matrix). Only the locations of the
+# secret files on the operator machine are here. All other values are in
+# gitops/workloads/keycloak/, gitops/charts/keycloak/ and the OIDC settings of
+# gitops/workloads/gitea/values-gitea.yaml and gitops/charts/matrix/.
+# verify-keycloak.yml reads the names from the manifests.
+#
+# lab.sh init creates the files when they are missing (mode 0600, random
+# values, never shown) and renders secrets/keycloak/*.sops.yaml and the two
+# client secret copies secrets/gitea/gitea-oidc.sops.yaml and
+# secrets/matrix/matrix-oidc.sops.yaml. The client secret of the notes sites (client
+# notes) is rendered to secrets/keycloak/keycloak-notes-client.sops.yaml; the
+# role notes_sites puts the same value into the notes namespaces (Secret notes-oidc).
+
+keycloak_secret_dir: "{{ lookup('ansible.builtin.env', 'HOME') }}/.config/k8s-lab"
+keycloak_db_password_file: "{{ keycloak_secret_dir }}/keycloak-k3s-lab-db.pw"
+keycloak_admin_user_file: "{{ keycloak_secret_dir }}/keycloak-k3s-lab-admin.user"
+keycloak_admin_password_file: "{{ keycloak_secret_dir }}/keycloak-k3s-lab-admin.pw"
+keycloak_gitea_client_secret_file: "{{ keycloak_secret_dir }}/keycloak-k3s-lab-gitea-client.secret"
+keycloak_synapse_client_secret_file: "{{ keycloak_secret_dir }}/keycloak-k3s-lab-synapse-client.secret"
+keycloak_notes_client_secret_file: "{{ keycloak_secret_dir }}/keycloak-k3s-lab-notes-client.secret"

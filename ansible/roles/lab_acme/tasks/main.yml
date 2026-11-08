@@ -1,0 +1,148 @@
+---
+# Public probe: ClusterIssuer lab-acme (ACME DNS-01) and probe certificate. Without the
+# four acme_* values in lab.local.yaml: SKIP, nothing is created. The API token never appears
+# in the output: it is an encrypted secret in Git (secrets/cert-manager),
+# here only a check THAT it is not empty (length, no_log).
+
+- name: Public probe is off (acme_* in lab.local.yaml not set)
+  ansible.builtin.debug:
+    msg: >-
+      SKIP, public probe off. Enable by setting acme_solver, acme_zone, acme_probe_name and
+      acme_email in infra/envs/local/lab.local.yaml set (docs/how-to/public-certificate.md).
+  when: not (lab_acme_active | bool)
+
+- name: Create public probe
+  when: lab_acme_active | bool
+  block:
+    - name: Check probe values
+      ansible.builtin.assert:
+        that:
+          - lab_acme_solver in lab_acme_solvers
+          - lab_acme_zone is match('^[a-z0-9]([a-z0-9.-]*[a-z0-9])?\.[a-z]{2,}$')
+          - lab_acme_probe_name == lab_acme_zone or lab_acme_probe_name is match('^.+\.' ~ (lab_acme_zone | regex_escape) ~ '$')
+          - lab_acme_probe_name != lab.domain
+          - not (lab_acme_probe_name is match('^(.+\.)?' ~ (lab.domain | regex_escape) ~ '$'))
+          - lab_acme_email is match('^[^@ ]+@[^@ ]+\.[^@ ]+$')
+          - lab_acme_server is match('^https://')
+        fail_msg: >-
+          acme_* values invalid, acme_solver from {{ lab_acme_solvers.keys() | list | join(', ') }},
+          acme_zone a domain, acme_probe_name lies in the zone and NOT under {{ lab.domain }}
+          (only lab-ca issues there), acme_email an address, acme_server https://.
+        quiet: true
+
+    # Argo CD creates the token secret (application secrets-cert-manager, KSOPS).
+    # Empty = template without token: then the probe is unusable, and the role says what is missing.
+    - name: Wait for the token secret from Argo CD
+      kubernetes.core.k8s_info:
+        kind: Secret
+        namespace: "{{ lab_acme_namespace }}"
+        name: "{{ lab_acme_token_secret }}"
+      register: lab_acme_token_info
+      no_log: true
+      until: lab_acme_token_info.resources | default([]) | length == 1
+      retries: "{{ 1 if ansible_check_mode else lab_acme_wait_retries }}"
+      delay: "{{ lab_acme_wait_delay }}"
+      failed_when: false
+
+    - name: Remember only the length of the token
+      ansible.builtin.set_fact:
+        lab_acme_token_length: >-
+          {{ ((lab_acme_token_info.resources | default([{}]) | first | default({})).data | default({}))[lab_acme_token_key]
+             | default('') | b64decode | length }}
+      no_log: true
+
+    - name: Token secret is there and the token is not empty
+      ansible.builtin.assert:
+        that: (lab_acme_token_length | int) > 0
+        fail_msg: >-
+          Secret {{ lab_acme_namespace }}/{{ lab_acme_token_secret }} is missing or the token is empty.
+          Put the token into ~/.config/k8s-lab/acme-dns01.token (mode 600), the file
+          secrets/cert-manager/acme-dns01-token.sops.yaml delete, lab.sh init, commit, push
+          (docs/how-to/public-certificate.md).
+        success_msg: "Token secret present ({{ lab_acme_token_length }} characters, value not shown)"
+      when: not ansible_check_mode
+
+    - name: Discard raw data of the token secret
+      ansible.builtin.set_fact:
+        lab_acme_token_info: {}
+      no_log: true
+
+    # The issuer lives here and not in Git: zone, provider and mail are personal.
+    - name: Create ClusterIssuer lab-acme
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: cert-manager.io/v1
+          kind: ClusterIssuer
+          metadata:
+            name: "{{ lab_acme_issuer }}"
+            labels:
+              app.kubernetes.io/managed-by: ansible
+              app.kubernetes.io/part-of: lab-acme
+          spec:
+            acme:
+              server: "{{ lab_acme_server }}"
+              email: "{{ lab_acme_email }}"
+              privateKeySecretRef:
+                name: "{{ lab_acme_account_secret }}"
+              solvers:
+                - selector:
+                    dnsZones:
+                      - "{{ lab_acme_zone }}"
+                  dns01: "{{ lab_acme_solvers[lab_acme_solver] }}"
+
+    # Probe certificate for a name outside the lab domain, from the public issuer.
+    # Every Certificate chooses its issuer itself (issuerRef): lab names lab-ca, the probe lab-acme.
+    - name: Create probe certificate
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: cert-manager.io/v1
+          kind: Certificate
+          metadata:
+            name: "{{ lab_acme_probe_name_obj }}"
+            namespace: "{{ lab_acme_probe_namespace }}"
+            labels:
+              app.kubernetes.io/managed-by: ansible
+              app.kubernetes.io/part-of: lab-acme
+          spec:
+            secretName: "{{ lab_acme_probe_secret }}"
+            dnsNames:
+              - "{{ lab_acme_probe_name }}"
+            duration: 2160h
+            renewBefore: 720h
+            privateKey:
+              algorithm: ECDSA
+              size: 256
+              rotationPolicy: Always
+            issuerRef:
+              name: "{{ lab_acme_issuer }}"
+              kind: ClusterIssuer
+              group: cert-manager.io
+
+    # Route without backend (noop@internal): the probe only shows the certificate, no app.
+    # Same TLS options (sniStrict) and security headers as every route on websecure
+    # (entrypoint and TLSOption default apply to all routers).
+    - name: Create probe route
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: traefik.io/v1alpha1
+          kind: IngressRoute
+          metadata:
+            name: "{{ lab_acme_probe_name_obj }}"
+            namespace: "{{ lab_acme_probe_namespace }}"
+            labels:
+              app.kubernetes.io/managed-by: ansible
+              app.kubernetes.io/part-of: lab-acme
+          spec:
+            entryPoints:
+              - websecure
+            routes:
+              - match: "Host(`{{ lab_acme_probe_name }}`)"
+                kind: Rule
+                services:
+                  - name: noop@internal
+                    kind: TraefikService
+            tls:
+              secretName: "{{ lab_acme_probe_secret }}"

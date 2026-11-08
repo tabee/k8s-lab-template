@@ -1,0 +1,16 @@
+# Template for gitea-runner-token.sops.yaml: structure without real values.
+# Global registration token of the Gitea Actions runner (issue #115). Gitea reads the key token at start
+# (env GITEA_RUNNER_REGISTRATION_TOKEN, values-gitea.yaml, optional: without this secret Gitea starts without
+# a global token). Same value as secrets/gitea-runner/gitea-runner-registration.sops.yaml.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: gitea-runner-token
+  namespace: gitea
+  labels:
+    app.kubernetes.io/managed-by: argocd
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+type: Opaque
+stringData:
+  token: "@file:gitea-runner-token"

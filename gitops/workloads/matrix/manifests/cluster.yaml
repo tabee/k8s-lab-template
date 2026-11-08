@@ -1,0 +1,46 @@
+---
+# Database for Synapse: own CNPG cluster matrix-db.
+# Own cluster so a restore of Matrix does not touch Gitea or pg-lab.
+# 2 instances: failover in about 30 s, small enough for the VM.
+# Image: same version and digest as gitea-db, as an own copy so each
+# cluster can move on its own.
+# Session pooling is in pooler.yaml. A transaction pooler breaks Synapse.
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: matrix-db
+  namespace: matrix
+spec:
+  instances: 2
+  # yamllint disable-line rule:line-length
+  imageName: ghcr.io/cloudnative-pg/postgresql:18.6-minimal-trixie@sha256:64abc98a4387361afd6821a3a99f975763bbd87bbdde9449e75ad6002528a318
+  enableSuperuserAccess: false
+  bootstrap:
+    initdb:
+      # ONLY place for database and user name. The deployment env
+      # DATABASE_USER and DATABASE_NAME are copies; verify-matrix.yml compares.
+      database: matrix
+      owner: matrix
+      secret:
+        name: matrix-db-owner
+  storage:
+    size: 2Gi
+  affinity:
+    podAntiAffinityType: preferred
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 192Mi  # lab-limit: matrix/matrix-db/postgres
+  postgresql:
+    parameters:
+      shared_buffers: 64MB
+      max_connections: "50"
+  plugins:
+    - name: barman-cloud.cloudnative-pg.io
+      enabled: true
+      isWALArchiver: true
+      parameters:
+        barmanObjectName: matrix-db
+        serverName: matrix-db

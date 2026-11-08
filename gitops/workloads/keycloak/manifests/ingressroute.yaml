@@ -1,0 +1,24 @@
+---
+# Public HTTPS name on the websecure entrypoint (port 443), same as Gitea.
+# Only the realm "lab" (login, token, keys, discovery) and the static files
+# of its login pages are routed. The admin console, the admin REST API and
+# the master realm have NO route: administration goes through
+# `kubectl -n keycloak port-forward svc/keycloak 8080:8080`
+# (docs/how-to/keycloak.md). The realm name lab is a copy of
+# gitops/charts/keycloak/values.yaml (tests/keycloak-tests.sh compares).
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: keycloak
+  namespace: keycloak
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - kind: Rule
+      match: Host(`sso.lab.example`) && (PathPrefix(`/realms/lab/`) || PathPrefix(`/resources/`))
+      services:
+        - name: keycloak
+          port: http
+  tls:
+    secretName: keycloak-tls

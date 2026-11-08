@@ -1,0 +1,32 @@
+# Template: copy to lab.local.yaml and adjust (it is in .gitignore).
+# Only enter keys that differ from lab.yaml. Example for another
+# machine with another libvirt network and its own SSH key:
+#
+# ssh_user: colleague
+# ssh_key: ~/.ssh/id_ed25519
+# vm_ip: 192.168.123.50
+# vm_cidr: 192.168.123.0/24
+# gateway: 192.168.123.1
+# dns_servers: ["192.168.123.1"]
+# memory_mib: 6144                 # only on a smaller PC; the lab is then no faithful memory test
+#
+# Network edge (profile edge), only if you want to separate admin and ingress network:
+# edge_profile: edge                # admin = only edge_profile_admin
+# edge_profile_admin: gateway       # one address, or e.g. 10.8.0.2
+# edge_ingress_cidrs: vm_cidr      # ingress networks, comma list ("vm_cidr, 203.0.113.0/24")
+#
+# Public probe (real certificate via ACME DNS-01), only if you want it:
+# acme_solver: cloudflare              # or digitalocean
+# acme_zone: example.org               # your zone at the DNS provider
+# acme_probe_name: lab-probe.example.org
+# acme_email: du@example.org
+# You put the API token into ~/.config/k8s-lab/acme-dns01.token (mode 600, one line).
+# It never goes into this file and never unencrypted into Git.
+#
+# Source of Argo CD (ADR 0024): gitea (default) or the private GitHub mirror. Switch with
+# "bash scripts/lab.sh source github" (writes this line and gitops/, then commit and push), not by hand:
+# source: github
+#
+# Attention: gateway and network are additionally fixed in some files under
+# gitops/ (Argo CD reads only Git). "bash scripts/lab.sh customize" writes them
+# there. List of the files: docs/tutorials/lab-for-friends.md, section "Anderes Netz".

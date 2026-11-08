@@ -1,0 +1,26 @@
+---
+# Stage 8c: Gitea in the k3s lab. Runbook: docs/learning-path/stage-8c-gitea.md.
+# Only the locations of the secret files on the owner's PC are here (one per
+# environment, environment = k3s-lab). All other values (names, host, times)
+# are in gitops/workloads/gitea/ and gitops/apps/; verify-gitea.yml
+# reads them from there.
+#
+# The files are created by lab.sh init, only if they are missing
+# (mode 0600, random values, never shown). From them
+# ansible/scripts/sops-secret.sh from-files makes the SOPS files under
+# secrets/gitea/. Changing a value = change the file, render the SOPS file
+# anew (delete the old one first), runbook "Schluessel wechseln".
+
+gitea_secret_dir: "{{ lookup('ansible.builtin.env', 'HOME') }}/.config/k8s-lab"
+# Password of the DB owner (CNPG sets it, Gitea logs in with it).
+gitea_db_password_file: "{{ gitea_secret_dir }}/gitea-k3s-lab-db.pw"
+# First Gitea admin: user name and password (the chart sets the password
+# only on creation, passwordMode initialOnlyNoReset).
+gitea_admin_user_file: "{{ gitea_secret_dir }}/gitea-k3s-lab-admin.user"
+gitea_admin_password_file: "{{ gitea_secret_dir }}/gitea-k3s-lab-admin.pw"
+# restic repo password for K8up. Without this password the file backup is
+# worthless: additionally keep offline (password manager).
+gitea_k8up_repo_password_file: "{{ gitea_secret_dir }}/k8up-k3s-lab-repo.pw"
+# Global registration token of the Gitea Actions runner (issue #115, at least 32 characters). Gitea reads it at
+# start (GITEA_RUNNER_REGISTRATION_TOKEN), the runner registers with it; both from SOPS, docs/how-to/gitea-actions.md.
+gitea_runner_token_file: "{{ gitea_secret_dir }}/gitea-k3s-lab-runner.token"

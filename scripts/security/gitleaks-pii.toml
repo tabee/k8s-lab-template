@@ -1,0 +1,73 @@
+# Generic rules for personal data in the repository (revDSG Art. 5 lit. c / GDPR Art. 9: special categories,
+# docs/concepts/public-release-security.md). Used ONLY by scripts/security-scan.sh (check "pii"), together with the
+# optional private deny list (CI secret PII_DENYLIST, converted at run time by pii-config.py into rules pii-001 ...).
+# This file contains no private names or numbers: it only describes the SHAPE of personal identifiers. Go regexps
+# (RE2): no look-around, so the neutral values are allowlisted per rule.
+title = "k8s-lab personal data"
+
+[[allowlists]]
+description = "git metadata (config, logs) is not part of the repository content"
+paths = ['''(^|/)\.git/''']
+
+[[rules]]
+id = "pii-ahv-number"
+description = "Swiss social security number (AHV/AVS, 756.xxxx.xxxx.xx)"
+regex = '''\b756[. ]?\d{4}[. ]?\d{4}[. ]?\d{2}\b'''
+keywords = ["756"]
+
+[[rules]]
+id = "pii-iban-ch-li"
+description = "Swiss or Liechtenstein IBAN"
+regex = '''\b(?:CH|LI)\d{2}(?: ?\d{4}){4} ?\d\b'''
+keywords = ["ch", "li"]
+[[rules.allowlists]]
+description = "Documentation example IBANs"
+regexes = ['''CH00 0000 0000 0000 0000 0''', '''CH0000000000000000000''']
+
+[[rules]]
+id = "pii-iban-generic"
+description = "IBAN of another country (2 letters, 2 digits, 4+ blocks)"
+regex = '''\b(?:DE|AT|FR|IT|ES|NL|BE|GB)\d{2}(?: ?[0-9A-Z]{4}){4,6}(?: ?\d{1,4})?\b'''
+keywords = ["de", "at", "fr", "it", "es", "nl", "be", "gb"]
+
+[[rules]]
+id = "pii-phone-number"
+description = "Phone number with an international prefix (CH, DE, AT, FR, IT, LI)"
+regex = '''(?:\+|\b00)(?:41|49|43|33|39|423)[ .\-]?\(?0?\)?[1-9]\d{1,2}[ .\-]?\d{3,4}[ .\-]?\d{2,4}(?:[ .\-]?\d{2,4})?\b'''
+keywords = ["+41", "+49", "+43", "+33", "+39", "+423", "0041", "0049", "0043", "0033", "0039"]
+
+[[rules]]
+id = "pii-phone-number-ch-national"
+description = "Swiss national phone number written in blocks (0xx xxx xx xx)"
+regex = '''\b0[1-9]\d [0-9]{3} [0-9]{2} [0-9]{2}\b'''
+keywords = ["0"]
+
+[[rules]]
+id = "pii-email-address"
+description = "E-mail address outside the reserved and generic domains"
+regex = '''[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}\b'''
+keywords = ["@"]
+[[rules.allowlists]]
+description = "Reserved domains (RFC 2606/6761), noreply addresses, the ssh user git@ and well-known non-personal names"
+regexes = [
+  '''@(?:[A-Za-z0-9-]+\.)*(?:example|test|invalid|local|localhost|lab\.dev)(?:\.[a-z]+)?\b''',
+  '''@users\.noreply\.github\.com\b''',
+  '''@(?:openssh\.com|libssh\.org)\b''',
+  '''\bnoreply@''',
+  '''\bgit@''',
+]
+
+[[rules]]
+id = "pii-matrix-user-id"
+description = "Matrix user ID of a real server (chat identity, can reveal health-adjacent conversations)"
+regex = '''@[a-z0-9._=/+-]+:[a-z0-9-]+(?:\.[a-z0-9-]+)*\.[a-z]{2,}\b'''
+keywords = [":"]
+[[rules.allowlists]]
+description = "Neutral servers of the public version"
+regexes = ['''(?:example|test|invalid|local|localhost|lab\.dev)(?:\.[a-z]+)?\b''']
+
+[[rules]]
+id = "pii-date-of-birth"
+description = "Date of birth next to a keyword"
+regex = '''(?i)(?:geburtsdatum|geboren am|date of birth|\bdob\b)\W{1,4}\d{1,2}[./-]\d{1,2}[./-](?:19|20)?\d{2}'''
+keywords = ["geburtsdatum", "geboren am", "date of birth", "dob"]

@@ -1,0 +1,48 @@
+---
+# Public HTTPS names on the websecure entrypoint (port 443), same as Gitea.
+# The admin entrypoint (8444) stays for Argo CD only.
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: matrix
+  namespace: matrix
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    # The Synapse admin API (/_synapse/admin) is never reachable from outside: it can read and change every account.
+    # This rule is longer and has a higher priority than the one below, and its middleware lets only 127.0.0.1 in.
+    # Traefik reaches Synapse from another address, so the answer is always 403. Admin work (and the import) goes
+    # through localhost inside the pod or through a kubectl port-forward (docs/how-to/matrix.md).
+    - kind: Rule
+      match: Host(`matrix.lab.example`) && PathPrefix(`/_synapse/admin`)
+      priority: 1000
+      middlewares:
+        - name: deny-admin-api
+      services:
+        - name: synapse
+          port: http
+    - kind: Rule
+      match: Host(`matrix.lab.example`)
+      services:
+        - name: synapse
+          port: http
+  tls:
+    secretName: matrix-tls
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: element
+  namespace: matrix
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - kind: Rule
+      match: Host(`element.lab.example`)
+      services:
+        - name: element
+          port: http
+  tls:
+    secretName: matrix-tls

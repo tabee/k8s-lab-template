@@ -1,0 +1,32 @@
+---
+# AppArmor is the default on Ubuntu; containerd (k3s) uses the profile
+# cri-containerd.apparmor.d only if AppArmor is active in the kernel.
+
+- name: Install AppArmor
+  ansible.builtin.apt:
+    name:
+      - apparmor
+      - apparmor-utils
+    state: present
+
+- name: Enable AppArmor service
+  ansible.builtin.systemd_service:
+    name: apparmor
+    enabled: true
+    state: started
+
+- name: Read AppArmor status in the kernel
+  ansible.builtin.command: aa-enabled
+  register: base_apparmor_enabled
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: AppArmor must be active
+  ansible.builtin.assert:
+    that:
+      - base_apparmor_enabled.stdout | trim == 'Yes'
+    fail_msg: >-
+      AppArmor not active: {{ base_apparmor_enabled.stdout | default('') }} {{ base_apparmor_enabled.stderr | default('') }}
+      {{ base_apparmor_enabled.msg | default('') }}
+    quiet: true

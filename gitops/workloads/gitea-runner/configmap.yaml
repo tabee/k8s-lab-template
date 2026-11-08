@@ -1,0 +1,120 @@
+---
+# Configuration of gitea-runner 5.4.1 (all keys: config.example.yaml of the release). Jobs run as Kubernetes pods
+# (label kubernetes://), not in Docker: no Docker daemon, no privileged container (ADR 0030).
+#
+# One job at a time (capacity 1), 45 minutes at most. The job pod's memory limit below is what the memory budget
+# counts for CI (scripts/prod-budget-check.py, marker lab-limit); the ResourceQuota in jobs-limits.yaml enforces
+# the same number. The default image of the label is the same python image the workflows name
+# (tests/gitea-runner-tests.sh compares it with .github/workflows/lint.yml); every workflow sets its own image anyway.
+#
+# Pod template, merged under every job pod by the runner:
+#   - PSA restricted: uid/gid 1000, no privilege escalation, no capabilities, seccomp RuntimeDefault.
+#   - HOME=/tmp: the images have no home for uid 1000 (git config --global, pip, ansible-galaxy write there).
+#   - /etc/passwd and /etc/group from the ConfigMap gitea-runner-job-env: ssh-keygen (signature checks) and git
+#     refuse to run for a uid without an entry.
+#   - GIT_CONFIG_SYSTEM: rewrites the public Gitea URL (github.server_url) to the Service inside the cluster,
+#     so a clone neither needs the lab CA nor public DNS (jobs-configmap.yaml).
+#   - workspace and act are size-limited emptyDirs (the runner would mount unlimited ones).
+#
+# Backup window: health_check.script (backup-window.sh below) makes the runner refuse new jobs from 19:00 to
+# 02:30 UTC. The backup calendar runs 20:00-02:30 UTC (CNPG 20:00, K8up up to Sunday 01:30 + 30 min, the same span
+# as the Keycloak sync window); the hour before 20:00 lets a job that started at 18:59 end (timeout 45m,
+# activeDeadlineSeconds 50m). So a CI job pod and a K8up pod never run at the same time. The budget still counts
+# the job pod in full (scripts/prod-budget-check.py): the gate is a runner setting, not something Kubernetes enforces.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gitea-runner-config
+  namespace: gitea-runner
+data:
+  config.yaml: |
+    log:
+      level: info
+    runner:
+      file: /data/.runner
+      capacity: 1
+      timeout: 45m
+      shutdown_timeout: 0s
+      fetch_timeout: 5s
+      fetch_interval: 5s
+      fetch_interval_max: 30s
+      labels:
+        - "ubuntu-latest:kubernetes://docker.io/library/python:3.13.17-trixie@sha256:d5a186865324088bd10d1671801b42297a8fe3f8059143fb22b2e2b776ffa6dd"
+    cache:
+      enabled: false
+    kubernetes:
+      namespace: gitea-runner-jobs
+      transfer:
+        mode: api
+      pod_template:
+        spec:
+          activeDeadlineSeconds: 3000
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            fsGroup: 1000
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: job
+              env:
+                - name: HOME
+                  value: /tmp
+                - name: GIT_CONFIG_SYSTEM
+                  value: /etc/gitea-runner-job/gitconfig
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop:
+                    - "ALL"
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 512Mi
+                  ephemeral-storage: 1Gi
+                limits:
+                  memory: 512Mi  # lab-limit: gitea-runner-jobs/*/job
+                  ephemeral-storage: 8Gi
+              volumeMounts:
+                - name: job-env
+                  mountPath: /etc/gitea-runner-job
+                  readOnly: true
+                - name: job-env
+                  mountPath: /etc/passwd
+                  subPath: passwd
+                  readOnly: true
+                - name: job-env
+                  mountPath: /etc/group
+                  subPath: group
+                  readOnly: true
+          volumes:
+            - name: job-env
+              configMap:
+                name: gitea-runner-job-env
+            - name: workspace
+              emptyDir:
+                sizeLimit: 4Gi
+            - name: act
+              emptyDir:
+                sizeLimit: 2Gi
+    health_check:
+      enabled: true
+      # Jobs keep their files in the job pod, not in the runner: the free space check only must not trip on /data.
+      min_free_disk_space_mb: 1
+      script: /etc/gitea-runner/backup-window.sh
+      interval: 60s
+      timeout: 5s
+    metrics:
+      enabled: false
+  backup-window.sh: |
+    #!/bin/bash
+    # Health check of the runner: exit 1 = accept no new job. Running jobs are not touched.
+    # Window 19:00-02:30 UTC (Europe/Zurich winter 20:00-03:30, summer 21:00-04:30); see the header above.
+    set -u
+    now=$((10#$(date -u +%H%M)))
+    if (( now >= 1900 || now < 230 )); then
+      echo "backup window (19:00-02:30 UTC): no new jobs until 02:30 UTC"
+      exit 1
+    fi
+    exit 0

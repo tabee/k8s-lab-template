@@ -1,0 +1,133 @@
+---
+# Issue #3: off-host replica of the rustfs backup data. Usage in the directory ansible/:
+#   ansible-playbook backup-replica.yml             (or: bash scripts/lab.sh replica install)
+#   ansible-playbook backup-replica.yml --tags config   (only config and script, used by lab.sh replica hostkey)
+# Runbook: docs/how-to/backup-replica.md. Rootless on the replica: only ~/.ssh/authorized_keys and one directory.
+# The personal key (backup_replica_install_key) is used ONCE, here; the mirror runs with its own restricted key.
+# Values: inventory/group_vars/all/backup_replica.yml (host, user, paths, limits live only there).
+# Needs: the host key pinned (backup_replica_host_key), rsync on the replica (sudo apt install rsync, once).
+
+- name: Replica, step 1 (owner's PC), key, config, preflight
+  hosts: backup_host
+  gather_facts: true
+  gather_subset: [min]
+  tasks:
+    - name: The replica is switched on in group_vars
+      ansible.builtin.assert:
+        that: backup_replica_enabled | bool
+        fail_msg: "backup_replica_enabled is false in group_vars/all/backup_replica.yml, nothing to do."
+      tags: [always]
+
+    - name: Config and script of the mirror
+      ansible.builtin.include_role:
+        name: backup_replica
+        tasks_from: config
+        apply:
+          tags: [config, install]
+      tags: [config, install]
+
+    - name: Restricted key of the mirror (only if missing, a private key is never printed)
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/secrets-generate.yml"
+      vars:
+        secret_names: [replica-ssh-key]
+      tags: [install]
+
+    - name: Pinned host key
+      ansible.builtin.include_role:
+        name: backup_replica
+        tasks_from: pin
+        apply:
+          tags: [install]
+      tags: [install]
+
+    - name: Preflight with the install key (reachability, rsync, rrsync, space)
+      ansible.builtin.command:
+        argv: "{{ [ansible_playbook_python, backup_replica_script, 'preflight', '--install', '--config', backup_replica_config] }}"
+      register: replica_preflight
+      changed_when: false
+      check_mode: false
+      ignore_errors: true
+      when: not ansible_check_mode
+      tags: [install]
+
+    - name: Preflight passed
+      ansible.builtin.assert:
+        that: (replica_preflight.rc | default(0)) == 0
+        fail_msg: |-
+          {{ replica_preflight.stdout | default('') }}
+          {{ replica_preflight.stderr | default('') }}
+      when: not ansible_check_mode
+      tags: [install]
+
+    - name: Authorized_keys line (restrict, from=, rrsync), computed by the same script the tests run
+      ansible.builtin.command:
+        argv: "{{ [ansible_playbook_python, backup_replica_script, 'authline', '--config', backup_replica_config] }}"
+      register: replica_authline
+      changed_when: false
+      check_mode: false
+      ignore_errors: "{{ ansible_check_mode }}"
+      tags: [install]
+
+- name: Replica, step 2 (the replica, rootless, install key used once)
+  hosts: backup_replica
+  gather_facts: false
+  tags: [install]
+  vars:
+    replica_line: "{{ hostvars[groups['backup_host'][0]].replica_authline.stdout | default('') | trim }}"
+  tasks:
+    - name: Directory .ssh
+      ansible.builtin.file:
+        path: ~/.ssh
+        state: directory
+        mode: "0700"
+
+    - name: Restricted key in authorized_keys (replaces the old line of this key, other keys stay)
+      ansible.builtin.lineinfile:
+        path: ~/.ssh/authorized_keys
+        regexp: ' k8s-lab-replica$'
+        line: "{{ replica_line }}"
+        create: true
+        mode: "0600"
+      when: replica_line | length > 0
+
+    - name: Data directory of the replica
+      ansible.builtin.file:
+        path: "{{ backup_replica_remote_dir }}/data"
+        state: directory
+        mode: "0700"
+
+- name: Replica, step 3 (owner's PC), units, first mirror, check with the restricted key
+  hosts: backup_host
+  gather_facts: true
+  gather_subset: [min]
+  tags: [install]
+  tasks:
+    - name: Units and timers
+      ansible.builtin.include_role:
+        name: backup_replica
+        tasks_from: units
+
+    - name: Restricted key works (rsync listing only, no shell)
+      ansible.builtin.command:
+        argv: "{{ [ansible_playbook_python, backup_replica_script, 'preflight', '--config', backup_replica_config] }}"
+      register: replica_runtime
+      changed_when: false
+      ignore_errors: true
+      when: not ansible_check_mode
+
+    - name: Restricted key passed the check
+      ansible.builtin.assert:
+        that: (replica_runtime.rc | default(0)) == 0
+        fail_msg: |-
+          {{ replica_runtime.stdout | default('') }}
+          {{ replica_runtime.stderr | default('') }}
+      when: not ansible_check_mode
+
+    - name: First mirror run (waits until it is done)
+      ansible.builtin.systemd_service:
+        name: "{{ backup_replica_unit_prefix }}-mirror.service"
+        scope: user
+        state: started
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/{{ ansible_facts['user_uid'] }}"
+      when: not ansible_check_mode

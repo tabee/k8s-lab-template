@@ -1,0 +1,219 @@
+---
+# Incoming in the namespace keycloak first everything closed, then open selectively:
+#   - Pods in the same namespace among each other (Keycloak -> Postgres,
+#     realm job -> Keycloak, replication, backup pods),
+#   - the CNPG operator to the instances (status 8000, Postgres 5432),
+#   - Traefik to Keycloak (port 8080; Traefik routes only the realm and its
+#     static files, the admin console has no route, see ingressroute.yaml),
+#   - Gitea and Synapse to Keycloak (port 8080, in-cluster back channel: token,
+#     keys, user info). The matching egress rules live next to those apps
+#     (gitea/manifests/networkpolicy-keycloak.yaml, matrix/manifests/networkpolicy-keycloak.yaml).
+#   - the login proxies of the notes sites (notes-oauth2-proxy in every notes-* namespace, label
+#     part-of=notes on the namespace, set by Ansible): port 8080, back channel (token, keys).
+#     The matching egress rule lives in the chart (gitops/charts/notes-site/templates/networkpolicy.yaml).
+# Outgoing: first everything closed. Keycloak has no path to the internet (no
+# mail, no federation, no external identity provider). DNS and the same
+# namespace are enough for Keycloak and the realm job. Postgres may reach the
+# API server and the S3 backup target.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: keycloak
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-same-namespace
+  namespace: keycloak
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector: {}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-cnpg-operator
+  namespace: keycloak
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: cnpg-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: cloudnative-pg
+      ports:
+        - protocol: TCP
+          port: 8000
+        - protocol: TCP
+          port: 5432
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: keycloak-allow-traefik
+  namespace: keycloak
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: keycloak
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: traefik
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: traefik
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+# Back channel of the OIDC clients: Gitea (init: none, login: token + user info) and
+# Synapse (token, keys, user info). Only these two pods, only the HTTP port.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: keycloak-allow-oidc-clients
+  namespace: keycloak
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: keycloak
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gitea
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: gitea
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: matrix
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: synapse
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+# Back channel of the notes login proxies (client notes): token and keys, only the HTTP port.
+# The namespaces notes-* carry app.kubernetes.io/part-of=notes (Ansible, role notes_sites).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: keycloak-allow-notes-proxy
+  namespace: keycloak
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: keycloak
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: notes
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: notes-oauth2-proxy
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+# Egress: nothing leaves a pod unless a policy below allows it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-egress
+  namespace: keycloak
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+---
+# DNS: only the cluster DNS pods.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-dns
+  namespace: keycloak
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+# Inside the namespace: Keycloak to Postgres, realm job to Keycloak, replication.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-same-namespace
+  namespace: keycloak
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector: {}
+---
+# Postgres instance, backup and initdb pods (label cnpg.io/cluster): API server
+# (rule is evaluated after DNAT, so node IP:6443) and S3 of the backup target.
+# Nothing else. Keycloak does not carry this label and cannot use this path.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-cnpg-api-s3
+  namespace: keycloak
+spec:
+  podSelector:
+    matchExpressions:
+      - key: cnpg.io/cluster
+        operator: Exists
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 192.168.122.50/32
+      ports:
+        - protocol: TCP
+          port: 6443
+    - to:
+        - ipBlock:
+            cidr: 192.168.122.1/32
+      ports:
+        - protocol: TCP
+          port: 9000

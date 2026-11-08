@@ -1,0 +1,138 @@
+---
+# Egress probes (issue #5). Input: egress_probes, a list of {name, namespace, labels, open, closed,
+# create_namespace} (ansible/inventory/group_vars/all/egress.yml). One throwaway pod per entry
+# (PSA restricted, no service account token) tries TCP connections; "open" targets must connect, "closed"
+# targets must not. All pods run side by side, results are asserted per pod, pods (and the control
+# namespace) are removed at the end, also on failure. The including play must set module_defaults for
+# kubernetes.core.k8s with the kubeconfig.
+- name: Egress probes
+  vars:
+    egress_script: "{{ lookup('ansible.builtin.file', playbook_dir ~ '/files/egress-probe.py') }}"
+  block:
+    - name: Remove leftover probe pods from an earlier run
+      kubernetes.core.k8s:
+        state: absent
+        api_version: v1
+        kind: Pod
+        namespace: "{{ item.namespace }}"
+        name: "egress-probe-{{ item.name }}"
+        wait: true
+      loop: "{{ egress_probes }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: not (item.create_namespace | default(false))
+
+    - name: Create the namespace without policies (control probe)
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ item.namespace }}"
+            labels:
+              pod-security.kubernetes.io/enforce: restricted
+      loop: "{{ egress_probes | selectattr('create_namespace', 'defined') | selectattr('create_namespace') | list }}"
+      loop_control:
+        label: "{{ item.namespace }}"
+
+    - name: Create the probe pods
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: "egress-probe-{{ item.name }}"
+            namespace: "{{ item.namespace }}"
+            labels: "{{ item.labels | default({}) | combine({'lab-egress-probe': 'true'}) }}"
+          spec:
+            restartPolicy: Never
+            automountServiceAccountToken: false
+            securityContext:
+              runAsNonRoot: true
+              runAsUser: 65534
+              runAsGroup: 65534
+              seccompProfile:
+                type: RuntimeDefault
+            containers:
+              - name: probe
+                image: "{{ egress_probe_image }}"
+                command: [python3, -c, "{{ egress_script }}"]
+                env:
+                  - name: PROBE_OPEN
+                    value: "{{ item.open | join(' ') }}"
+                  - name: PROBE_CLOSED
+                    value: "{{ item.closed | join(' ') }}"
+                  - name: PYTHONDONTWRITEBYTECODE
+                    value: "1"
+                securityContext:
+                  allowPrivilegeEscalation: false
+                  readOnlyRootFilesystem: true
+                  capabilities:
+                    drop: [ALL]
+                resources:
+                  requests: {cpu: 10m, memory: 32Mi}
+                  limits: {memory: 128Mi}
+      loop: "{{ egress_probes }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Wait until every probe pod has finished
+      kubernetes.core.k8s_info:
+        kind: Pod
+        namespace: "{{ item.namespace }}"
+        name: "egress-probe-{{ item.name }}"
+      register: egress_wait
+      until: ((egress_wait.resources | first | default({})).status | default({})).phase | default('') in ['Succeeded', 'Failed']
+      retries: 36
+      delay: 5
+      loop: "{{ egress_probes }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Read the probe logs
+      kubernetes.core.k8s_log:
+        namespace: "{{ item.namespace }}"
+        name: "egress-probe-{{ item.name }}"
+      register: egress_logs
+      loop: "{{ egress_probes }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Every probe matches its expectation (open targets connect, closed targets do not)
+      ansible.builtin.assert:
+        that:
+          - "'DONE bad=0' in item.log_lines"
+        fail_msg: >-
+          Egress probe {{ item.item.name }} (namespace {{ item.item.namespace }}, labels {{ item.item.labels | default({}) | to_json }}):
+          {{ item.log_lines | default([]) | select('match', '^BAD') | list | join('; ') or 'no result line' }}.
+          {{ 'Check the control probe first: the target must be reachable without any policy.' if item.item.name != 'control' else
+          'Control probe: the target is unreachable even without a policy (S3 down? firewall?), so the closed checks prove nothing.' }}
+        success_msg: "Egress {{ item.item.name }}: {{ item.log_lines | default([]) | select('match', '^OK') | length }} checks as expected"
+      loop: "{{ egress_logs.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+  always:
+    - name: Remove the probe pods
+      kubernetes.core.k8s:
+        state: absent
+        api_version: v1
+        kind: Pod
+        namespace: "{{ item.namespace }}"
+        name: "egress-probe-{{ item.name }}"
+        wait: false
+      loop: "{{ egress_probes }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Remove the control namespace
+      kubernetes.core.k8s:
+        state: absent
+        api_version: v1
+        kind: Namespace
+        name: "{{ item.namespace }}"
+        wait: false
+      loop: "{{ egress_probes | selectattr('create_namespace', 'defined') | selectattr('create_namespace') | list }}"
+      loop_control:
+        label: "{{ item.namespace }}"

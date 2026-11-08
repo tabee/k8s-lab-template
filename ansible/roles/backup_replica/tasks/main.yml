@@ -1,0 +1,10 @@
+---
+# Everything on the owner's PC, in this order: config and script, pinned host key, units.
+- name: Config and script
+  ansible.builtin.import_tasks: config.yml
+
+- name: Pinned host key
+  ansible.builtin.import_tasks: pin.yml
+
+- name: Units
+  ansible.builtin.import_tasks: units.yml

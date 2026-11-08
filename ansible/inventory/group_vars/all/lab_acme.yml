@@ -1,0 +1,40 @@
+---
+# Public probe (issue #7): second ClusterIssuer lab-acme via ACME DNS-01 and a
+# probe certificate for a name OUTSIDE the lab domain. Role lab_acme, playbook
+# public.yml, check verify-public.yml. Each value only defined here;
+# the personal values come from lab.local.yaml (lab.yaml has empty defaults).
+# Without the four values nothing happens (SKIP, changed=0). No token here, see lab_acme_token_*.
+
+lab_acme_solver: "{{ lab.acme_solver | default('', true) | trim }}"
+lab_acme_zone: "{{ lab.acme_zone | default('', true) | trim | lower }}"
+lab_acme_probe_name: "{{ lab.acme_probe_name | default('', true) | trim | lower }}"
+lab_acme_email: "{{ lab.acme_email | default('', true) | trim }}"
+lab_acme_server: "{{ lab.acme_server }}"
+lab_acme_active: "{{ [lab_acme_solver, lab_acme_zone, lab_acme_probe_name, lab_acme_email] | select | list | length == 4 }}"
+
+# Supported providers: name -> solver in the ClusterIssuer (the token is in the secret
+# lab_acme_token_secret under the key lab_acme_token_key).
+lab_acme_solvers:
+  cloudflare:
+    cloudflare:
+      apiTokenSecretRef: { name: "{{ lab_acme_token_secret }}", key: "{{ lab_acme_token_key }}" }
+  digitalocean:
+    digitalocean:
+      tokenSecretRef: { name: "{{ lab_acme_token_secret }}", key: "{{ lab_acme_token_key }}" }
+
+lab_acme_issuer: lab-acme
+lab_acme_account_secret: lab-acme-account
+# The token secret comes encrypted from secrets/cert-manager (Application
+# secrets-cert-manager, template acme-dns01-token.sops.yaml.example).
+lab_acme_token_secret: acme-dns01-token
+lab_acme_token_key: token
+# Host file of the token (optional, kind external in secrets.yml): one line, mode 600.
+lab_acme_token_file: ~/.config/k8s-lab/acme-dns01.token
+# Namespace of the issuer and token secret (cert-manager: cluster resource namespace).
+lab_acme_namespace: "{{ lab_ca_namespace }}"
+# Probe certificate and route live in the Traefik namespace (route without backend: noop@internal).
+lab_acme_probe_namespace: traefik
+lab_acme_probe_name_obj: acme-probe
+lab_acme_probe_secret: acme-probe-tls
+lab_acme_wait_retries: 60
+lab_acme_wait_delay: 10

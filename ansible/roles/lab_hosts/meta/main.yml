@@ -1,0 +1,34 @@
+---
+# Role "lab_hosts": names of the lab services in /etc/hosts on the owner's PC
+# (group backup_host, local), so that the browser finds them. The names
+# come from the repo (certificates, Gitea values, gitops/sites.yaml), the IP
+# from the inventory (k3s-lab). Runbook: docs/learning-path/stage-8c-gitea.md (section "Namen in /etc/hosts").
+galaxy_info:
+  author: k8s-lab
+  description: Maintain managed block with the lab names in /etc/hosts, remove legacy entries
+  license: MIT
+  min_ansible_version: "2.17"
+  platforms:
+    - name: GenericLinux
+      versions:
+        - all
+dependencies: []
+
+# Required variables; values come from inventory/group_vars/all/lab_hosts.yml.
+argument_specs:
+  main:
+    short_description: /etc/hosts block with the lab names (sudo only for /etc/hosts)
+    options:
+      lab_hosts_file: { type: path, required: true, description: Hosts file (/etc/hosts) }
+      lab_hosts_domain: { type: str, required: true, description: "Domain of all lab names, only these go into the block" }
+      lab_hosts_ip: { type: str, required: true, description: "Address of the lab VM (inventory, k3s-lab)" }
+      lab_hosts_marker: { type: str, required: true, description: "Marker of the managed block, {mark} becomes BEGIN/END" }
+      lab_hosts_workloads_dir: { type: path, required: true, description: "Folder with gitops/workloads (certificate.yaml per service)" }
+      lab_hosts_cert_file: { type: str, required: true, description: File name of the certificates under the workloads folder }
+      lab_hosts_gitea_values_file: { type: path, required: true, description: "values-gitea.yaml (gitea.config.server.DOMAIN)" }
+      lab_hosts_sites_file: { type: path, required: true, description: "gitops/sites.yaml (notebooks, field host)" }
+      lab_hosts_stale_regexps:
+        type: list
+        elements: str
+        required: true
+        description: "Old lines that are deleted outside the block (regex per line)"

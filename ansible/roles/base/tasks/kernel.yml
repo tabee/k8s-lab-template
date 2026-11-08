@@ -1,0 +1,14 @@
+---
+- name: Load kernel modules at boot
+  ansible.builtin.template:
+    src: modules-k8s.conf.j2
+    dest: /etc/modules-load.d/k8s.conf
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Load kernel modules immediately
+  community.general.modprobe:
+    name: "{{ item }}"
+    state: present
+  loop: "{{ base_kernel_modules }}"

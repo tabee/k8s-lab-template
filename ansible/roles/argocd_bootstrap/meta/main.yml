@@ -1,0 +1,74 @@
+---
+# Role "argocd_bootstrap": bring Argo CD into the cluster once (chicken and egg).
+# Afterwards Git steers the cluster; the role only creates the starting point.
+galaxy_info:
+  author: k8s-lab
+  description: Install Argo CD via Helm, create repo, project and root app
+  license: MIT
+  min_ansible_version: "2.17"
+  platforms:
+    - name: GenericLinux
+      versions:
+        - all
+dependencies: []
+
+# Required variables; values come from inventory/group_vars/all/argocd.yml.
+argument_specs:
+  main:
+    short_description: Argo CD bootstrap (runs on localhost)
+    options:
+      argocd_kubeconfig: { type: str, required: true, description: Kubeconfig on the control machine }
+      argocd_namespace: { type: str, required: true, description: Namespace for Argo CD }
+      argocd_psa_level:
+        type: str
+        required: true
+        choices: [privileged, baseline, restricted]
+        description: PSA level for the namespace (enforce, audit, warn)
+      argocd_psa_version: { type: str, required: true, description: PSA version (latest or v1.x) }
+      argocd_chart_repo_name: { type: str, required: true, description: Local name of the Helm repo }
+      argocd_chart_repo_url: { type: str, required: true, description: URL des Helm-Repos }
+      argocd_chart_name: { type: str, required: true, description: Chart-Name im Repo }
+      argocd_chart_version: { type: str, required: true, description: Pinned chart version }
+      argocd_release_name: { type: str, required: true, description: Name des Helm-Releases }
+      argocd_helm_timeout: { type: str, required: true, description: Wait time for helm (Go duration) }
+      argocd_repo_url: { type: str, required: true, description: SSH-URL des Git-Repos }
+      argocd_repo_revision: { type: str, required: true, description: Branch for the root app }
+      argocd_pin_revision: { type: str, required: false, default: "", description: "Commit (40 hex) for root and child apps; empty: branch" }
+      argocd_repo_ssh_key_path: { type: str, required: true, description: Path to the private deploy key }
+      argocd_repo_secret_name: { type: str, required: true, description: Name des Repo-Secrets }
+      argocd_repo_known_hosts: { type: list, elements: str, required: true, description: Host-Keys (ssh-keyscan) }
+      argocd_project: { type: str, required: true, description: Name of the AppProject for workloads }
+      argocd_project_namespaces: { type: list, elements: str, required: true, description: Target namespaces for the workload project }
+      argocd_project_chart_repos: { type: list, elements: str, required: true, description: "Helm repos for the workload project (empty = Git only)" }
+      argocd_platform_project: { type: str, required: true, description: Name of the AppProject for platform services }
+      argocd_platform_namespaces: { type: list, elements: str, required: true, description: Target namespaces for the platform project }
+      argocd_platform_chart_repos: { type: list, elements: str, required: true, description: Additional Helm repos for the platform project }
+      argocd_platform_cluster_resources:
+        type: list
+        elements: dict
+        required: true
+        description: Cluster-wide kinds (group, kind) for the platform project
+      argocd_destination_server: { type: str, required: true, description: API address of the target cluster }
+      argocd_root_app_name: { type: str, required: true, description: Name of the root application }
+      argocd_root_app_path: { type: str, required: true, description: Path of the app definitions in the repo }
+      argocd_root_automated: { type: dict, required: true, description: "Auto-sync policy of the root application (prune, selfHeal)" }
+      argocd_root_project: { type: str, required: true, description: Name of the AppProject for the root Application }
+      argocd_root_project_resources:
+        type: list
+        elements: dict
+        required: true
+        description: Kinds (group, kind) the root project may create in the namespace argocd
+      argocd_ui_project: { type: str, required: true, description: Name of the AppProject for the Argo CD ingress Application }
+      argocd_ui_namespaces: { type: list, elements: str, required: true, description: Destination namespaces of the ingress project }
+      argocd_ui_resources:
+        type: list
+        elements: dict
+        required: true
+        description: Kinds (group, kind) the ingress project may create
+      argocd_default_project: { type: str, required: true, description: Name of the built-in project that gets closed }
+      # Stage 7 (KSOPS), values from inventory/group_vars/all/sops.yml.
+      argocd_sops_age_key_path: { type: str, required: true, description: "Path to the private age key (mode 0600)" }
+      argocd_sops_age_secret_name: { type: str, required: true, description: Name des age-Secrets im Namespace argocd }
+      argocd_sops_config_path: { type: str, required: true, description: Path to .sops.yaml (recipients) }
+      argocd_ksops_image: { type: str, required: true, description: "KSOPS image with tag and digest" }
+      lab_probe_image: { type: str, required: true, description: "Probe image with tag and digest (group_vars/all/images.yml)" }

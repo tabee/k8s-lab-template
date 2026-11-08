@@ -1,0 +1,8 @@
+# Paths trufflehog skips (regex, one per line, matched against the path inside the repository).
+# Only fixtures with made-up credentials. A real finding is never listed here.
+# 2026-11-03: the e2e harness seeds a throw-away Gitea container with made-up users and passwords in URLs
+# (user and password inside clone URLs); the URI detector reports them. gitleaks checks the same file with the narrow allowlist
+# in .gitleaks.toml (only the two seed users), so the file is not unchecked.
+^scripts/gitea-import-e2e\.sh$
+# Git's own object store (the filesystem mode would read the same content a second time; history is scanned by "trufflehog git").
+(^|/)\.git/

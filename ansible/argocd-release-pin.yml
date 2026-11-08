@@ -1,0 +1,16 @@
+---
+# Releases the pin of a rebuild (issue 71, ADR-0023): the root application and, through the
+# Kustomize patches, every child application follow the branch (argocd_repo_revision) again.
+# lab.sh runs this after the source trust re-check passed. Run by hand if a re-check failed and you
+# have looked at the commits yourself:  bash scripts/lab.sh trust release
+# Idempotent. Check first: ansible-playbook argocd-release-pin.yml --check --diff
+- name: Release the pin of the root application
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: "{{ argocd_kubeconfig }}"
+  tasks:
+    - name: Unpin the root application
+      ansible.builtin.include_tasks: tasks/root-unpin.yml

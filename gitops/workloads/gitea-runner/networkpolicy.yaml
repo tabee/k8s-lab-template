@@ -1,0 +1,118 @@
+---
+# NetworkPolicies of both runner namespaces (issue #115). Default-deny for ingress and egress, then only:
+#   runner pod (gitea-runner):      DNS, Gitea (Service gitea-http, port 3000), API server (node IP:6443; the rule
+#                                   is evaluated after DNAT, as in gitea/networkpolicy.yaml). No ingress at all.
+#   job pods (gitea-runner-jobs):   DNS, Gitea (port 3000) and HTTPS to the public internet (PyPI, GitHub releases,
+#                                   Ansible Galaxy, the trivy database). Private ranges, link-local and the node
+#                                   network stay closed, so a job reaches neither the API server nor another pod
+#                                   nor S3. No ingress at all (exec goes through the kubelet, not the pod network).
+# Gitea's side: gitops/workloads/gitea/manifests/networkpolicy-runner.yaml.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: gitea-runner
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gitea-runner-allow-egress
+  namespace: gitea-runner
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: gitea-runner
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gitea
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: gitea
+      ports:
+        - protocol: TCP
+          port: 3000
+    - to:
+        - ipBlock:
+            cidr: 192.168.122.50/32
+      ports:
+        - protocol: TCP
+          port: 6443
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: gitea-runner-jobs
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gitea-runner-jobs-allow-egress
+  namespace: gitea-runner-jobs
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gitea
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: gitea
+      ports:
+        - protocol: TCP
+          port: 3000
+    # Names cannot be pinned (kube-router has no FQDN rules), so 443 stays open to every public address.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+              - 127.0.0.0/8
+      ports:
+        - protocol: TCP
+          port: 443

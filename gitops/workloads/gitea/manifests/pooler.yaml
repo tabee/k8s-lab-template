@@ -1,0 +1,32 @@
+---
+# PgBouncer in front of the primary (rw). Gitea connects to
+# gitea-db-pooler-rw.gitea.svc:5432 (values-gitea.yaml, HOST); for a
+# failover the pooler itself points to the new primary.
+# Session-Modus: Gitea (Go, lib/pq) uses prepared statements.
+# 1 instance is enough: Gitea also runs only once, and if the pooler
+# fails, Kubernetes restarts it in seconds.
+apiVersion: postgresql.cnpg.io/v1
+kind: Pooler
+metadata:
+  name: gitea-db-pooler-rw
+  namespace: gitea
+spec:
+  cluster:
+    name: gitea-db
+  instances: 1
+  type: rw
+  pgbouncer:
+    poolMode: session
+    parameters:
+      max_client_conn: "100"
+      default_pool_size: "20"
+  template:
+    spec:
+      containers:
+        - name: pgbouncer
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 64Mi  # lab-limit: gitea/gitea-db-pooler-rw/pgbouncer

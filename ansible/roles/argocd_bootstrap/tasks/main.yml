@@ -1,0 +1,17 @@
+---
+# Bootstrap of Argo CD: Ansible lights the rocket, afterwards it flies with
+# Git as control. Order: check, namespace, Helm, repo, project+root.
+# Runs on localhost; kubeconfig comes via module_defaults from argocd.yml.
+
+- name: Check prerequisites
+  ansible.builtin.import_tasks: preflight.yml
+
+# Stage 7: age key matches .sops.yaml (never plain text in the output).
+- name: Check prerequisites for KSOPS
+  ansible.builtin.import_tasks: preflight-sops.yml
+
+- name: Namespace and Helm release
+  ansible.builtin.import_tasks: install.yml
+
+- name: Repo access, project and root application
+  ansible.builtin.import_tasks: gitops.yml

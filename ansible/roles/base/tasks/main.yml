@@ -1,0 +1,42 @@
+---
+# Order: packages, snapd gone, updates, kernel modules, apport off,
+# sysctl (k3s + hardening), time, SSH, auditd, AppArmor, UFW (off).
+# Host-Firewall: Rolle "firewall".
+# Only kernel modules, apport and sysctl: ansible-playbook site.yml --tags sysctl
+- name: Apt packages and upgrades
+  ansible.builtin.import_tasks: apt.yml
+
+- name: Remove snapd
+  ansible.builtin.import_tasks: snapd.yml
+
+- name: Unattended-Upgrades
+  ansible.builtin.import_tasks: unattended.yml
+
+- name: Kernel-Module
+  ansible.builtin.import_tasks: kernel.yml
+  tags: [sysctl]
+
+- name: Disable apport (otherwise sets fs.suid_dumpable=2 at boot)
+  ansible.builtin.import_tasks: apport.yml
+  tags: [sysctl]
+
+- name: Sysctl (k3s values and hardening)
+  ansible.builtin.import_tasks: sysctl.yml
+  tags: [sysctl]
+
+- name: Set time zone
+  community.general.timezone:
+    name: "{{ base_timezone }}"
+
+- name: SSH hardening
+  ansible.builtin.import_tasks: ssh.yml
+
+- name: Auditd with base rules
+  ansible.builtin.import_tasks: auditd.yml
+
+- name: Check AppArmor
+  ansible.builtin.import_tasks: apparmor.yml
+
+- name: Firewall (optional)
+  ansible.builtin.import_tasks: ufw.yml
+  when: base_ufw_enabled

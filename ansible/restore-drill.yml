@@ -1,0 +1,544 @@
+---
+# Restore drill (issue #4): prove that Gitea (database and files) can be rebuilt from the backups ALONE.
+# A second play (restore-drill-matrix.yml) does the same for Matrix. It runs only after this play succeeds.
+# Usage (from ansible/), normally through `lab.sh restore-drill` (double confirmation, fresh export required):
+#   ansible-playbook restore-drill.yml
+#
+# What it does (nothing real is deleted, the running Gitea is only read and backed up once more):
+#   1. Preflight: the live cluster is healthy, rustfs answers, the newest completed schedule backups
+#      (CNPG base backup and K8up) are younger than restore_drill_max_age_h.
+#   2. One fresh backup each (K8up Backup, CNPG Backup), then a fingerprint of the live database.
+#   3. Throwaway namespace <gitea ns>-drill with fresh volumes (nothing of the old disk is used): the secrets
+#      and the ObjectStore as in the real namespace, a CNPG cluster with bootstrap.recovery from the REAL
+#      archive (read only, no WAL archiver: the live archive is never written) and a K8up restore of the
+#      Gitea volume into an empty PVC. Both are timed (RTO).
+#   4. Comparison: repository list and schema version of the restored database against the live database,
+#      and the repositories found on the restored volume against the restored database.
+#   5. Clean up (also on error): namespace, one-off backup objects. The snapshots stay until the retention.
+# Prints one line "RESTORE-DRILL RESULT ..." with the timings; lab.sh copies it into the acceptance evidence.
+#
+# Why a throwaway namespace and not the real names: see docs/concepts/decisions/0014-restore-drill-throwaway-namespace.md. The restore into the real
+# names would need a new serverName in the live cluster (the plugin refuses a non-empty archive), which
+# Git would then have to carry forever.
+#
+# Values: group_vars/all/restore_drill.yml. Names: manifests under gitops/workloads/gitea.
+# Secrets: only copied between namespaces (no_log), never printed.
+
+- name: Restore drill (Gitea from backup only)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: "{{ argocd_kubeconfig }}"
+  vars:
+    rd_repo: "{{ playbook_dir }}/.."
+    rd_wl: "{{ rd_repo }}/gitops/workloads/gitea"
+    rd_mf: "{{ rd_wl }}/manifests"
+    rd_m_cluster: "{{ lookup('ansible.builtin.file', rd_mf ~ '/cluster.yaml') | from_yaml }}"
+    rd_m_os: "{{ lookup('ansible.builtin.file', rd_mf ~ '/objectstore.yaml') | from_yaml }}"
+    rd_m_sched: "{{ lookup('ansible.builtin.file', rd_mf ~ '/k8up-schedule.yaml') | from_yaml }}"
+    rd_m_podcfg: "{{ lookup('ansible.builtin.file', rd_mf ~ '/k8up-podconfig.yaml') | from_yaml }}"
+    rd_m_nsm: "{{ lookup('ansible.builtin.file', rd_mf ~ '/namespace.yaml') | from_yaml }}"
+    rd_m_values: "{{ lookup('ansible.builtin.file', rd_wl ~ '/values-gitea.yaml') | from_yaml }}"
+    rd_ns: "{{ rd_m_cluster.metadata.namespace }}"
+    rd_cluster: "{{ rd_m_cluster.metadata.name }}"
+    rd_boot: "{{ rd_m_cluster.spec.bootstrap.initdb | default(rd_m_cluster.spec.bootstrap.recovery) }}"
+    rd_db: "{{ rd_boot.database }}"
+    rd_owner: "{{ rd_boot.owner }}"
+    rd_owner_secret: "{{ rd_boot.secret.name }}"
+    rd_server: "{{ (rd_m_cluster.spec.plugins | first).parameters.serverName }}"
+    rd_os_name: "{{ rd_m_os.metadata.name }}"
+    rd_s3: "{{ rd_m_sched.spec.backend.s3 }}"
+    rd_dns: "{{ rd_ns }}{{ restore_drill_ns_suffix }}"
+    rd_drill_cluster: "{{ rd_cluster }}-drill"
+    rd_psql: "psql -XAtq -v ON_ERROR_STOP=1 -d {{ rd_db }} -c"
+    # One SQL line, the same on both sides. Names of the repositories (sorted), highest id, schema version.
+    rd_sql: >-
+      SELECT coalesce(string_agg(lower(owner_name) || '/' || lower_name, ',' ORDER BY owner_name, lower_name), '') || '|' ||
+      count(*) || '|' || coalesce((SELECT max(version)::text FROM version), '-') FROM repository
+    rd_secrets:
+      - "{{ rd_m_os.spec.configuration.s3Credentials.accessKeyId.name }}"
+      - "{{ rd_owner_secret }}"
+      - "{{ rd_s3.accessKeyIDSecretRef.name }}"
+      - "{{ rd_m_sched.spec.backend.repoPasswordSecretRef.name }}"
+    rd_pod_sc:
+      runAsNonRoot: true
+      runAsUser: 1000
+      runAsGroup: 1000
+      seccompProfile:
+        type: RuntimeDefault
+    rd_ctr_sc:
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop: [ALL]
+  tasks:
+    - name: Set the run ID and the start time
+      ansible.builtin.set_fact:
+        rd_run: "r{{ lookup('ansible.builtin.pipe', 'date -u +%Y%m%d%H%M%S') }}"
+        rd_t_start: "{{ lookup('ansible.builtin.pipe', 'date +%s') | int }}"
+
+    # ================= 1. Preflight =================
+    - name: Read the live cluster
+      kubernetes.core.k8s_info:
+        api_version: postgresql.cnpg.io/v1
+        kind: Cluster
+        namespace: "{{ rd_ns }}"
+        name: "{{ rd_cluster }}"
+      register: rd_cl
+
+    - name: Live cluster is healthy
+      ansible.builtin.assert:
+        that:
+          - rd_cl.resources | length == 1
+          - (rd_cl.resources | first).status.phase | default('') == 'Cluster in healthy state'
+        fail_msg: "{{ rd_ns }}/{{ rd_cluster }} is not healthy. Fix that first, a drill needs a working primary to compare against."
+        quiet: true
+
+    - name: Remember the live primary
+      ansible.builtin.set_fact:
+        rd_primary: "{{ (rd_cl.resources | first).status.currentPrimary }}"
+
+    - name: Check that rustfs answers (the archive is read from there)
+      ansible.builtin.uri:
+        url: "{{ backup_s3_probe_url }}"
+        timeout: 10
+        return_content: false
+      register: rd_probe
+      failed_when: false
+
+    - name: Backup host is reachable
+      ansible.builtin.assert:
+        that: rd_probe.status | default(0) == 200
+        fail_msg: >-
+          rustfs {{ backup_s3_probe_url }} does not answer (status {{ rd_probe.status | default('-') }}).
+          Start it first: lab.sh up (phase backup host) or systemctl --user start rustfs.
+        quiet: true
+
+    - name: List CNPG backups of the live cluster
+      kubernetes.core.k8s_info:
+        api_version: postgresql.cnpg.io/v1
+        kind: Backup
+        namespace: "{{ rd_ns }}"
+      register: rd_bk_list
+
+    - name: List K8up backups
+      kubernetes.core.k8s_info:
+        api_version: k8up.io/v1
+        kind: Backup
+        namespace: "{{ rd_ns }}"
+      register: rd_k8_list
+
+    - name: Age of the newest completed schedule backups
+      ansible.builtin.set_fact:
+        rd_cnpg_done: >-
+          {{ rd_bk_list.resources
+             | selectattr('spec.cluster.name', 'equalto', rd_cluster)
+             | selectattr('status.phase', 'defined') | selectattr('status.phase', 'equalto', 'completed')
+             | selectattr('status.stoppedAt', 'defined') | map(attribute='status.stoppedAt') | sort | list }}
+        rd_k8up_done: >-
+          {{ rd_k8_list.resources | map(attribute='status.conditions', default=[]) | flatten
+             | selectattr('type', 'equalto', 'Completed') | selectattr('status', 'equalto', 'True')
+             | selectattr('reason', 'equalto', 'Succeeded') | map(attribute='lastTransitionTime') | sort | list }}
+
+    - name: Convert both timestamps to epoch seconds
+      ansible.builtin.command: "date -u -d {{ item.ts | quote }} +%s"
+      loop:
+        - {name: cnpg, ts: "{{ rd_cnpg_done | last | default('1970-01-01T00:00:00Z') }}"}
+        - {name: k8up, ts: "{{ rd_k8up_done | last | default('1970-01-01T00:00:00Z') }}"}
+      register: rd_epoch
+      changed_when: false
+
+    - name: Both are fresh
+      ansible.builtin.assert:
+        that:
+          - rd_cnpg_done | length > 0
+          - rd_k8up_done | length > 0
+          - (rd_t_start | int) - (rd_epoch.results[0].stdout | int) < restore_drill_max_age_h * 3600
+          - (rd_t_start | int) - (rd_epoch.results[1].stdout | int) < restore_drill_max_age_h * 3600
+        fail_msg: >-
+          No fresh successful backup (max {{ restore_drill_max_age_h }} h). CNPG: {{ rd_cnpg_done | last | default('none') }},
+          K8up: {{ rd_k8up_done | last | default('none') }}. Look at the schedules before you drill:
+          kubectl -n {{ rd_ns }} get backups.postgresql.cnpg.io,backups.k8up.io
+        success_msg: "Newest schedule backups: CNPG {{ rd_cnpg_done | last }}, K8up {{ rd_k8up_done | last }}"
+
+    - name: Remove a leftover throwaway namespace of an aborted drill
+      kubernetes.core.k8s:
+        state: absent
+        kind: Namespace
+        name: "{{ rd_dns }}"
+        wait: true
+        wait_timeout: 600
+
+    - name: Drill
+      block:
+        # ================= 2. Fresh backups of the live state =================
+        - name: Start one-off file backup (same target as the schedule)
+          kubernetes.core.k8s:
+            definition:
+              apiVersion: k8up.io/v1
+              kind: Backup
+              metadata:
+                name: "{{ restore_drill_backup_prefix }}-{{ rd_run }}"
+                namespace: "{{ rd_ns }}"
+              spec:
+                podConfigRef: "{{ rd_m_sched.spec.podConfigRef }}"
+                backend: "{{ rd_m_sched.spec.backend }}"
+                tags: ["{{ restore_drill_backup_prefix }}-{{ rd_run }}"]
+                successfulJobsHistoryLimit: 1
+                failedJobsHistoryLimit: 1
+
+        - name: Wait until the file backup is done
+          kubernetes.core.k8s_info:
+            api_version: k8up.io/v1
+            kind: Backup
+            namespace: "{{ rd_ns }}"
+            name: "{{ restore_drill_backup_prefix }}-{{ rd_run }}"
+          register: rd_kb
+          until: (rd_kb.resources | first).status.finished | default(false)
+          retries: "{{ restore_drill_retries }}"
+          delay: "{{ restore_drill_delay }}"
+
+        - name: File backup succeeded
+          ansible.builtin.assert:
+            that:
+              - rd_kb_done | length == 1
+              - rd_kb_done[0].status == 'True'
+              - rd_kb_done[0].reason == 'Succeeded'
+            fail_msg: "File backup {{ restore_drill_backup_prefix }}-{{ rd_run }}: {{ rd_kb_done | map(attribute='message', default='-') | join(' ') }}"
+            quiet: true
+          vars:
+            rd_kb_done: >-
+              {{ (rd_kb.resources | first).status.conditions | default([])
+                 | selectattr('type', 'equalto', 'Completed') | list }}
+
+        - name: Start one-off base backup (CNPG, barman plugin)
+          kubernetes.core.k8s:
+            definition:
+              apiVersion: postgresql.cnpg.io/v1
+              kind: Backup
+              metadata:
+                name: "{{ restore_drill_backup_prefix }}-{{ rd_run }}"
+                namespace: "{{ rd_ns }}"
+              spec:
+                cluster:
+                  name: "{{ rd_cluster }}"
+                method: plugin
+                pluginConfiguration:
+                  name: barman-cloud.cloudnative-pg.io
+
+        - name: Wait until the base backup is done
+          kubernetes.core.k8s_info:
+            api_version: postgresql.cnpg.io/v1
+            kind: Backup
+            namespace: "{{ rd_ns }}"
+            name: "{{ restore_drill_backup_prefix }}-{{ rd_run }}"
+          register: rd_cb
+          until: (rd_cb.resources | first).status.phase | default('') in ['completed', 'failed']
+          retries: "{{ restore_drill_retries }}"
+          delay: "{{ restore_drill_delay }}"
+
+        - name: Base backup succeeded
+          ansible.builtin.assert:
+            that: (rd_cb.resources | first).status.phase == 'completed'
+            fail_msg: >-
+              Base backup failed: {{ (rd_cb.resources | first).status.error | default('-') }}.
+              Logs: kubectl -n {{ rd_ns }} logs {{ rd_primary }} -c plugin-barman-cloud
+            quiet: true
+
+        - name: Fingerprint of the live database (after the backups)
+          kubernetes.core.k8s_exec:
+            namespace: "{{ rd_ns }}"
+            pod: "{{ rd_primary }}"
+            container: postgres
+            command: "{{ rd_psql }} \"{{ rd_sql }}\""
+          register: rd_live
+          changed_when: false
+
+        - name: Remember the live fingerprint and the repositories
+          ansible.builtin.set_fact:
+            rd_live_repos: "{{ (rd_live.stdout | trim).split('|')[0] }}"
+            rd_live_count: "{{ (rd_live.stdout | trim).split('|')[1] | int }}"
+            rd_live_ver: "{{ (rd_live.stdout | trim).split('|')[2] }}"
+
+        - name: Enough data to prove something
+          ansible.builtin.assert:
+            that: rd_live_count | int >= restore_drill_min_repos
+            fail_msg: "Only {{ rd_live_count }} repositories in Gitea, restore_drill_min_repos is {{ restore_drill_min_repos }}. Create one first."
+            quiet: true
+
+        # ================= 3. Throwaway namespace =================
+        - name: Create the throwaway namespace (PSA like the real one)
+          kubernetes.core.k8s:
+            definition:
+              apiVersion: v1
+              kind: Namespace
+              metadata:
+                name: "{{ rd_dns }}"
+                labels: "{{ rd_m_nsm.metadata.labels | combine({'app.kubernetes.io/managed-by': 'restore-drill'}) }}"
+
+        - name: Read the secrets of the real namespace (values are not printed)
+          kubernetes.core.k8s_info:
+            kind: Secret
+            namespace: "{{ rd_ns }}"
+            name: "{{ item }}"
+          register: rd_sec
+          loop: "{{ rd_secrets | unique }}"
+          no_log: true
+
+        - name: Copy the secrets
+          kubernetes.core.k8s:
+            definition:
+              apiVersion: v1
+              kind: Secret
+              type: "{{ (item.resources | first).type | default('Opaque') }}"
+              metadata:
+                name: "{{ item.item }}"
+                namespace: "{{ rd_dns }}"
+              data: "{{ (item.resources | first).data }}"
+          loop: "{{ rd_sec.results }}"
+          no_log: true
+
+        - name: Copy ObjectStore and PodConfig
+          kubernetes.core.k8s:
+            definition: "{{ item | combine({'metadata': {'name': item.metadata.name, 'namespace': rd_dns}}) }}"
+          loop:
+            - "{{ rd_m_os }}"
+            - "{{ rd_m_podcfg }}"
+
+        - name: Time stamp before the database restore
+          ansible.builtin.set_fact:
+            rd_t_db0: "{{ lookup('ansible.builtin.pipe', 'date +%s') | int }}"
+
+        - name: Create the recovery cluster (own volumes, reads the real archive, writes nothing back)
+          kubernetes.core.k8s:
+            definition:
+              apiVersion: postgresql.cnpg.io/v1
+              kind: Cluster
+              metadata:
+                name: "{{ rd_drill_cluster }}"
+                namespace: "{{ rd_dns }}"
+              spec:
+                instances: 1
+                imageName: "{{ rd_m_cluster.spec.imageName }}"
+                enableSuperuserAccess: false
+                storage: "{{ rd_m_cluster.spec.storage }}"
+                resources: "{{ rd_m_cluster.spec.resources }}"
+                postgresql: "{{ rd_m_cluster.spec.postgresql }}"
+                bootstrap:
+                  recovery:
+                    source: origin
+                    database: "{{ rd_db }}"
+                    owner: "{{ rd_owner }}"
+                    secret:
+                      name: "{{ rd_owner_secret }}"
+                externalClusters:
+                  - name: origin
+                    plugin:
+                      name: barman-cloud.cloudnative-pg.io
+                      parameters:
+                        barmanObjectName: "{{ rd_os_name }}"
+                        serverName: "{{ rd_server }}"
+
+        - name: Wait until the recovery cluster is healthy
+          kubernetes.core.k8s_info:
+            api_version: postgresql.cnpg.io/v1
+            kind: Cluster
+            namespace: "{{ rd_dns }}"
+            name: "{{ rd_drill_cluster }}"
+          register: rd_dc
+          until: >-
+            (rd_dc.resources | first).status.phase | default('') == 'Cluster in healthy state' and
+            (rd_dc.resources | first).status.readyInstances | default(0) == 1
+          retries: "{{ restore_drill_retries }}"
+          delay: "{{ restore_drill_delay }}"
+          failed_when: false
+
+        - name: Recovery cluster is healthy
+          ansible.builtin.assert:
+            that: (rd_dc.resources | first).status.phase | default('') == 'Cluster in healthy state'
+            fail_msg: >-
+              {{ rd_drill_cluster }}: phase '{{ (rd_dc.resources | first | default({})).status.phase | default('-') }}'.
+              Logs: kubectl -n {{ rd_dns }} logs -l cnpg.io/cluster={{ rd_drill_cluster }} --all-containers --tail 50
+            quiet: true
+
+        - name: Time stamp after the database restore, before the file restore
+          ansible.builtin.set_fact:
+            rd_t_db1: "{{ lookup('ansible.builtin.pipe', 'date +%s') | int }}"
+
+        - name: Create the empty target volume (same size as the original)
+          kubernetes.core.k8s:
+            definition:
+              apiVersion: v1
+              kind: PersistentVolumeClaim
+              metadata:
+                name: restore-target
+                namespace: "{{ rd_dns }}"
+              spec:
+                accessModes: [ReadWriteOnce]
+                resources:
+                  requests:
+                    storage: "{{ rd_m_values.persistence.size }}"
+
+        - name: Start the file restore (the snapshot of this drill)
+          kubernetes.core.k8s:
+            definition:
+              apiVersion: k8up.io/v1
+              kind: Restore
+              metadata:
+                name: "{{ restore_drill_backup_prefix }}-{{ rd_run }}"
+                namespace: "{{ rd_dns }}"
+              spec:
+                podConfigRef: "{{ rd_m_sched.spec.podConfigRef }}"
+                backend: "{{ rd_m_sched.spec.backend }}"
+                tags: ["{{ restore_drill_backup_prefix }}-{{ rd_run }}"]
+                restoreMethod:
+                  folder:
+                    claimName: restore-target
+
+        - name: Wait until the file restore is done
+          kubernetes.core.k8s_info:
+            api_version: k8up.io/v1
+            kind: Restore
+            namespace: "{{ rd_dns }}"
+            name: "{{ restore_drill_backup_prefix }}-{{ rd_run }}"
+          register: rd_kr
+          until: (rd_kr.resources | first).status.finished | default(false)
+          retries: "{{ restore_drill_retries }}"
+          delay: "{{ restore_drill_delay }}"
+
+        - name: File restore succeeded
+          ansible.builtin.assert:
+            that:
+              - rd_kr_done | length == 1
+              - rd_kr_done[0].status == 'True'
+              - rd_kr_done[0].reason == 'Succeeded'
+            fail_msg: >-
+              File restore: {{ rd_kr_done | map(attribute='message', default='-') | join(' ') }}.
+              Logs: kubectl -n {{ rd_dns }} logs -l k8up.io/owned-by=restore_{{ restore_drill_backup_prefix }}-{{ rd_run }}
+            quiet: true
+          vars:
+            rd_kr_done: >-
+              {{ (rd_kr.resources | first).status.conditions | default([])
+                 | selectattr('type', 'equalto', 'Completed') | list }}
+
+        - name: Time stamp after the file restore
+          ansible.builtin.set_fact:
+            rd_t_f1: "{{ lookup('ansible.builtin.pipe', 'date +%s') | int }}"
+
+        # ================= 4. Comparison =================
+        - name: Fingerprint of the restored database
+          kubernetes.core.k8s_exec:
+            namespace: "{{ rd_dns }}"
+            pod: "{{ (rd_dc.resources | first).status.currentPrimary }}"
+            container: postgres
+            command: "{{ rd_psql }} \"{{ rd_sql }}\""
+          register: rd_new
+          changed_when: false
+
+        - name: Start the check pod (reads the restored volume, Gitea image)
+          kubernetes.core.k8s:
+            definition:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                name: drill-files
+                namespace: "{{ rd_dns }}"
+              spec:
+                restartPolicy: Never
+                automountServiceAccountToken: false
+                securityContext: "{{ rd_pod_sc }}"
+                containers:
+                  - name: list
+                    image: >-
+                      {{ rd_m_values.image.registry }}/{{ rd_m_values.image.repository }}:{{ rd_m_values.image.tag
+                      }}-rootless@{{ rd_m_values.image.digest }}
+                    command: [/bin/sh, -c]
+                    args:
+                      - |
+                        set -eu
+                        find /restore -type d -name '*.git' -path '*/gitea-repositories/*/*' \
+                          | sed -e 's#.*/gitea-repositories/##' -e 's#\.git$##' | tr 'A-Z' 'a-z' | sort | tr '\n' ',' | sed 's#,$##'
+                        echo
+                    securityContext: "{{ rd_ctr_sc }}"
+                    volumeMounts:
+                      - name: restore
+                        mountPath: /restore
+                        readOnly: true
+                volumes:
+                  - name: restore
+                    persistentVolumeClaim:
+                      claimName: restore-target
+
+        - name: Wait for the check pod
+          kubernetes.core.k8s_info:
+            kind: Pod
+            namespace: "{{ rd_dns }}"
+            name: drill-files
+          register: rd_pod
+          until: (rd_pod.resources | first).status.phase | default('') in ['Succeeded', 'Failed']
+          retries: 60
+          delay: 5
+
+        - name: Read the check pod output
+          kubernetes.core.k8s_log:
+            namespace: "{{ rd_dns }}"
+            name: drill-files
+          register: rd_files
+
+        - name: Everything matches
+          ansible.builtin.assert:
+            that:
+              - (rd_pod.resources | first).status.phase == 'Succeeded'
+              - (rd_new.stdout | trim).split('|')[0] == rd_live_repos
+              - (rd_new.stdout | trim).split('|')[1] | int == rd_live_count | int
+              - (rd_new.stdout | trim).split('|')[2] == rd_live_ver
+              - (rd_files.log | trim) == rd_live_repos
+            fail_msg: >-
+              Mismatch. Live: {{ rd_live_count }} repositories ({{ rd_live_repos | truncate(200) }}), schema {{ rd_live_ver }}.
+              Restored database: {{ rd_new.stdout | trim | truncate(260) }}.
+              Restored volume: {{ rd_files.log | default('-') | trim | truncate(200) }}.
+              If someone used Gitea during the drill, run it again (lab.sh restore-drill).
+            quiet: true
+
+        - name: Compute the timings
+          ansible.builtin.set_fact:
+            rd_db_s: "{{ (rd_t_db1 | int) - (rd_t_db0 | int) }}"
+            rd_files_s: "{{ (rd_t_f1 | int) - (rd_t_db1 | int) }}"
+            rd_total_s: "{{ (rd_t_f1 | int) - (rd_t_start | int) }}"
+
+        - name: Result (one line for the acceptance evidence)
+          ansible.builtin.debug:
+            msg: >-
+              RESTORE-DRILL RESULT ok: database {{ rd_db_s }} s, files {{ rd_files_s }} s, total {{ rd_total_s }} s
+              (without the preflight and the fresh backups: {{ (rd_db_s | int) + (rd_files_s | int) }} s),
+              repositories {{ rd_live_count }}, schema {{ rd_live_ver }}, run {{ rd_run }}.
+
+        - name: Warn when the RTO budget is exceeded
+          ansible.builtin.debug:
+            msg: "WARNING: {{ rd_total_s }} s is above restore_drill_rto_budget_s ({{ restore_drill_rto_budget_s }})."
+          when: rd_total_s | int > restore_drill_rto_budget_s
+
+      always:
+        - name: Throwaway namespace gone (cluster, volumes, secrets, restore, pod)
+          kubernetes.core.k8s:
+            state: absent
+            kind: Namespace
+            name: "{{ rd_dns }}"
+            wait: true
+            wait_timeout: 600
+
+        - name: One-off backup objects gone (the snapshots stay until the retention)
+          kubernetes.core.k8s:
+            state: absent
+            api_version: "{{ item }}"
+            kind: Backup
+            namespace: "{{ rd_ns }}"
+            name: "{{ restore_drill_backup_prefix }}-{{ rd_run }}"
+          loop:
+            - k8up.io/v1
+            - postgresql.cnpg.io/v1
+
+- name: Restore drill for Matrix
+  import_playbook: restore-drill-matrix.yml

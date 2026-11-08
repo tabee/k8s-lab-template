@@ -1,0 +1,45 @@
+---
+# Role "base": base system for k3s nodes (Ubuntu 24.04).
+galaxy_info:
+  author: k8s-lab
+  description: Base configuration and hardening for k3s nodes
+  license: MIT
+  min_ansible_version: "2.17"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - noble
+dependencies: []
+
+# Required variables; values come from inventory/group_vars/all/main.yml.
+argument_specs:
+  main:
+    short_description: Base configuration
+    options:
+      base_timezone: { type: str, required: true, description: Time zone }
+      base_apt_upgrade:
+        type: str
+        required: true
+        choices: [safe, dist, "no"]
+        description: apt-Upgrade-Modus
+      base_apt_cache_valid_time: { type: int, required: true, description: apt cache validity }
+      base_reboot_if_required: { type: bool, required: true, description: Reboot after upgrade }
+      base_packages: { type: list, elements: str, required: true, description: Packages }
+      base_unattended_automatic_reboot: { type: bool, required: true, description: Auto-Reboot }
+      base_unattended_reboot_time: { type: str, required: true, description: Reboot-Zeit }
+      base_kernel_modules: { type: list, elements: str, required: true, description: Kernel-Module }
+      base_sysctl: { type: dict, required: true, description: sysctl values }
+      base_sysctl_file: { type: str, required: true, description: sysctl.d file for base_sysctl }
+      base_ssh_allow_users: { type: list, elements: str, required: true, description: SSH-User }
+      base_ufw_enabled: { type: bool, required: true, description: Enable UFW }
+      base_ufw_rules: { type: list, elements: dict, required: true, description: UFW rules }
+      base_ssh_listen_address: { type: str, required: true, description: Only listen IP of sshd }
+      base_ssh_kex_algorithms: { type: list, elements: str, required: true, description: SSH-KEX }
+      base_ssh_ciphers: { type: list, elements: str, required: true, description: SSH-Ciphers }
+      base_ssh_macs: { type: list, elements: str, required: true, description: SSH-MACs }
+      base_ssh_host_key_algorithms: { type: list, elements: str, required: true, description: Host key types }
+      base_ssh_pubkey_algorithms: { type: list, elements: str, required: true, description: Client key types }
+      base_sysctl_hardening: { type: dict, required: true, description: sysctl-Haertung }
+      base_sysctl_hardening_file: { type: str, required: true, description: sysctl.d file for the hardening }
+      base_sysctl_old_files: { type: list, elements: str, required: true, description: old sysctl.d files (are deleted) }
+      base_auditd_watches: { type: list, elements: dict, required: true, description: auditd-Watches }

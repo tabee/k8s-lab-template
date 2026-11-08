@@ -1,0 +1,152 @@
+---
+# Check for issue #8 (alerts). Usage in the directory ansible/:
+#   ansible-playbook verify-alerts.yml
+# 1. The real checks pass against the running lab (rustfs, CNPG, K8up, replica, edge).
+# 2. Fault injection WITHOUT touching the lab: a temporary copy of the config points a check at a closed port.
+#    The alert must go out once, not twice, and a recovery message must follow. Real state is not touched.
+# 3. Every configured sink (and the fallback) gets a test message; the Matrix sink only when it is switched on.
+# Nothing is changed in the cluster or on rustfs. Temporary files are removed at the end.
+
+- name: Check the alerts
+  hosts: backup_host
+  gather_facts: true
+  gather_subset: [min]
+  vars:
+    verify_alert_py: "{{ ansible_playbook_python }} {{ backup_alert_script }}"
+    verify_alert_tmp: "{{ backup_alert_state_file | dirname }}/verify-alerts"
+  tasks:
+    - name: The alerts are switched on and installed
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ backup_alert_script }}"
+        - "{{ backup_alert_config }}"
+      register: verify_files
+      failed_when: not verify_files.stat.exists
+      when: backup_alert_enabled | bool
+
+    - name: The alert timer is active
+      ansible.builtin.systemd_service:
+        name: "{{ backup_alert_unit_prefix }}.timer"
+        scope: user
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/{{ ansible_facts['user_uid'] }}"
+      register: verify_timer
+
+    - name: Timer active and enabled
+      ansible.builtin.assert:
+        that:
+          - verify_timer.status.ActiveState == 'active'
+          - verify_timer.status.UnitFileState == 'enabled'
+        fail_msg: >-
+          Timer {{ backup_alert_unit_prefix }}.timer:
+          {{ verify_timer.status.ActiveState }}/{{ verify_timer.status.UnitFileState }},
+          run: bash scripts/lab.sh alert install
+        success_msg: "Timer {{ backup_alert_unit_prefix }}.timer is active and enabled"
+
+    # ---------- 1. real checks ----------
+    - name: Real checks (all must pass)
+      ansible.builtin.command: "{{ verify_alert_py }} check --config {{ backup_alert_config }}"
+      register: verify_real
+      changed_when: false
+      failed_when: false
+
+    - name: The lab is healthy for the alerts
+      ansible.builtin.assert:
+        that: verify_real.rc == 0
+        fail_msg: |-
+          A check fails right now (that is what the alert is for):
+          {{ verify_real.stdout }}
+        success_msg: "{{ verify_real.stdout_lines | join(' | ') }}"
+
+    # ---------- 2. fault injection on a copy ----------
+    - name: Temporary directory
+      ansible.builtin.file:
+        path: "{{ verify_alert_tmp }}"
+        state: directory
+        mode: "0700"
+
+    - name: Read the installed config
+      ansible.builtin.slurp:
+        src: "{{ backup_alert_config }}"
+      register: verify_cfg_raw
+
+    - name: Two test configs (file sink only, own state; one with a dead rustfs URL, one with the real one)
+      ansible.builtin.copy:
+        dest: "{{ verify_alert_tmp }}/{{ item.name }}.json"
+        mode: "0600"
+        content: "{{ verify_cfg_raw.content | b64decode | from_json | combine(item.patch, recursive=true) | to_nice_json }}"
+      loop:
+        - name: broken
+          patch:
+            sinks: [file]
+            fallback_sinks: []
+            file_path: "{{ verify_alert_tmp }}/alerts.log"
+            state_file: "{{ verify_alert_tmp }}/state.json"
+            rustfs_url: "http://127.0.0.1:1/health"
+        - name: healthy
+          patch:
+            sinks: [file]
+            fallback_sinks: []
+            file_path: "{{ verify_alert_tmp }}/alerts.log"
+            state_file: "{{ verify_alert_tmp }}/state.json"
+      loop_control:
+        label: "{{ item.name }}"
+      no_log: true
+
+    - name: Run 1 with a dead rustfs URL
+      ansible.builtin.command: "{{ verify_alert_py }} run --config {{ verify_alert_tmp }}/broken.json"
+      register: verify_run1
+      changed_when: false
+      failed_when: false
+
+    - name: Run 2 with the same fault (no second alert)
+      ansible.builtin.command: "{{ verify_alert_py }} run --config {{ verify_alert_tmp }}/broken.json"
+      register: verify_run2
+      changed_when: false
+      failed_when: false
+
+    - name: Run 3 with the real URL (recovery)
+      ansible.builtin.command: "{{ verify_alert_py }} run --config {{ verify_alert_tmp }}/healthy.json"
+      register: verify_run3
+      changed_when: false
+      failed_when: false
+
+    - name: Read the alerts that the fault produced
+      ansible.builtin.slurp:
+        src: "{{ verify_alert_tmp }}/alerts.log"
+      register: verify_log
+
+    - name: One alarm, then one recovery
+      ansible.builtin.assert:
+        that:
+          - verify_run1.rc == 1
+          - verify_run2.rc == 1
+          - verify_run3.rc == 0
+          - verify_lines | length == 2
+          - "'ALARM: rustfs' in verify_lines[0]"
+          - "'OK again: rustfs' in verify_lines[1]"
+        fail_msg: "Alerts: {{ verify_lines }} (rc {{ verify_run1.rc }}/{{ verify_run2.rc }}/{{ verify_run3.rc }})"
+        success_msg: "Fault injection: 1 alarm, no repeat, 1 recovery"
+      vars:
+        verify_lines: "{{ (verify_log.content | b64decode).splitlines() }}"
+
+    - name: Remove the temporary files
+      ansible.builtin.file:
+        path: "{{ verify_alert_tmp }}"
+        state: absent
+
+    # ---------- 3. sinks ----------
+    - name: Test message through the real sinks (a notification appears on the desktop)
+      ansible.builtin.command: "{{ verify_alert_py }} test --config {{ backup_alert_config }}"
+      register: verify_sinks
+      changed_when: false
+      failed_when: false
+      tags: [sinks]
+
+    - name: At least one sink delivered
+      ansible.builtin.assert:
+        that: verify_sinks.rc == 0
+        fail_msg: "No sink delivered: {{ verify_sinks.stdout_lines | join(' | ') }}"
+        success_msg: "Sinks: {{ verify_sinks.stdout_lines | join(' | ') }}"
+      tags: [sinks]

@@ -1,0 +1,52 @@
+---
+# Backup target for gitea-db (Barman cloud plugin): rustfs on the owner's PC,
+# the same bucket cnpg-k3s-lab as pg-lab, own folder (prefix) gitea.
+# Location: s3://cnpg-k3s-lab/gitea/gitea-db/{base,wals}.
+# Why no own bucket: same kind of data (Postgres), same
+# retention, no further user and no further policy. Downside: the
+# key also reaches the pg-lab backups (acceptable in the lab, see
+# docs/learning-path/stage-8c-gitea.md). The repo files (K8up/restic) by contrast have
+# their own bucket and key.
+#
+# COPY: endpointURL and bucket actually exist only in
+# ansible/inventory/group_vars/all/backup_s3.yml (backup_s3_vm_endpoint,
+# backup_s3_bucket). Argo CD cannot read Ansible variables, hence here
+# as a copy. ansible/verify-gitea.yml compares and aborts on deviation.
+apiVersion: barmancloud.cnpg.io/v1
+kind: ObjectStore
+metadata:
+  name: gitea-db
+  namespace: gitea
+spec:
+  # Like pg-lab: the plugin deletes base backups and WAL older than 14 days.
+  retentionPolicy: "14d"
+  configuration:
+    destinationPath: s3://cnpg-k3s-lab/gitea
+    endpointURL: http://192.168.122.1:9000
+    # serverName stays empty here (plugin docs), it comes from the cluster.
+    s3Credentials:
+      accessKeyId:
+        name: backup-s3-creds
+        key: ACCESS_KEY_ID
+      secretAccessKey:
+        name: backup-s3-creds
+        key: ACCESS_SECRET_KEY
+    wal:
+      compression: gzip
+      maxParallel: 2
+    data:
+      compression: gzip
+      jobs: 1
+  instanceSidecarConfiguration:
+    # Like pg-lab (stage 8b): old checksum behavior of boto3.
+    env:
+      - name: AWS_REQUEST_CHECKSUM_CALCULATION
+        value: when_required
+      - name: AWS_RESPONSE_CHECKSUM_VALIDATION
+        value: when_required
+    resources:
+      requests:
+        cpu: 10m
+        memory: 64Mi
+      limits:
+        memory: 192Mi  # lab-limit: gitea/gitea-db/plugin-barman-cloud

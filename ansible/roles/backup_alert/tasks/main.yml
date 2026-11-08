@@ -1,0 +1,47 @@
+---
+- name: Directories for config, state, scripts and user units
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - "{{ backup_alert_config | dirname }}"
+    - "{{ backup_alert_state_file | dirname }}"
+    - "{{ backup_alert_script | dirname }}"
+    - "{{ backup_s3_systemd_user_dir }}"
+
+- name: Config of the alerts (no secret in it, only paths and the token file name)
+  ansible.builtin.template:
+    src: alert.json.j2
+    dest: "{{ backup_alert_config }}"
+    mode: "0644"
+
+- name: Script lab-alert.py (from the repo, the same file the tests run)
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../scripts/lab-alert.py"
+    dest: "{{ backup_alert_script }}"
+    mode: "0755"
+
+- name: Units of the alert run
+  ansible.builtin.template:
+    src: "alert.{{ item }}.j2"
+    dest: "{{ backup_s3_systemd_user_dir }}/{{ backup_alert_unit_prefix }}.{{ item }}"
+    mode: "0644"
+  loop:
+    - service
+    - timer
+  notify: Reload alert timer
+
+- name: Load the units now if they are new
+  ansible.builtin.meta: flush_handlers
+
+- name: Timer runs and starts at boot
+  ansible.builtin.systemd_service:
+    name: "{{ backup_alert_unit_prefix }}.timer"
+    scope: user
+    enabled: true
+    state: started
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ ansible_facts['user_uid'] }}"
+  # In the --check run before the first installation the unit does not exist yet.
+  ignore_errors: "{{ ansible_check_mode }}"

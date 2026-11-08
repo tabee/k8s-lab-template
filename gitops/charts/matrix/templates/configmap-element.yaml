@@ -1,0 +1,27 @@
+---
+# Element Web. The public base URL follows the lab domain (the lab CA can
+# only sign names under it). server_name is the homeserver identity.
+# No identity server and no integrations manager: nothing calls out.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: matrix-element-config
+  namespace: {{ .Release.Namespace }}
+data:
+  config.json: |
+    {
+      "default_server_config": {
+        "m.homeserver": {
+          "base_url": {{ printf "https://matrix.%s/" .Values.domain | quote }},
+          "server_name": {{ .Values.serverName | quote }}
+        }
+      },
+      "disable_custom_urls": true,
+      "disable_guests": true,
+      "brand": "Matrix Lab",
+      "default_federate": false,
+      "show_labs_settings": false,
+      "default_theme": "dark",
+      "default_country_code": "CH",
+      "disable_3pid_login": true
+    }

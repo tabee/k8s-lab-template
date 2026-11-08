@@ -1,0 +1,22 @@
+## {{ ansible_managed }}
+## Base rules. -D, -b and -f are already set by Ubuntu in audit.rules; do not
+## repeat them here, otherwise a later -D deletes earlier rules.
+## No "-e 2" (immutable): in the lab rules should be changeable without a reboot
+## stay adjustable.
+
+## Zeit
+-a always,exit -F arch=b64 -S adjtimex,settimeofday,clock_settime -F key=time-change
+-a always,exit -F arch=b32 -S adjtimex,settimeofday,clock_settime -F key=time-change
+
+## Load/unload kernel modules
+-a always,exit -F arch=b64 -S init_module,finit_module,delete_module -F key=modules
+-a always,exit -F arch=b32 -S init_module,finit_module,delete_module -F key=modules
+
+## Privilege escalation (sudo, su, setuid programs)
+-a always,exit -F arch=b64 -S execve -C uid!=euid -F euid=0 -F key=priv-esc
+-a always,exit -F arch=b32 -S execve -C uid!=euid -F euid=0 -F key=priv-esc
+
+## Files and directories (existing ones only; k3s paths from the 2nd run)
+{% for r in base_auditd_paths.results if r.stat.exists %}
+-w {{ r.item.path }} -p {{ r.item.perm }} -k {{ r.item.key }}
+{% endfor %}

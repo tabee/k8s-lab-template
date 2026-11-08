@@ -1,0 +1,16 @@
+---
+# The pinned host key (known_hosts of the mirror only). Aborts when it is not set.
+
+- name: The host key of the replica is pinned
+  ansible.builtin.assert:
+    that: backup_replica_host_key | trim | length > 0
+    fail_msg: >-
+      backup_replica_host_key is empty in group_vars/all/backup_replica.yml. Fetch it with
+      'bash scripts/lab.sh replica hostkey', compare the fingerprint on the replica
+      (ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub) and enter the line (type and key) there.
+
+- name: Pinned host key (known_hosts of the mirror only)
+  ansible.builtin.template:
+    src: known_hosts.j2
+    dest: "{{ backup_replica_known_hosts }}"
+    mode: "0600"

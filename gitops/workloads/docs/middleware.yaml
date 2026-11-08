@@ -1,0 +1,37 @@
+---
+# Browsers should ask the server for every page again (Last-Modified, mostly
+# 304), otherwise they show the old version for up to a day after a push:
+# static-web-server sends Cache-Control max-age=86400 by itself.
+# The security headers still come from the entrypoint websecure (Traefik).
+#
+# Content Security Policy: first only reporting (violations show up in the
+# browser console, nothing is blocked). Everything comes from the site itself
+# since Mermaid is self-hosted (docs/vendor-mermaid.py). Inline scripts and
+# styles stay allowed: the theme writes page-specific inline scripts, a hash
+# list is not possible. What the policy forbids: third-party scripts, images,
+# fonts and connections (no data leaves the site), embedding, form targets.
+# Enforcing: rename the key to Content-Security-Policy (docs/how-to/docs-site.md).
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: no-cache
+  namespace: docs
+  annotations:
+    # CRD comes only with the app traefik (retry in apps/docs.yaml).
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+spec:
+  headers:
+    customResponseHeaders:
+      Cache-Control: no-cache
+      Content-Security-Policy-Report-Only: >-
+        default-src 'none';
+        script-src 'self' 'unsafe-inline';
+        style-src 'self' 'unsafe-inline';
+        img-src 'self' data:;
+        font-src 'self';
+        connect-src 'self';
+        worker-src 'self' blob:;
+        manifest-src 'self';
+        base-uri 'self';
+        form-action 'none';
+        frame-ancestors 'none'

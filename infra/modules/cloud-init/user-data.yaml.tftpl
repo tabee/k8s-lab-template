@@ -1,0 +1,31 @@
+#cloud-config
+# Minimal initial configuration. Hardening follows with Ansible.
+
+hostname: ${hostname}
+fqdn: ${fqdn}
+manage_etc_hosts: true
+
+# Only our own user, no default user "ubuntu".
+users:
+  - name: ${username}
+    groups: [sudo]
+    shell: /bin/bash
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    lock_passwd: true
+    ssh_authorized_keys:
+      - ${ssh_public_key}
+
+ssh_pwauth: false
+disable_root: true
+
+package_update: true
+packages:
+%{ if guest_agent ~}
+  - qemu-guest-agent
+%{ endif ~}
+  - curl
+%{ if guest_agent ~}
+
+runcmd:
+  - [systemctl, enable, --now, qemu-guest-agent]
+%{ endif ~}

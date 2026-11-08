@@ -1,0 +1,52 @@
+---
+# Child application of the root app (app of apps), stage 8b: practice database
+# pg-lab in namespace db-lab (cluster, pooler, ObjectStore, backup plan).
+# Playground for failover drill, restore test and disaster rebuild.
+# Gitea gets its own cluster in the namespace gitea in stage 8c.
+# Project lab: namespace db-lab is in argocd_project_namespaces
+# (ansible/inventory/group_vars/all/argocd.yml).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: db-lab
+  namespace: argocd
+  # Deleting this file deletes cluster, pooler and backup plan, so that
+  # the PVCs too (data gone, backups in S3 stay). The namespace stays
+  # (Delete=false in namespace.yaml), as does the S3 secret.
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: lab
+  source:
+    repoURL: ssh://git@github.com/YOUR-NAME/k8s-lab.git
+    targetRevision: main
+    path: gitops/workloads/db-lab
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: db-lab
+  # Runtime recovery (rebuild --restore) may differ here. Git stays initdb. ADR-0018.
+  ignoreDifferences:
+    - group: postgresql.cnpg.io
+      kind: Cluster
+      jqPathExpressions:
+        - .spec.bootstrap
+        - .spec.externalClusters
+        - .spec.plugins[].parameters.serverName
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - RespectIgnoreDifferences=true
+      # On the first sync the CNPG CRDs may not exist yet (app cnpg
+      # runs in parallel). Without this option the dry run fails for everything,
+      # also for the namespace; with it the namespace comes immediately, the rest
+      # via retry as soon as the CRDs are there.
+      - SkipDryRunOnMissingResource=true
+      - ServerSideApply=true
+    retry:
+      limit: 10
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 3m

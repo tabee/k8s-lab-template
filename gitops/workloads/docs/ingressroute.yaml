@@ -1,0 +1,30 @@
+---
+# From outside via Traefik (entrypoint websecure, TLS with own certificate
+# of the lab CA from certificate.yaml). Test from the host:
+#   curl --cacert ~/.config/k8s-lab/lab-ca.crt https://docs.lab.example/
+# (entry in /etc/hosts: 192.168.122.50 docs.lab.example)
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: docs
+  namespace: docs
+  annotations:
+    # The CRD comes only from the app traefik. Until then the sync fails
+    # and Argo CD tries again (retry in apps/docs.yaml).
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - kind: Rule
+      match: Host(`docs.lab.example`)
+      # Cache-Control no-cache (middleware.yaml), so that pushes are visible immediately.
+      middlewares:
+        - name: no-cache
+      services:
+        # Same namespace (allowCrossNamespace is off).
+        - name: docs
+          port: http
+  # Secret created by cert-manager from certificate.yaml (same namespace).
+  tls:
+    secretName: docs-tls

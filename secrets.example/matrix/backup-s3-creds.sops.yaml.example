@@ -1,0 +1,18 @@
+# Template for backup-s3-creds.sops.yaml: structure without real values.
+# lab.sh init fills the placeholders from files on the operator machine and encrypts
+# immediately to secrets/matrix/backup-s3-creds.sops.yaml.
+# Placeholders: @file:NAME, @env:NAME:KEY, @optional:NAME
+# (NAME = entry in ansible/inventory/group_vars/all/secrets.yml).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: backup-s3-creds
+  namespace: matrix
+  labels:
+    app.kubernetes.io/managed-by: argocd
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+type: Opaque
+stringData:
+  ACCESS_KEY_ID: "@env:s3-cnpg:ACCESS_KEY_ID"
+  ACCESS_SECRET_KEY: "@env:s3-cnpg:ACCESS_SECRET_KEY"

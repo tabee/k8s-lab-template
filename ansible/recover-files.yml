@@ -1,0 +1,172 @@
+---
+# File half of `rebuild --restore` (issue #4, ADR-0018). The databases come back
+# from the recovery spec applied at runtime. Gitea and Synapse must not start on empty PVCs, and
+# Argo CD self-heal would scale them back up, so auto-sync is paused first.
+# That includes the root app (app of apps): its self-heal would otherwise put
+# the child apps (and so auto-sync and the replicas) back within minutes.
+# Order: pause root, then gitea and matrix; resume gitea and matrix, then root.
+# The pause also makes sure the workloads are really down: it waits for a
+# running sync, syncs once if none ever succeeded (the ObjectStore of the
+# database recovery lives in the app), scales to zero and waits until no pod
+# mounts the PVC. The restore checks that again before it deletes the PVC.
+#
+# Plays, selected with --tags: pause, restore, resume, verify.
+# A bare run does all four. Nothing here prints a secret. The Restore object
+# only names secrets that already exist in the namespace.
+- name: Pause root, Gitea and Matrix so self-heal cannot scale them back up
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tags: [pause]
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: "{{ argocd_kubeconfig }}"
+  tasks:
+    - name: Load the recover targets
+      ansible.builtin.include_tasks: tasks/recover-load.yml
+
+    # Order matters: the child apps must exist first (root creates them),
+    # then root is paused, then the children. If a step fails, root may stay
+    # paused: the rescue says so loudly instead of leaving it silently off.
+    - name: Pause root, then Gitea and Matrix
+      block:
+        - name: Wait until the child applications exist
+          kubernetes.core.k8s_info:
+            api_version: argoproj.io/v1alpha1
+            kind: Application
+            namespace: "{{ argocd_namespace }}"
+            name: "{{ target.app }}"
+          register: recover_child
+          loop: "{{ recover_targets }}"
+          loop_control:
+            loop_var: target
+            label: "{{ target.app }}"
+          retries: 60
+          delay: 5
+          until: recover_child.resources | default([]) | length == 1
+
+        - name: Pause the root application first
+          ansible.builtin.include_tasks: tasks/recover-root-pause.yml
+
+        - name: Pause one workload
+          ansible.builtin.include_tasks: tasks/recover-pause-one.yml
+          loop: "{{ recover_targets }}"
+          loop_control:
+            loop_var: target
+            label: "{{ target.app }}"
+      rescue:
+        - name: Say that root may still be paused
+          ansible.builtin.fail:
+            msg: >-
+              Pause failed. Auto-sync of the Argo CD application
+              {{ argocd_root_app_name }} (and gitea, matrix) may now be OFF
+              and nothing turns it on again by itself. Fix the cause and run
+              the pause again (cd ansible && ansible-playbook
+              recover-files.yml --tags pause), or undo with:
+              ansible-playbook recover-files.yml --tags resume
+              (idempotent, restores root last).
+
+- name: Restore Gitea and Matrix files onto the new disks
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tags: [restore]
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: "{{ argocd_kubeconfig }}"
+  tasks:
+    - name: Load the recover targets
+      ansible.builtin.include_tasks: tasks/recover-load.yml
+
+    - name: Refuse to restore while Argo CD can still start the workloads
+      ansible.builtin.include_tasks: tasks/recover-assert-paused.yml
+
+    - name: Restore one volume
+      ansible.builtin.include_tasks: tasks/recover-restore-one.yml
+      loop: "{{ recover_targets }}"
+      loop_control:
+        loop_var: target
+        label: "{{ target.app }}"
+
+- name: Resume Argo CD auto-sync for Gitea, Matrix and root
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tags: [resume]
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: "{{ argocd_kubeconfig }}"
+  tasks:
+    - name: Load the recover targets
+      ansible.builtin.include_tasks: tasks/recover-load.yml
+
+    # Children first, root last. The always part runs even when a child fails,
+    # so root is never left paused by this play.
+    - name: Resume Gitea and Matrix, then root
+      block:
+        - name: Resume one workload
+          ansible.builtin.include_tasks: tasks/recover-resume-one.yml
+          loop: "{{ recover_targets }}"
+          loop_control:
+            loop_var: target
+            label: "{{ target.app }}"
+      always:
+        - name: Resume the root application
+          ansible.builtin.include_tasks: tasks/recover-root-resume.yml
+
+- name: Regenerate Gitea hooks and run the doctor
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tags: [verify]
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: "{{ argocd_kubeconfig }}"
+  tasks:
+    - name: Wait until a Gitea pod is running
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Pod
+        namespace: gitea
+        label_selectors:
+          - app.kubernetes.io/name=gitea
+      register: recover_gitea_pods
+      retries: 24
+      delay: 5
+      until: >-
+        recover_gitea_pods.resources | default([])
+        | selectattr('status.phase', 'equalto', 'Running')
+        | list | length >= 1
+
+    - name: Remember the running Gitea pod
+      ansible.builtin.set_fact:
+        recover_gitea_pod: >-
+          {{ (recover_gitea_pods.resources
+              | selectattr('status.phase', 'equalto', 'Running')
+              | first).metadata.name }}
+
+    - name: Regenerate the Gitea hooks
+      kubernetes.core.k8s_exec:
+        namespace: gitea
+        pod: "{{ recover_gitea_pod }}"
+        container: gitea
+        command: gitea admin regenerate hooks
+      changed_when: false
+
+    - name: Run the Gitea doctor
+      kubernetes.core.k8s_exec:
+        namespace: gitea
+        pod: "{{ recover_gitea_pod }}"
+        container: gitea
+        command: >-
+          gitea doctor check --run hooks --run check-db-consistency
+          --run check-git-daemon-export-ok --run check-commit-graphs
+      changed_when: false
+
+    # Last task of the play: the restore counts as finished only when the files
+    # are back AND the checks above went through. Until then lab.sh refuses to
+    # back up a running VM (restore.yml, restore_state_file).
+    - name: Remove the marker of the unfinished restore
+      ansible.builtin.file:
+        path: "{{ restore_state_file }}"
+        state: absent

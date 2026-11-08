@@ -1,0 +1,174 @@
+# Helm values for the chart argo-cd (rendered by the role argocd_bootstrap).
+# Only deviations from the chart default. The security contexts of the chart
+# already fulfil PSA "restricted" (checked: see docs/learning-path/stage-4-argocd.md).
+
+global:
+  # NetworkPolicies of the chart (govern ingress only) per component instead of
+  # global: global would also create the chart policy for argocd-server,
+  # and that allows everything. argocd-server gets its own (Traefik only):
+  # gitops/workloads/argocd/networkpolicy.yaml (stage 6c).
+  networkPolicy:
+    create: false
+  # Stage 7 (KSOPS): volumes belong to group 999 (user argocd). This way
+  # the repo-server reads the age key (mode 0440) without it being readable
+  # for everyone. Applies to all Argo CD pods (only changes volume permissions).
+  securityContext:
+    fsGroup: 999
+
+configs:
+  # Stage 6c: TLS ends at Traefik (IngressRoute from gitops/workloads/argocd),
+  # argocd-server internally speaks only HTTP on 8080. Emergency exit without Traefik:
+  # kubectl -n argocd port-forward svc/argocd-server 8080:80 -> http://localhost:8080
+  params:
+    server.insecure: true
+  # Stage 7 (KSOPS): Kustomize may start generators as a program
+  # (--enable-alpha-plugins --enable-exec). Only this way ksops runs under
+  # secrets/. Applies to all Kustomize apps; the others have no
+  # generators, so nothing changes for them.
+  cm:
+    kustomize.buildOptions: --enable-alpha-plugins --enable-exec
+{% if lab_cnpg_restore | default(false) | bool %}
+    # rebuild --restore only. Lifted again by ansible/restore-clusters.yml
+    # after the recovery Clusters exist. A plain up does not set this.
+    resource.exclusions: |
+      - apiGroups:
+          - postgresql.cnpg.io
+        kinds:
+          - Cluster
+        clusters:
+          - "*"
+{% endif %}
+  ssh:
+    # Host keys of the own Git server in addition to GitHub/GitLab & co.
+    extraHosts: |
+{% for line in argocd_repo_known_hosts %}
+      {{ line }}
+{% endfor %}
+  # UI theme in the style of docs.example.org. Source: files/argocd-theme.css.
+  # The chart creates the ConfigMap argocd-styles-cm from it, mounts it in
+  # argocd-server and sets ui.cssurl itself (hence no ui.cssurl here).
+  styles: |
+{{ lookup('ansible.builtin.file', 'argocd-theme.css') | indent(4, first=true) }}
+
+# No SSO in the lab: login only with local admin. Saves a pod.
+dex:
+  enabled: false
+
+# No target (mail/chat) configured, so no controller needed.
+notifications:
+  enabled: false
+
+# ApplicationSet controller cannot be switched off in the chart (follows the
+# upstream manifest). Kept small. The notes sites need it
+# (gitops/apps/notes.yaml, ein ApplicationSet).
+applicationSet:
+  networkPolicy:
+    create: true
+  resources:
+    requests:
+      cpu: 20m
+      memory: 64Mi
+    limits:
+      memory: 64Mi  # lab-limit: argocd/argocd-applicationset-controller/applicationset-controller
+
+controller:
+  networkPolicy:
+    create: true
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 512Mi  # lab-limit: argocd/argocd-application-controller/application-controller
+
+server:
+  # No chart ingress: from outside via the Traefik IngressRoute from
+  # gitops/workloads/argocd (stage 6c). No chart NetworkPolicy
+  # (networkPolicy.create stays false), the own one comes from the same folder.
+  ingress:
+    enabled: false
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 96Mi  # lab-limit: argocd/argocd-server/server
+
+repoServer:
+  networkPolicy:
+    create: true
+  # Stage 7 (KSOPS, runbook docs/learning-path/stage-7-ksops.md): an init container copies
+  # the program ksops from the pinned image into an empty volume, the
+  # repo-server finds it as /usr/local/bin/ksops. No own image,
+  # Update = new pin in group_vars/all/sops.yml.
+  initContainers:
+    - name: install-ksops
+      image: "{{ argocd_ksops_image }}"
+      command: [/usr/local/bin/ksops, install, /custom-tools]
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: [ALL]
+        readOnlyRootFilesystem: true
+        runAsNonRoot: true
+        # Image user is called "nonroot" (no numeric value), PSA needs the number.
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      resources:
+        requests:
+          cpu: 10m
+          memory: 32Mi
+        limits:
+          memory: 128Mi
+      volumeMounts:
+        - name: custom-tools
+          mountPath: /custom-tools
+  volumes:
+    - name: custom-tools
+      emptyDir:
+        sizeLimit: 128Mi
+    # Secret from install.yml (Ansible). optional: Argo CD also starts without,
+    # only the apps under secrets/ then report an error (nothing is deleted).
+    - name: sops-age
+      secret:
+        secretName: "{{ argocd_sops_age_secret_name }}"
+        defaultMode: 0440
+        optional: true
+  # Without subPath on the key: a new key (rotation) arrives
+  # after ~1 minute without restart.
+  volumeMounts:
+    - name: custom-tools
+      mountPath: /usr/local/bin/ksops
+      subPath: ksops
+    - name: sops-age
+      mountPath: /sops-age
+      readOnly: true
+  env:
+    - name: SOPS_AGE_KEY_FILE
+      value: /sops-age/keys.txt
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 160Mi  # lab-limit: argocd/argocd-repo-server/repo-server
+
+redis:
+  networkPolicy:
+    create: true
+  resources:
+    requests:
+      cpu: 20m
+      memory: 64Mi
+    limits:
+      memory: 64Mi  # lab-limit: argocd/argocd-redis/redis
+
+redisSecretInit:
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      memory: 64Mi  # lab-limit: argocd/argocd-redis-secret-init/secret-init

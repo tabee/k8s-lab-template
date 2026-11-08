@@ -1,0 +1,60 @@
+---
+# Child application of the root app (app of apps): Traefik as ingress controller.
+# Source 1: Helm chart traefik/traefik (version pinned here, the only place).
+# Source 2: this repo, provides values.yaml ($values) and the own
+#           Traefik objects under gitops/platform/traefik/manifests.
+# Project platform: may only go to namespace traefik and only the
+# cluster-wide kinds Traefik needs (source of truth:
+# ansible/inventory/group_vars/all/argocd.yml, argocd_platform_*).
+# repoURL (Git and chart), targetRevision and project must match
+# ansible/inventory/group_vars/all/argocd.yml.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: traefik
+  namespace: argocd
+  # Deleting this file also cleans up the Traefik objects in the cluster
+  # (CRDs included, so all IngressRoutes too!).
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: platform
+  sources:
+    - repoURL: https://traefik.github.io/charts
+      chart: traefik
+      targetRevision: 42.1.3
+      helm:
+        releaseName: traefik
+        valueFiles:
+          - $values/gitops/platform/traefik/values.yaml
+    - repoURL: ssh://git@github.com/YOUR-NAME/k8s-lab.git
+      targetRevision: main
+      ref: values
+      # With path Argo CD additionally renders this source as manifests.
+      path: gitops/platform/traefik/manifests
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: traefik
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    # Namespace is created by Argo CD; PSA labels as in workloads/whoami/namespace.yaml.
+    managedNamespaceMetadata:
+      labels:
+        pod-security.kubernetes.io/enforce: restricted
+        pod-security.kubernetes.io/enforce-version: latest
+        pod-security.kubernetes.io/audit: restricted
+        pod-security.kubernetes.io/audit-version: latest
+        pod-security.kubernetes.io/warn: restricted
+        pod-security.kubernetes.io/warn-version: latest
+    syncOptions:
+      - CreateNamespace=true
+      # CRDs are too big for the last-applied annotation of client-side apply.
+      - ServerSideApply=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 3m

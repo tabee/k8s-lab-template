@@ -1,0 +1,14 @@
+---
+# domain follows lab.yaml (lab.sh customize, whole word).
+# The public hosts are derived from it: sso.<domain>, git.<domain>, matrix.<domain>.
+domain: lab.example
+# Name of the realm. The Traefik route (ingressroute.yaml) and the in-cluster
+# endpoints (Gitea, Synapse) contain the same name; tests/keycloak-tests.sh compares them.
+realm: lab
+# Address of the admin console (port-forward). The master realm gets it as
+# frontendUrl (realm-master.json), so the console iframe check, which the browser
+# runs against the issuer of the master realm, reaches the port-forward instead
+# of the public name (Traefik does not route /realms/master/). Copy of
+# KC_HOSTNAME_ADMIN in gitops/workloads/keycloak/manifests/deployment.yaml;
+# tests/keycloak-tests.sh and verify-keycloak.yml compare them.
+adminUrl: http://localhost:8080

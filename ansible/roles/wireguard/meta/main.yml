@@ -1,0 +1,29 @@
+---
+# Role "wireguard": WireGuard tunnel on the production node (server) and the control PC (client).
+# Issue #60. Private keys stay on disk (lab-secrets); the role never prints them.
+galaxy_info:
+  author: k8s-lab
+  description: WireGuard tunnel for production admin and backup S3 access
+  license: MIT
+  min_ansible_version: "2.17"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - noble
+dependencies: []
+
+argument_specs:
+  main:
+    short_description: Configure WireGuard (server or client)
+    options:
+      wireguard_enabled: { type: bool, required: true, description: Role is active }
+      wireguard_interface: { type: str, required: true, description: Interface name (wg0) }
+      wireguard_listen_port: { type: raw, required: true, description: UDP listen port on the server (0 = client only) }
+      wireguard_mtu: { type: int, required: true, description: Interface MTU }
+      wireguard_keepalive: { type: int, required: true, description: PersistentKeepalive seconds from the client }
+      wireguard_mode: { type: str, required: true, description: "server or client" }
+      wireguard_address: { type: str, required: true, description: CIDR address of this host in the tunnel }
+      wireguard_private_key_path: { type: str, required: true, description: Path of the private key file (mode 600) }
+      wireguard_peer_public_key: { type: str, required: true, description: Peer's public key (not a secret) }
+      wireguard_peer_allowed_ips: { type: str, required: true, description: AllowedIPs for the peer }
+      wireguard_peer_endpoint: { type: str, required: true, description: Endpoint host:port for the client (empty on server) }

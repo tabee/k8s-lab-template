@@ -1,0 +1,10 @@
+---
+# Traefik values that Ansible (checks) and Git (Argo CD) need together.
+# The source is gitops/platform/traefik/values.yaml: here it is only read.
+
+# Admin entrypoint (ports.admin): Argo CD UI and whoami. New connections from non-
+# approved networks are dropped by the host firewall (chain admin_check), because this port
+# is neither 80 nor 443. Traefik does not see the client IP (externalTrafficPolicy
+# Cluster), hence the port separates, not a Traefik middleware.
+traefik_values: "{{ lookup('ansible.builtin.file', playbook_dir ~ '/../gitops/platform/traefik/values.yaml') | from_yaml }}"
+traefik_admin_port: "{{ traefik_values.ports.admin.exposedPort }}"

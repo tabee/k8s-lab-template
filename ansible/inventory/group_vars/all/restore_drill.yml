@@ -1,0 +1,20 @@
+---
+# Issue #4: restore drill (lab.sh restore-drill, ansible/restore-drill.yml). The ONE place for its values.
+# Names of clusters, secrets, buckets and the endpoint are NOT repeated here: the playbook reads them from the
+# manifests under gitops/workloads/gitea (single source) and the endpoint from backup_s3.yml.
+
+# Suffix of the throwaway namespace: <namespace of gitea><suffix>. It is deleted at the end (also on error).
+restore_drill_ns_suffix: -drill
+# The newest completed backup of the SCHEDULE (CNPG and K8up) must not be older than this. It proves that the
+# daily schedules work. The drill takes its own fresh backups on top, so the comparison is exact.
+restore_drill_max_age_h: 30
+# Name of the one-off backups (CNPG Backup, K8up Backup) in the real namespace: <prefix>-<run id>. Removed afterwards.
+restore_drill_backup_prefix: drill
+# Wait loops (retries x delay seconds) per step.
+restore_drill_retries: 90
+restore_drill_delay: 10
+# The restored Gitea database must hold at least this many repositories, otherwise the file comparison
+# proves nothing (an empty Gitea restores "correctly"). 0 = allow an empty Gitea, the result then says so.
+restore_drill_min_repos: 0
+# A drill that takes longer than this many seconds in total is reported as a warning (RTO budget).
+restore_drill_rto_budget_s: 1800

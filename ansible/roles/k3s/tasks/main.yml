@@ -1,0 +1,95 @@
+---
+# Installation path: binary straight from the GitHub release with pinned SHA256
+# (get_url only downloads again if the checksum does not match = other version).
+# The likewise pinned install.sh afterwards only creates systemd unit, symlinks
+# (kubectl, crictl, ctr) and the uninstall script (SKIP_DOWNLOAD, SKIP_START).
+
+- name: Determine k3s architecture
+  ansible.builtin.set_fact:
+    k3s_arch: "{{ k3s_arch_map[ansible_facts['architecture']] }}"
+
+- name: Create configuration directory
+  ansible.builtin.file:
+    path: /etc/rancher/k3s
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: PSA and audit files (before config.yaml, otherwise the API does not start)
+  ansible.builtin.import_tasks: hardening.yml
+
+- name: Write config.yaml
+  ansible.builtin.template:
+    src: config.yaml.j2
+    dest: /etc/rancher/k3s/config.yaml
+    owner: root
+    group: root
+    mode: "0600"
+  notify: Restart k3s
+
+- name: Download k3s binary (pinned, SHA256 verified)
+  ansible.builtin.get_url:
+    url: "{{ k3s_release_url }}/{{ k3s_binary_names[k3s_arch] }}"
+    dest: /usr/local/bin/k3s
+    checksum: "sha256:{{ k3s_binary_sha256[k3s_arch] }}"
+    owner: root
+    group: root
+    mode: "0755"
+  register: k3s_binary
+  notify: Restart k3s
+
+- name: Download install script (pinned, SHA256 verified)
+  ansible.builtin.get_url:
+    url: "{{ k3s_install_script_url }}"
+    dest: /usr/local/bin/k3s-install.sh
+    checksum: "sha256:{{ k3s_install_script_sha256 }}"
+    owner: root
+    group: root
+    mode: "0700"
+  register: k3s_install_script
+
+- name: Check whether the systemd unit exists
+  ansible.builtin.stat:
+    path: /etc/systemd/system/k3s.service
+  register: k3s_unit
+
+- name: Run install script (only on first installation or version change)
+  ansible.builtin.command: /usr/local/bin/k3s-install.sh
+  environment:
+    INSTALL_K3S_SKIP_DOWNLOAD: "true"
+    INSTALL_K3S_SKIP_START: "true"
+    INSTALL_K3S_VERSION: "{{ k3s_version }}"
+    INSTALL_K3S_EXEC: server
+  when: >-
+    not k3s_unit.stat.exists
+    or k3s_binary is changed
+    or k3s_install_script is changed
+  changed_when: true
+  notify: Restart k3s
+
+- name: Run restart now if needed
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable and start k3s
+  ansible.builtin.systemd_service:
+    name: k3s
+    enabled: true
+    state: started
+  # In the --check run before the first installation the unit does not exist yet.
+  ignore_errors: "{{ ansible_check_mode }}"
+
+- name: Wait until the node is Ready
+  ansible.builtin.command: >-
+    /usr/local/bin/k3s kubectl wait --for=condition=Ready
+    node/{{ k3s_server_config['node-name'] }} --timeout=10s
+  register: k3s_node_ready
+  until: k3s_node_ready.rc == 0
+  retries: "{{ k3s_ready_retries }}"
+  delay: "{{ k3s_ready_delay }}"
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Fetch kubeconfig to the control machine
+  ansible.builtin.import_tasks: kubeconfig.yml
+  when: not ansible_check_mode

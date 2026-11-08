@@ -1,0 +1,107 @@
+---
+# Drift check of values that are copied into gitops/ (issue #10). Offline: reads files only,
+# needs no cluster and no VM. Argo CD reads only Git, so gateway, CIDRs, S3 endpoint, ports,
+# domain, image pins and the branch exist in lab.yaml/group_vars AND in gitops/. This playbook
+# turns "two places must agree" into a red check.
+# Usage: ansible-playbook verify-consistency.yml   (also a phase of lab.sh acceptance, and runs
+#        before every commit in the CI workflow)
+# The comparison logic lives in scripts/consistency-check.py (one place, tested with deliberate
+# deviations in tests/consistency-tests.sh). This file only hands over the expected values.
+# Not covered here, on purpose: values that live in a running cluster object (verify-argocd,
+# verify-traefik, verify-gitea, verify-cnpg, verify-certmanager compare those with the cluster).
+
+- name: Check that the copies in gitops/ equal their sources
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    consistency_repo: "{{ playbook_dir }}/.."
+    consistency_expect:
+      vm_ip: "{{ lab.vm_ip }}"
+      gateway: "{{ lab.gateway }}"
+      s3_port: "{{ backup_s3_port | int }}"
+      repo_cidrs: "{{ lab_repo_egress_cidrs }}"
+      repo_port: "{{ egress_repo_port | int }}"
+      domain: "{{ lab.domain }}"
+      probe_image: "{{ egress_probe_image }}"
+      revision: "{{ argocd_repo_revision }}"
+      gateway_files: "{{ lab_values.gitops_gateway_files }}"
+      matrix_server_name: "{{ lab.matrix_server_name }}"
+  tasks:
+    - name: Compare gateway, S3 port, egress rules, Traefik ports, Gitea domain, images, revision
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_playbook_python }}"
+          - "{{ consistency_repo }}/scripts/consistency-check.py"
+          - --repo
+          - "{{ consistency_repo }}"
+          - --expect
+          - "-"
+      args:
+        stdin: "{{ consistency_expect | to_json }}"
+      register: consistency_result
+      changed_when: false
+      failed_when: consistency_result.rc not in [0, 1]
+
+    - name: No copy in gitops/ differs from its source
+      ansible.builtin.assert:
+        that:
+          - consistency_result.rc == 0
+        fail_msg: |-
+          gitops/ differs from lab.yaml or group_vars (fix the copy, never the check):
+          {{ consistency_result.stdout | default('') }}{{ consistency_result.stderr | default('') }}
+        success_msg: "{{ consistency_result.stdout_lines | default(['']) | last }}"
+
+    - name: Repo address of the egress policies equals lab.yaml (scripts/repo-egress.py --check)
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_playbook_python }}"
+          - "{{ consistency_repo }}/scripts/repo-egress.py"
+          - --repo
+          - "{{ consistency_repo }}"
+          - --check
+      register: consistency_egress
+      changed_when: false
+      failed_when: consistency_egress.rc not in [0, 1]
+
+    - name: The repo-egress blocks in gitops/ match repo_url and repo_egress_cidrs
+      ansible.builtin.assert:
+        that:
+          - consistency_egress.rc == 0
+        fail_msg: |-
+          repo-egress --check is red. Run: bash scripts/lab.sh repo-egress, then commit and push.
+          {{ consistency_egress.stdout | default('') }}{{ consistency_egress.stderr | default('') }}
+
+    - name: Domain, repo address, gateway, VM network and ingress networks equal lab.yaml (scripts/lab-customize.py --check)
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_playbook_python }}"
+          - "{{ consistency_repo }}/scripts/lab-customize.py"
+          - --repo
+          - "{{ consistency_repo }}"
+          - --domain
+          - "{{ lab.domain }}"
+          - --repo-url
+          - "{{ argocd_repo_url }}"
+          - --gateway
+          - "{{ lab.gateway }}"
+          - --vm-cidr
+          - "{{ lab.vm_cidr }}"
+          - --vm-ip
+          - "{{ lab.vm_ip }}"
+          - --edge-ingress-cidrs
+          - "{{ lab_edge_ingress_cidrs | join(',') }}"
+          - --server-name
+          - "{{ lab.matrix_server_name }}"
+          - --check
+      register: consistency_customize
+      changed_when: false
+      failed_when: consistency_customize.rc not in [0, 1]
+
+    - name: The gitops tree matches lab.yaml
+      ansible.builtin.assert:
+        that:
+          - consistency_customize.rc == 0
+        fail_msg: |-
+          gitops/ does not match lab.yaml. Run: bash scripts/lab.sh customize, then commit and push.
+          {{ consistency_customize.stdout | default('') }}{{ consistency_customize.stderr | default('') }}

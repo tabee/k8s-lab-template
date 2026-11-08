@@ -1,0 +1,19 @@
+---
+# SOPS rules (stage 7, runbook docs/learning-path/stage-7-ksops.md): everything under
+# secrets/**/*.sops.yaml is encrypted with YOUR age key.
+# Only the PUBLIC key is here, the private one is in
+# ~/.config/sops/age/keys.txt (and as the secret argocd/sops-age in the cluster).
+# Only data/stringData is encrypted: name, namespace, labels and
+# annotations stay readable (Argo CD, review, verify-ksops.yml).
+# Several recipients (e.g. during rotation): age: >- separated by commas.
+#
+# Placeholder: "bash scripts/lab.sh init" recognizes the line below (it is
+# NOT a valid age key), generates your key and enters the
+# public part here. Afterwards commit this file.
+stores:
+  yaml:
+    indent: 2
+creation_rules:
+  - path_regex: ^secrets/.*\.sops\.yaml$
+    encrypted_regex: ^(data|stringData)$
+    age: age1-PLACEHOLDER-lab-sh-init-sets-this-value-here

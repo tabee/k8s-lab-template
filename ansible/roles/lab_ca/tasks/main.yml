@@ -1,0 +1,118 @@
+---
+# Lab CA: preflight, namespace with PSA, wait for the CA secret from Argo CD
+# (stage 7: KSOPS from secrets/cert-manager), public certificate.
+# The content of the CA secret never appears in the output (no_log).
+
+- name: Preflight
+  ansible.builtin.import_tasks: preflight.yml
+
+# The namespace belongs to Ansible, not Argo CD: one owner for the
+# PSA labels, and it must survive the deletion of the applications.
+- name: Create namespace with PSA labels
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ lab_ca_namespace }}"
+        labels:
+          pod-security.kubernetes.io/enforce: "{{ lab_ca_psa_level }}"
+          pod-security.kubernetes.io/enforce-version: "{{ lab_ca_psa_version }}"
+          pod-security.kubernetes.io/audit: "{{ lab_ca_psa_level }}"
+          pod-security.kubernetes.io/audit-version: "{{ lab_ca_psa_version }}"
+          pod-security.kubernetes.io/warn: "{{ lab_ca_psa_level }}"
+          pod-security.kubernetes.io/warn-version: "{{ lab_ca_psa_version }}"
+  register: lab_ca_namespace_result
+
+# PSA proof as in argocd_bootstrap: insecure test pod only via
+# server dry run (check_mode: true, nothing is created).
+- name: Send PSA probe via server dry run
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Pod
+      metadata:
+        name: psa-probe
+        namespace: "{{ lab_ca_namespace }}"
+      spec:
+        containers:
+          - name: probe
+            image: "{{ lab_probe_image }}"
+            securityContext:
+              privileged: true
+  check_mode: true
+  register: lab_ca_psa_probe
+  ignore_errors: true  # the assert reads failed and msg; failed_when: false resets them (ansible-core 2.19+)
+  when: not (ansible_check_mode and lab_ca_namespace_result is changed)
+
+- name: PSA rejects insecure pods in the namespace
+  ansible.builtin.assert:
+    that: lab_ca_psa_probe.msg | default('') is search('violates PodSecurity')
+    fail_msg: "Namespace {{ lab_ca_namespace }}: test pod was NOT rejected by PSA"
+    quiet: true
+  when: not (ansible_check_mode and lab_ca_namespace_result is changed)
+
+# Stage 7: Argo CD creates the CA secret (application secrets-cert-manager,
+# KSOPS). Here only wait until it is there and belongs to Argo CD. On a fresh
+# bootstrap this takes a few minutes (repo-server, root app, sync).
+# no_log: the result contains the CA key. In check mode only 1 attempt.
+- name: Wait for the CA secret from Argo CD
+  kubernetes.core.k8s_info:
+    kind: Secret
+    namespace: "{{ lab_ca_namespace }}"
+    name: "{{ lab_ca_secret_name }}"
+  register: lab_ca_secret_info
+  no_log: true
+  until: lab_ca_secret_info.resources | default([]) | length == 1 and lab_ca_by_argocd | bool
+  retries: "{{ 1 if ansible_check_mode else lab_ca_wait_retries }}"
+  delay: "{{ lab_ca_wait_delay }}"
+  failed_when: false
+  vars:
+    lab_ca_meta: "{{ (lab_ca_secret_info.resources | default([{}]) | first | default({})).metadata | default({}) }}"
+    lab_ca_by_argocd: >-
+      {{ (lab_ca_meta.labels | default({}))['app.kubernetes.io/managed-by'] | default('') == 'argocd'
+         and 'argocd.argoproj.io/tracking-id' in (lab_ca_meta.annotations | default({})) }}
+
+# Pass on only non-secret attributes; tls.crt is public.
+- name: Determine attributes of the CA secret
+  ansible.builtin.set_fact:
+    lab_ca_found: "{{ lab_ca_obj | length > 0 }}"
+    lab_ca_owner: "{{ (lab_ca_obj.metadata.labels | default({}))['app.kubernetes.io/managed-by'] | default('-') }}"
+    lab_ca_tracked: "{{ 'argocd.argoproj.io/tracking-id' in (lab_ca_obj.metadata.annotations | default({})) }}"
+    lab_ca_crt_b64: "{{ (lab_ca_obj.data | default({}))['tls.crt'] | default('') }}"
+  vars:
+    lab_ca_obj: "{{ lab_ca_secret_info.resources | default([]) | first | default({}) }}"
+  no_log: true
+
+- name: CA secret comes from Argo CD
+  ansible.builtin.assert:
+    that:
+      - lab_ca_found | bool
+      - lab_ca_owner == 'argocd'
+      - lab_ca_tracked | bool
+      - lab_ca_crt_b64 | length > 0
+    fail_msg: >-
+      CA-Secret {{ lab_ca_namespace }}/{{ lab_ca_secret_name }} not created by Argo CD
+      (found={{ lab_ca_found }}, managed-by={{ lab_ca_owner }},
+      Tracking={{ lab_ca_tracked }}). Check:
+      kubectl -n argocd get application {{ lab_ca_secret_app }} and
+      docs/learning-path/stage-7-ksops.md, section Fehlerbilder.
+    success_msg: "CA secret from Argo CD (Application {{ lab_ca_secret_app }})"
+  when: not ansible_check_mode
+
+# Only the public certificate (tls.crt), trust anchor for browsers,
+# system store and verify-certmanager.yml. May be shown.
+- name: Store public CA certificate
+  ansible.builtin.copy:
+    content: "{{ lab_ca_crt_b64 | b64decode }}"
+    dest: "{{ lab_ca_cert_path | expanduser }}"
+    mode: "0644"
+  when: lab_ca_crt_b64 | length > 0
+
+# Do not keep the secret in memory longer than necessary.
+- name: Remove CA data from the facts
+  ansible.builtin.set_fact:
+    lab_ca_secret_info: {}
+  no_log: true

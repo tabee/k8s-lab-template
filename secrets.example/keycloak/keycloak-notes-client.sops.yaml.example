@@ -1,0 +1,18 @@
+# Template for keycloak-notes-client.sops.yaml: structure without real values.
+# Client secret of the realm client notes (login of the notes sites, one client
+# for all sites with auth sso). The realm job puts it into the realm file in memory
+# ($(env:NOTES_CLIENT_SECRET)). The same value goes into the Secret notes-oidc of
+# every sso notes namespace (Ansible, role notes_sites; Argo CD may not create secrets there).
+# A separate file on purpose: keycloak-oidc-clients.sops.yaml stays unchanged.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: keycloak-notes-client
+  namespace: keycloak
+  labels:
+    app.kubernetes.io/managed-by: argocd
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+type: Opaque
+stringData:
+  NOTES_CLIENT_SECRET: "@file:keycloak-notes-client-secret"

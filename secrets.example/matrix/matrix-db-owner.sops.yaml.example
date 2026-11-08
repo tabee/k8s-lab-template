@@ -1,0 +1,15 @@
+# Template for matrix-db-owner.sops.yaml: structure without real values.
+# lab.sh init fills the password and encrypts immediately.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: matrix-db-owner
+  namespace: matrix
+  labels:
+    app.kubernetes.io/managed-by: argocd
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+type: kubernetes.io/basic-auth
+stringData:
+  username: "matrix"
+  password: "@file:matrix-db-pw"

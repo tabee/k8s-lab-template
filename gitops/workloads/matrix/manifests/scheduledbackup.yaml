@@ -1,0 +1,19 @@
+---
+# Daily base backup of matrix-db. ONLY place for this time.
+# Cron with seconds (6 fields), UTC: 20:15, a quarter of an hour after
+# gitea-db so the two base backups do not start together. The media store
+# is backed up by K8up at 21:30 (k8up-schedule.yaml).
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: matrix-db-daily
+  namespace: matrix
+spec:
+  schedule: "0 15 20 * * *"
+  immediate: true
+  backupOwnerReference: self
+  cluster:
+    name: matrix-db
+  method: plugin
+  pluginConfiguration:
+    name: barman-cloud.cloudnative-pg.io

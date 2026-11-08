@@ -1,0 +1,49 @@
+---
+# Database for Keycloak: own CNPG cluster keycloak-db.
+# Own cluster so a restore of Keycloak does not touch Gitea, Matrix or pg-lab.
+# One instance: the lab is one node, a second instance would only add RAM
+# (docs/reference/memory-budget.md). Data safety comes from the daily base
+# backup and the WAL archive (objectstore.yaml), not from a replica. More
+# availability later: instances 2 (nothing else changes).
+# Image: same version and digest as gitea-db and matrix-db, as an own copy so
+# each cluster can move on its own.
+# No pooler: Keycloak has its own connection pool.
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: keycloak-db
+  namespace: keycloak
+spec:
+  instances: 1
+  # yamllint disable-line rule:line-length
+  imageName: ghcr.io/cloudnative-pg/postgresql:18.6-minimal-trixie@sha256:64abc98a4387361afd6821a3a99f975763bbd87bbdde9449e75ad6002528a318
+  enableSuperuserAccess: false
+  bootstrap:
+    initdb:
+      # ONLY place for database and user name. The deployment env
+      # KC_DB_URL_DATABASE is a copy; verify-keycloak.yml compares.
+      database: keycloak
+      owner: keycloak
+      secret:
+        name: keycloak-db-owner
+  storage:
+    size: 1Gi
+  affinity:
+    podAntiAffinityType: preferred
+  resources:
+    requests:
+      cpu: 50m
+      memory: 192Mi
+    limits:
+      memory: 192Mi  # lab-limit: keycloak/keycloak-db/postgres
+  postgresql:
+    parameters:
+      shared_buffers: 48MB
+      max_connections: "50"
+  plugins:
+    - name: barman-cloud.cloudnative-pg.io
+      enabled: true
+      isWALArchiver: true
+      parameters:
+        barmanObjectName: keycloak-db
+        serverName: keycloak-db

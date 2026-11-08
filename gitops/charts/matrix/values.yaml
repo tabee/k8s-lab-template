@@ -1,0 +1,22 @@
+---
+# domain follows lab.yaml (lab.sh customize, whole word).
+# serverName is pinned afterwards from lab.yaml key matrix_server_name.
+# It does not follow a domain change: phase 2 sets the imported server name.
+domain: lab.example
+serverName: matrix.lab.example
+# Single sign-on (Keycloak, ADR-0019). The realm name is a copy of
+# gitops/charts/keycloak/values.yaml (tests/keycloak-tests.sh compares). The public
+# address of Keycloak is sso.<domain>; Synapse reaches the token, key and
+# user info endpoints over the Service address (no egress to the internet).
+oidcRealm: lab
+# Text of the login button in Element. Same word as in Gitea, where the source name
+# keycloak (callback URL /user/oauth2/keycloak/callback, never rename it) is shown
+# capitalized: tests/keycloak-tests.sh compares both.
+oidcDisplayName: Keycloak
+oidcInternalBase: http://keycloak.keycloak.svc:8080
+# Matrix import (ADR-0020): imported accounts exist before the first Keycloak login.
+# true lets Synapse link a Keycloak user to the account with the same localpart
+# instead of refusing the login. Leave false on a fresh instance. Only turn it on
+# when every Keycloak user name is one you trust, because a Keycloak user named
+# like a local account (for example lab-admin) then logs in as that account.
+oidcAllowExistingUsers: false

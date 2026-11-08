@@ -1,0 +1,36 @@
+---
+# KSOPS generator: decrypts the listed files when rendering
+# (repo-server, age key from stage 7).
+# You create the *.sops.yaml files yourself (values never in the bundle); block B of
+# stage 8c (stufe8c-block-b.sh) does that with
+# ansible/scripts/sops-secret.sh from files under ~/.config/k8s-lab/ (0600):
+#   from-env   gitea backup-s3-creds s3-cnpg-k3s-lab.env       (stage 8a)
+#   from-files gitea gitea-db-owner  kubernetes.io/basic-auth
+#              username=gitea password=@gitea-k3s-lab-db.pw
+#   from-files gitea gitea-admin     Opaque
+#              username=@gitea-k3s-lab-admin.user password=@gitea-k3s-lab-admin.pw
+#   from-env   gitea k8up-s3-creds   s3-k8up-k3s-lab.env       (backup-host.yml)
+#   from-files gitea k8up-repo       Opaque password=@k8up-k3s-lab-repo.pw
+apiVersion: viaduct.ai/v1
+kind: ksops
+metadata:
+  name: secrets-gitea
+  annotations:
+    config.kubernetes.io/function: |
+      exec:
+        path: ksops
+files:
+  # S3 access for Barman (gitea-db), the same key as db-lab.
+  - ./backup-s3-creds.sops.yaml
+  # Owner of the database gitea (CNPG creates it, Gitea logs in with it).
+  - ./gitea-db-owner.sops.yaml
+  # First Gitea admin (username, password).
+  - ./gitea-admin.sops.yaml
+  # S3 access for K8up/restic, bucket k8up-k3s-lab only.
+  - ./k8up-s3-creds.sops.yaml
+  # restic repo password (encrypts the file backups).
+  - ./k8up-repo.sops.yaml
+  # OIDC client of Gitea at Keycloak (keys key and secret).
+  - ./gitea-oidc.sops.yaml
+  # Global registration token of the Gitea Actions runner (key token, issue #115).
+  - ./gitea-runner-token.sops.yaml

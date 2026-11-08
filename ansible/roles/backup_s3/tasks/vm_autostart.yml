@@ -1,0 +1,37 @@
+---
+# Power outage: the VM starts with libvirt if backup_s3_vm_autostart: true.
+# false = change nothing (also do not disable).
+
+- name: Read VM info (autostart)
+  ansible.builtin.command: virsh -c {{ backup_s3_libvirt_uri }} dominfo {{ backup_s3_vm_name }}
+  register: backup_s3_dominfo
+  environment:
+    LC_ALL: C
+  changed_when: false
+  check_mode: false
+  when: backup_s3_vm_autostart | bool
+
+- name: VM starts with libvirt (virsh autostart)
+  ansible.builtin.command: virsh -c {{ backup_s3_libvirt_uri }} autostart {{ backup_s3_vm_name }}
+  changed_when: true
+  when:
+    - backup_s3_vm_autostart | bool
+    - backup_s3_dominfo.stdout is not search('(?m)^Autostart:\s+enable')
+
+# Without a network the VM does not start: libvirt network of the VM (default) also with
+# autostart. The role does not touch other networks.
+- name: Read network info (autostart)
+  ansible.builtin.command: virsh -c {{ backup_s3_libvirt_uri }} net-info {{ backup_s3_vm_network }}
+  register: backup_s3_netinfo
+  environment:
+    LC_ALL: C
+  changed_when: false
+  check_mode: false
+  when: backup_s3_vm_autostart | bool
+
+- name: VM network starts with libvirt (virsh net-autostart)
+  ansible.builtin.command: virsh -c {{ backup_s3_libvirt_uri }} net-autostart {{ backup_s3_vm_network }}
+  changed_when: true
+  when:
+    - backup_s3_vm_autostart | bool
+    - backup_s3_netinfo.stdout is not search('(?m)^Autostart:\s+yes')

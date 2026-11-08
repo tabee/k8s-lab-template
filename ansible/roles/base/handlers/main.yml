@@ -1,0 +1,20 @@
+---
+# Reload is enough: sshd re-reads the configuration, open sessions stay.
+- name: Reload SSH
+  ansible.builtin.systemd_service:
+    name: ssh
+    state: reloaded
+
+# Socket activation: sshd-socket-generator reads ListenAddress at
+# daemon-reload; only the socket restart binds anew. Open sessions
+# stay (KillMode=process).
+- name: Regenerate SSH socket
+  ansible.builtin.systemd_service:
+    name: ssh.socket
+    state: restarted
+    daemon_reload: true
+  when: base_ssh_socket.status.ActiveState | default('') == 'active'
+
+- name: Load auditd rules
+  ansible.builtin.command: augenrules --load
+  changed_when: true

@@ -1,0 +1,207 @@
+---
+# Keycloak, one replica, state only in keycloak-db.
+#
+# Read-only root file system: Keycloak wants to write while it builds
+# (augmentation). So two init containers do the build on an emptyDir:
+#   1. copy-quarkus copies lib/quarkus (the bytecode directory) to the emptyDir,
+#   2. build runs `kc.sh build` with the build options below on top of it.
+# The main container starts with --optimized on the same emptyDir. The build
+# options (KC_DB, KC_CACHE, KC_HEALTH_ENABLED) are the same in all three places;
+# tests/keycloak-tests.sh compares them.
+# KC_CACHE=local: one replica needs no cluster cache and no JGroups ports.
+# KC_HOSTNAME is the public address; the back channel (Gitea, Synapse, the
+# realm job) uses the Service address (KC_HOSTNAME_BACKCHANNEL_DYNAMIC).
+# KC_HOSTNAME_ADMIN is localhost: the admin console only exists for the port-forward.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keycloak
+  namespace: keycloak
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: keycloak
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: keycloak
+        app.kubernetes.io/part-of: keycloak
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        # Wait until the CNPG primary accepts connections, so Keycloak does not crash-loop on restore (#113).
+        - name: wait-for-db
+          image: quay.io/keycloak/keycloak:26.8.1-2@sha256:3f3c5f8e03c614774b4bd9173b88391fefa4153bfc010d8012d59ad825377332
+          command: ["/bin/bash", "-c", "for i in $(seq 1 180); do (exec 3<>/dev/tcp/keycloak-db-rw.keycloak.svc/5432) 2>/dev/null && exit 0; echo \"waiting for keycloak-db ($i)\"; sleep 5; done; echo 'keycloak-db not ready after 15 min'; exit 1"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - "ALL"
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 64Mi
+        - name: copy-quarkus
+          image: quay.io/keycloak/keycloak:26.8.1-2@sha256:3f3c5f8e03c614774b4bd9173b88391fefa4153bfc010d8012d59ad825377332
+          command: ["/bin/sh", "-c", "cp -R /opt/keycloak/lib/quarkus/. /quarkus/"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - "ALL"
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          volumeMounts:
+            - name: quarkus
+              mountPath: /quarkus
+        - name: build
+          image: quay.io/keycloak/keycloak:26.8.1-2@sha256:3f3c5f8e03c614774b4bd9173b88391fefa4153bfc010d8012d59ad825377332
+          args: ["build"]
+          env:
+            - name: KC_DB
+              value: postgres
+            - name: KC_CACHE
+              value: local
+            - name: KC_HEALTH_ENABLED
+              value: "true"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - "ALL"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 768Mi
+          volumeMounts:
+            - name: quarkus
+              mountPath: /opt/keycloak/lib/quarkus
+            - name: tmp
+              mountPath: /tmp
+            - name: kcdata
+              mountPath: /opt/keycloak/data
+      containers:
+        - name: keycloak
+          image: quay.io/keycloak/keycloak:26.8.1-2@sha256:3f3c5f8e03c614774b4bd9173b88391fefa4153bfc010d8012d59ad825377332
+          args: ["start", "--optimized"]
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: management
+              containerPort: 9000
+          env:
+            - name: KC_DB
+              value: postgres
+            - name: KC_CACHE
+              value: local
+            - name: KC_HEALTH_ENABLED
+              value: "true"
+            - name: KC_DB_URL_HOST
+              value: keycloak-db-rw.keycloak.svc
+            - name: KC_DB_URL_PORT
+              value: "5432"
+            # Copy of cluster.yaml bootstrap.initdb.database (verify-keycloak.yml compares).
+            - name: KC_DB_URL_DATABASE
+              value: keycloak
+            - name: KC_DB_URL_PROPERTIES
+              value: "?sslmode=require"
+            - name: KC_DB_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: keycloak-db-owner
+                  key: username
+            - name: KC_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: keycloak-db-owner
+                  key: password
+            # Only used while the master realm does not exist yet (first start).
+            - name: KC_BOOTSTRAP_ADMIN_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: keycloak-admin
+                  key: username
+            - name: KC_BOOTSTRAP_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: keycloak-admin
+                  key: password
+            - name: KC_HOSTNAME
+              value: https://sso.lab.example
+            - name: KC_HOSTNAME_ADMIN
+              value: http://localhost:8080
+            - name: KC_HOSTNAME_BACKCHANNEL_DYNAMIC
+              value: "true"
+            - name: KC_HTTP_ENABLED
+              value: "true"
+            - name: KC_PROXY_HEADERS
+              value: xforwarded
+            - name: KC_LOG_LEVEL
+              value: info
+            - name: JAVA_OPTS_KC_HEAP
+              value: "-XX:MaxRAMPercentage=50 -XX:InitialRAMPercentage=25"
+          startupProbe:
+            httpGet:
+              path: /health/started
+              port: management
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: management
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: management
+            periodSeconds: 20
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - "ALL"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 512Mi
+            limits:
+              memory: 896Mi  # lab-limit: keycloak/keycloak/keycloak
+          volumeMounts:
+            - name: quarkus
+              mountPath: /opt/keycloak/lib/quarkus
+            - name: tmp
+              mountPath: /tmp
+            - name: kcdata
+              mountPath: /opt/keycloak/data
+      volumes:
+        - name: quarkus
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+        - name: kcdata
+          emptyDir: {}

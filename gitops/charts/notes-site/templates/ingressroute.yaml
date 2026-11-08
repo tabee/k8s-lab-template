@@ -1,0 +1,29 @@
+---
+# From outside via Traefik (websecure, TLS with notes-tls). auth: sso: no-cache,
+# then the service notes-oauth2-proxy (login at Keycloak, then the pod). auth: basic:
+# first basic-auth, then no-cache, then the pod. Test basic from the host (password from the file):
+#   curl --cacert ~/.config/k8s-lab/lab-ca.crt -u USER https://HOST/
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: notes
+  labels:
+    {{- include "notes.labels" . | nindent 4 }}
+  annotations:
+    {{- include "notes.crdAnnotation" . | nindent 4 }}
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - kind: Rule
+      match: {{ printf "Host(`%s`)" .Values.site.host | quote }}
+      middlewares:
+        {{- if not (include "notes.sso" .) }}
+        - name: basic-auth
+        {{- end }}
+        - name: no-cache
+      services:
+        - name: {{ ternary "notes-oauth2-proxy" "notes" (not (empty (include "notes.sso" .))) }}
+          port: http
+  tls:
+    secretName: notes-tls

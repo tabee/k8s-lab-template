@@ -1,0 +1,181 @@
+---
+# Check of the public probe (ACME DNS-01, ClusterIssuer lab-acme), read only.
+# Without the acme_* values in lab.local.yaml: clear SKIP (exit 0, no proof).
+# With values it is ALL or nothing:
+#   1. ClusterIssuer lab-acme is Ready,
+#   2. Certificate acme-probe is Ready, its issuerRef is lab-acme (not lab-ca),
+#   3. the probe name is OUTSIDE the lab domain (and thus the nameConstraints of the lab CA),
+#   4. the issued certificate names the probe name and does not come from the lab CA,
+#   5. the VM trusts it without --cacert (system truststore, TLS check ssl_verify_result 0).
+# Usage: ansible-playbook verify-public.yml
+# Only the public tls.crt is read (no tls.key in the output, no_log).
+
+- name: Check public probe (cluster)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: "{{ argocd_kubeconfig }}"
+  vars:
+    verify_retries: "{{ lab_acme_wait_retries }}"
+    verify_delay: "{{ lab_acme_wait_delay }}"
+  tasks:
+    - name: Public probe is off (acme_* in lab.local.yaml not set)
+      ansible.builtin.debug:
+        msg: >-
+          SKIP: public certificate NOT checked. acme_solver, acme_zone, acme_probe_name and
+          acme_email in infra/envs/local/lab.local.yaml set (docs/how-to/public-certificate.md).
+      when: not (lab_acme_active | bool)
+
+    - name: Check public probe
+      when: lab_acme_active | bool
+      block:
+        - name: Probe name is outside the lab domain
+          ansible.builtin.assert:
+            that:
+              - lab_acme_probe_name != lab.domain
+              - not (lab_acme_probe_name is search('(^|\.)' ~ (lab.domain | regex_escape) ~ '$'))
+            fail_msg: "Probe name {{ lab_acme_probe_name }} is under {{ lab.domain }}: that would be a lab name, not a public probe"
+            quiet: true
+
+        - name: Read ClusterIssuer lab-acme
+          kubernetes.core.k8s_info:
+            api_version: cert-manager.io/v1
+            kind: ClusterIssuer
+            name: "{{ lab_acme_issuer }}"
+          register: verify_acme_issuer
+          until: >-
+            verify_acme_issuer.resources | length == 1 and
+            (verify_acme_issuer.resources | first).status.conditions | default([])
+            | selectattr('type', 'equalto', 'Ready') | selectattr('status', 'equalto', 'True') | list | length == 1
+          retries: "{{ verify_retries }}"
+          delay: "{{ verify_delay }}"
+
+        - name: Read probe certificate (waits for the DNS-01 issuance)
+          kubernetes.core.k8s_info:
+            api_version: cert-manager.io/v1
+            kind: Certificate
+            namespace: "{{ lab_acme_probe_namespace }}"
+            name: "{{ lab_acme_probe_name_obj }}"
+          register: verify_acme_cert
+          until: >-
+            verify_acme_cert.resources | length == 1 and
+            (verify_acme_cert.resources | first).status.conditions | default([])
+            | selectattr('type', 'equalto', 'Ready') | selectattr('status', 'equalto', 'True') | list | length == 1
+          retries: "{{ verify_retries }}"
+          delay: "{{ verify_delay }}"
+
+        - name: Probe certificate is Ready, from the public issuer and not from lab-ca
+          ansible.builtin.assert:
+            that:
+              - verify_acme_cert_obj.spec.issuerRef.name == lab_acme_issuer
+              - verify_acme_cert_obj.spec.issuerRef.name != verify_lab_issuer
+              - verify_acme_cert_obj.spec.dnsNames == [lab_acme_probe_name]
+              - verify_acme_cert_obj.status.notAfter is defined
+            fail_msg: >-
+              Certificate {{ lab_acme_probe_name_obj }}: issuerRef {{ verify_acme_cert_obj.spec.issuerRef.name }}
+              (expected {{ lab_acme_issuer }}, nie {{ verify_lab_issuer }}) or dnsNames differ
+            quiet: true
+          vars:
+            verify_acme_cert_obj: "{{ verify_acme_cert.resources | first }}"
+            verify_lab_issuer: lab-ca
+
+            # Pass on only tls.crt (public); the raw data with the key disappears again right away.
+        - name: Fetch the public certificate of the probe
+          kubernetes.core.k8s_info:
+            kind: Secret
+            namespace: "{{ lab_acme_probe_namespace }}"
+            name: "{{ lab_acme_probe_secret }}"
+          register: verify_acme_secret
+          no_log: true
+
+        - name: Remember only the certificate
+          ansible.builtin.set_fact:
+            verify_acme_pem: "{{ ((verify_acme_secret.resources | first).data['tls.crt']) | b64decode }}"
+            verify_acme_secret: {}
+          no_log: true
+
+        - name: Read issuer and names of the certificate
+          ansible.builtin.command:
+            argv: [openssl, x509, -noout, -issuer, -ext, subjectAltName]
+            stdin: "{{ verify_acme_pem }}"
+          register: verify_acme_x509
+          changed_when: false
+          check_mode: false
+
+        - name: Certificate names the probe name and does not come from the lab CA
+          ansible.builtin.assert:
+            that:
+              - "('DNS:' ~ lab_acme_probe_name) in verify_acme_x509.stdout"
+              - "'Lab CA' not in verify_acme_x509.stdout"
+            fail_msg: "Certificate of the probe, name is missing or the issuer is the lab CA: {{ verify_acme_x509.stdout_lines | first }}"
+            quiet: true
+
+        - name: The lab CA would not have issued this certificate (openssl verify against the lab CA fails)
+          ansible.builtin.command:
+            argv: [openssl, verify, -CAfile, "{{ lab_ca_cert_path | expanduser }}", /dev/stdin]
+            stdin: "{{ verify_acme_pem }}"
+          register: verify_acme_vs_labca
+          changed_when: false
+          check_mode: false
+          failed_when: verify_acme_vs_labca.rc == 0
+
+        - name: Discard raw certificate
+          ansible.builtin.set_fact:
+            verify_acme_pem: ""
+          no_log: true
+
+        # The probe certificate and route live in this namespace: PSA must be enforced there.
+        - name: PSA proof for the namespace of the public probe
+          ansible.builtin.include_tasks: tasks/psa-probe.yml
+          vars:
+            verify_psa_namespaces:
+              - "{{ lab_acme_probe_namespace }}"
+
+        - name: Evidence
+          ansible.builtin.debug:
+            msg: "public probe ok: {{ lab_acme_probe_name }} from {{ lab_acme_issuer }} (not lab CA, outside {{ lab.domain }})"
+
+- name: Check the public probe from the VM (system truststore, without --cacert)
+  hosts: k3s
+  gather_facts: false
+  vars:
+    verify_retries: 30
+    verify_delay: 10
+  tasks:
+    - name: From the VM via HTTPS to the probe name
+      when: lab_acme_active | bool
+      block:
+            # --resolve: the name does not (yet) point at the VM; we talk to the Traefik address, SNI and name are real.
+        - name: Try HTTPS with the system truststore of the VM  # noqa: command-instead-of-module
+          ansible.builtin.command:
+            argv:
+              - curl
+              - --silent
+              - --output
+              - /dev/null
+              - --max-time
+              - "15"
+              - --resolve
+              - "{{ lab_acme_probe_name }}:443:{{ ansible_host }}"
+              - --write-out
+              - "%{ssl_verify_result} %{http_code}"
+              - "https://{{ lab_acme_probe_name }}/"
+          register: verify_acme_vm
+          changed_when: false
+          failed_when: false
+          until: verify_acme_vm.rc == 0 and (verify_acme_vm.stdout.split() | first | default('x')) == '0'
+          retries: "{{ verify_retries }}"
+          delay: "{{ verify_delay }}"
+
+        - name: The VM trusts the certificate without --cacert
+          ansible.builtin.assert:
+            that:
+              - verify_acme_vm.rc == 0
+              - (verify_acme_vm.stdout.split() | first | default('x')) == '0'
+            fail_msg: >-
+              curl from the VM to {{ lab_acme_probe_name }}: rc {{ verify_acme_vm.rc | default('?') }}, ssl_verify_result
+              {{ verify_acme_vm.stdout | default('?') }}. 0 means: trusted without --cacert.
+              (rc 60 / result 20 or 21: certificate not publicly trusted, e.g. ACME staging server.)
+            success_msg: "VM trusts {{ lab_acme_probe_name }} without --cacert (ssl_verify_result 0)"

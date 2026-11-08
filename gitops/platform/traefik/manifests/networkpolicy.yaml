@@ -1,0 +1,23 @@
+---
+# Traefik pod reachable only on web (8000), websecure (8443) and admin (8444).
+# Port traefik (8080, /ping) and metrics (9100) are thereby closed for other pods.
+# Kubelet probes from the own node are always let through by k3s (kube-router).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: traefik-ingress
+  namespace: traefik
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: traefik
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: 8000
+        - protocol: TCP
+          port: 8443
+        - protocol: TCP
+          port: 8444

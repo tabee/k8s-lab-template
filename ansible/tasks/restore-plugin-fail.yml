@@ -1,0 +1,64 @@
+---
+# The wait for the barman-cloud plugin ran out of budget. Read what there is to know (read only),
+# then stop with a message that says where it stopped, what the objects look like and which
+# commands go on. Variable restore_pl_stage names the step that failed.
+- name: Read the Argo CD application of the plugin
+  kubernetes.core.k8s_info:
+    api_version: argoproj.io/v1alpha1
+    kind: Application
+    namespace: "{{ argocd_namespace }}"
+    name: "{{ restore_op_app.metadata.name }}"
+  register: restore_fail_app
+  failed_when: false
+
+- name: Read the Certificates of the plugin
+  kubernetes.core.k8s_info:
+    api_version: cert-manager.io/v1
+    kind: Certificate
+    namespace: "{{ restore_op_ns }}"
+  register: restore_fail_certs
+  failed_when: false
+
+- name: Read the cert-manager pods
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: "{{ restore_cm_ns }}"
+    label_selectors:
+      - "app.kubernetes.io/instance={{ restore_cm_name }}"
+  register: restore_fail_cm_pods
+  failed_when: false
+
+- name: Read the plugin Deployment and its pods
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: "{{ restore_op_ns }}"
+    label_selectors:
+      - "app.kubernetes.io/name={{ restore_plugin_name }}"
+  register: restore_fail_pods
+  failed_when: false
+
+# The diagnosis lines are long Jinja loops over object lists, folding them would add blanks to the output.
+# yamllint disable rule:line-length
+- name: Stop with a diagnosis
+  ansible.builtin.fail:
+    msg: |-
+      The barman-cloud plugin is not usable: {{ restore_pl_stage }}.
+      Waited {{ now(utc=True).timestamp() | int - restore_pl_t0 | int }} s of the {{ restore_plugin_timeout_min }} min budget
+      (restore_plugin_timeout_min in ansible/inventory/group_vars/all/restore.yml; raise it if the VM is only slow).
+      Nothing was applied to the databases. What the objects look like now:
+      - cert-manager pods: {% for p in restore_fail_cm_pods.resources | default([]) %}{{ p.metadata.name }}={{ p.status.phase | default('?') }}{{ ('/' ~ (p.status.containerStatuses | default([]) | map(attribute='state.waiting.reason', default='') | select | first | default(''))) if p.status.phase | default('') != 'Running' else '' }}{{ ', ' if not loop.last }}{% else %}none{% endfor %}
+      - Certificates in {{ restore_op_ns }}: {% for c in restore_fail_certs.resources | default([]) %}{{ c.metadata.name }} Ready={{ (c.status.conditions | default([]) | selectattr('type', 'equalto', 'Ready') | map(attribute='status') | first) | default('unknown') }} ({{ (c.status.conditions | default([]) | selectattr('type', 'equalto', 'Ready') | map(attribute='message') | first) | default('no condition') | truncate(120) }}){{ '; ' if not loop.last }}{% else %}none (the Argo CD sync did not create them, or the cert-manager CRDs are missing){% endfor %}
+      - plugin pods: {% for p in restore_fail_pods.resources | default([]) %}{{ p.metadata.name }}={{ p.status.phase | default('?') }}{{ ('/' ~ (p.status.containerStatuses | default([]) | map(attribute='state.waiting.reason', default='') | select | first | default(''))) if p.status.phase | default('') != 'Running' else '' }}{{ ', ' if not loop.last }}{% else %}none{% endfor %}
+      - Argo CD application {{ restore_op_app.metadata.name }}: sync {{ restore_fail_app.resources[0].status.sync.status | default('?') if restore_fail_app.resources | default([]) | length == 1 else 'application missing' }}, last operation {{ restore_fail_app.resources[0].status.operationState.phase | default('none') if restore_fail_app.resources | default([]) | length == 1 else '-' }}{{ (': ' ~ (restore_fail_app.resources[0].status.operationState.message | default('') | truncate(200))) if restore_fail_app.resources | default([]) | length == 1 and restore_fail_app.resources[0].status.operationState.message is defined else '' }}
+      Look closer:
+        kubectl -n {{ restore_cm_ns }} get pods; kubectl -n {{ restore_op_ns }} get certificate,pods
+        kubectl -n {{ restore_op_ns }} describe pod -l app.kubernetes.io/name={{ restore_plugin_name }}
+        kubectl -n {{ argocd_namespace }} get application {{ restore_op_app.metadata.name }} -o jsonpath='{.status.operationState}'
+      When the cause is fixed, run the recovery command again (safe to repeat), then continue:
+        cd ansible && ansible-playbook restore-clusters.yml
+        cd ansible && ansible-playbook recover-files.yml --tags pause
+        kubectl wait --for=condition=Ready clusters.postgresql.cnpg.io --all -A --timeout=30m
+        cd ansible && ansible-playbook recover-files.yml --tags restore,resume,verify
+# yamllint enable rule:line-length

@@ -1,0 +1,28 @@
+---
+# whoami reachable only for Traefik, and only on port 8080 (container port).
+# All other pods: kube-router rejects ("Connection refused"). Outgoing is
+# not blocked (whoami calls nothing). Kubelet probes from the own node
+# are always let through by k3s (kube-router). Pattern: workloads/docs/networkpolicy.yaml.
+# From outside you only get in via Traefik (entrypoint admin, admin networks only).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: whoami-allow-traefik
+  namespace: whoami
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: whoami
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: traefik
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: traefik
+      ports:
+        - protocol: TCP
+          port: 8080

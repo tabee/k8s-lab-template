@@ -1,0 +1,55 @@
+---
+# Backup target for pg-lab (Barman cloud plugin): rustfs on the owner's PC,
+# bucket cnpg-k3s-lab from stage 8a. One ObjectStore per cluster (recommendation
+# of the plugin docs). Location: s3://cnpg-k3s-lab/db-lab/pg-lab/{base,wals}
+# (destinationPath + serverName from cluster.yaml).
+#
+# COPY: endpointURL and bucket actually exist only in
+# ansible/inventory/group_vars/all/backup_s3.yml (backup_s3_vm_endpoint,
+# backup_s3_bucket). Argo CD cannot read Ansible variables, hence here
+# as a copy. ansible/verify-cnpg.yml compares this file and the object
+# in the cluster with the Ansible values and aborts on deviation.
+apiVersion: barmancloud.cnpg.io/v1
+kind: ObjectStore
+metadata:
+  name: pg-lab
+  namespace: db-lab
+spec:
+  # The plugin deletes base backups and WAL older than 14 days (it always keeps
+  # at least the last base backup). rustfs keeps deleted
+  # versions for another 14 days (lifecycle from stage 8a), retrievable only with root.
+  retentionPolicy: "14d"
+  configuration:
+    destinationPath: s3://cnpg-k3s-lab/db-lab
+    endpointURL: http://192.168.122.1:9000
+    # serverName stays empty here (plugin docs), it comes from the cluster.
+    s3Credentials:
+      accessKeyId:
+        name: backup-s3-creds
+        key: ACCESS_KEY_ID
+      secretAccessKey:
+        name: backup-s3-creds
+        key: ACCESS_SECRET_KEY
+    wal:
+      compression: gzip
+      maxParallel: 2
+    data:
+      compression: gzip
+      jobs: 1
+  # Sidecar barman-cloud in every Postgres pod.
+  instanceSidecarConfiguration:
+    # Newer boto3 versions compute checksums by default that not
+    # every S3 clone knows. Tested with rustfs 1.0.3: works without it too
+    # (stage 8a); the two variables switch to the old behavior and
+    # do no harm.
+    env:
+      - name: AWS_REQUEST_CHECKSUM_CALCULATION
+        value: when_required
+      - name: AWS_RESPONSE_CHECKSUM_VALIDATION
+        value: when_required
+    resources:
+      requests:
+        cpu: 10m
+        memory: 64Mi
+      limits:
+        memory: 128Mi  # lab-limit: db-lab/pg-lab/plugin-barman-cloud

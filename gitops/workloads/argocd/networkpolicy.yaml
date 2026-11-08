@@ -1,0 +1,98 @@
+---
+# argocd-server reachable only for Traefik, and only on the container port
+# 8080 (UI, API, gRPC-Web). Metrics port 8083 and everything else are closed for pods.
+# The chart policy for argocd-server (would allow everything) is off for that in
+# values.yaml.j2; the other Argo CD pods keep their chart policies.
+# kubectl port-forward (emergency exit) runs via the kubelet directly into the
+# pod and is not affected by this; kubelet probes from the own node are always let
+# through by k3s (kube-router).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: argocd-server-allow-traefik
+  namespace: argocd
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: argocd-server
+      app.kubernetes.io/instance: argocd
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: traefik
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: traefik
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+# Egress (wave 2, issue 5) for the repo-server only: it clones from the git server and fetches Helm/OCI charts.
+# DNS, Redis (cache), Git over SSH to the pinned server and HTTPS to the public internet (chart hosts, cert-manager
+# chart on quay.io). No API server, no node, no S3. The controller, server and applicationSet pods keep their
+# chart policies (ingress only): egress for them is a follow-up.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: argocd-repo-server-egress
+  namespace: argocd
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: argocd-repo-server
+      app.kubernetes.io/instance: argocd
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: argocd-redis
+      ports:
+        - protocol: TCP
+          port: 6379
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Git server of repo_url: only its own address(es), SSH port (and 443 for the HTTPS clone of the
+    # docs plugin when the server sits in a private range). Written by scripts/repo-egress.py.
+    - to:
+        # lab-egress:repo-cidrs BEGIN
+        - ipBlock:
+            cidr: 203.0.113.10/32
+        # lab-egress:repo-cidrs END
+      ports:
+        - protocol: TCP
+          # lab-egress:repo-port BEGIN
+          port: 22
+          # lab-egress:repo-port END
+        - protocol: TCP
+          port: 443
+    # PyPI, plugin clone, container and chart hosts: HTTPS to the public internet only. Names cannot be
+    # pinned (kube-router has no FQDN rules), so 443 stays open to every public address; private ranges,
+    # link-local and the node network stay closed.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+              - 127.0.0.0/8
+      ports:
+        - protocol: TCP
+          port: 443

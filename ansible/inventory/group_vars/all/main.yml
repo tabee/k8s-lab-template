@@ -1,0 +1,169 @@
+---
+# Values for the role "base" (all hosts).
+# Each value is defined only here; the role deliberately has no defaults/.
+
+base_timezone: Europe/Zurich
+
+# apt: "safe" (apt upgrade), "dist" (apt full-upgrade) or "no".
+base_apt_upgrade: safe
+# For this long (seconds) the apt cache counts as fresh.
+base_apt_cache_valid_time: 3600
+# Reboot if an upgrade requires it (/var/run/reboot-required).
+base_reboot_if_required: true
+
+base_packages:
+  - ca-certificates
+  - curl
+  - jq
+  - htop
+  - vim
+  - bash-completion
+  - unattended-upgrades
+
+# Unattended upgrades: security updates only (Ubuntu default origins).
+base_unattended_automatic_reboot: false
+base_unattended_reboot_time: "03:30"
+
+# Kernel modules for container networking and OverlayFS.
+base_kernel_modules:
+  - overlay
+  - br_netfilter
+
+# sysctl files. systemd-sysctl reads all sysctl.d directories at boot
+# (/etc, /run, /usr/local/lib, /usr/lib) together, sorted by
+# file name; the last value wins. "99-zz-" sorts after
+# 99-protect-links.conf, 99-sysctl.conf (= /etc/sysctl.conf) and
+# 99-cloudimg-ipv6.conf, so our values apply. Each key is
+# in only one of the two files (the role checks this).
+base_sysctl_file: /etc/sysctl.d/99-zz-k8s.conf
+base_sysctl_hardening_file: /etc/sysctl.d/99-zz-hardening.conf
+# Earlier file names (lost at boot against 99-*), the role deletes them.
+base_sysctl_old_files:
+  - /etc/sysctl.d/80-hardening.conf
+  - /etc/sysctl.d/90-k8s.conf
+
+# sysctl for Kubernetes (file base_sysctl_file). The last four values
+# are required by k3s with protect-kernel-defaults (CIS); they match the
+# expectations of the kubelet.
+base_sysctl:
+  net.bridge.bridge-nf-call-iptables: 1
+  net.bridge.bridge-nf-call-ip6tables: 1
+  net.ipv4.ip_forward: 1
+  fs.inotify.max_user_instances: 8192
+  fs.inotify.max_user_watches: 524288
+  vm.overcommit_memory: 1
+  vm.panic_on_oom: 0
+  kernel.panic: 10
+  kernel.panic_on_oops: 1
+
+# SSH: only these users may log in (the Ansible user itself).
+base_ssh_allow_users:
+  - "{{ ansible_user }}"
+
+# sshd listens only on the address Ansible connects through (no 0.0.0.0).
+base_ssh_listen_address: "{{ ansible_host }}"
+# Modern crypto, all available in OpenSSH 9.6 (Ubuntu 24.04).
+# sntrup761x25519 = hybrid post-quantum key exchange.
+base_ssh_kex_algorithms:
+  - sntrup761x25519-sha512@openssh.com
+  - curve25519-sha256
+  - curve25519-sha256@libssh.org
+base_ssh_ciphers:
+  - chacha20-poly1305@openssh.com
+  - aes256-gcm@openssh.com
+  - aes128-gcm@openssh.com
+# Encrypt-then-MAC only (unused with AEAD ciphers anyway).
+base_ssh_macs:
+  - hmac-sha2-512-etm@openssh.com
+  - hmac-sha2-256-etm@openssh.com
+  - umac-128-etm@openssh.com
+# Host keys the server offers (no ECDSA, no ssh-rsa/SHA1).
+base_ssh_host_key_algorithms:
+  - ssh-ed25519
+  - rsa-sha2-512
+  - rsa-sha2-256
+# Client keys the server accepts (incl. FIDO2/security key).
+base_ssh_pubkey_algorithms:
+  - ssh-ed25519
+  - sk-ssh-ed25519@openssh.com
+  - rsa-sha2-512
+  - rsa-sha2-256
+
+# Kernel hardening (file base_sysctl_hardening_file). Must not contain a key
+# from base_sysctl (checked in the role); ip_forward,
+# bridge-nf and the protect-kernel-defaults values stay untouched.
+base_sysctl_hardening:
+  # Hide kernel info from unprivileged processes
+  kernel.kptr_restrict: 2
+  kernel.dmesg_restrict: 1
+  # eBPF for root only; harden JIT against spraying
+  kernel.unprivileged_bpf_disabled: 1
+  net.core.bpf_jit_harden: 2
+  # ptrace only with CAP_SYS_PTRACE (debuggers only via sudo)
+  kernel.yama.ptrace_scope: 2
+  # Magic SysRq off (emergency reset works via virsh reset)
+  kernel.sysrq: 0
+  kernel.randomize_va_space: 2
+  # No core dumps of setuid programs (apport is masked for this,
+  # otherwise apport.service sets it to 2 at boot)
+  fs.suid_dumpable: 0
+  fs.protected_hardlinks: 1
+  fs.protected_symlinks: 1
+  fs.protected_fifos: 2
+  fs.protected_regular: 2
+  # Network: strict reverse path check (set to 2 for pod network problems)
+  net.ipv4.conf.all.rp_filter: 1
+  net.ipv4.conf.default.rp_filter: 1
+  net.ipv4.conf.all.accept_redirects: 0
+  net.ipv4.conf.default.accept_redirects: 0
+  net.ipv4.conf.all.secure_redirects: 0
+  net.ipv4.conf.default.secure_redirects: 0
+  net.ipv6.conf.all.accept_redirects: 0
+  net.ipv6.conf.default.accept_redirects: 0
+  net.ipv4.conf.all.send_redirects: 0
+  net.ipv4.conf.default.send_redirects: 0
+  net.ipv4.conf.all.accept_source_route: 0
+  net.ipv4.conf.default.accept_source_route: 0
+  net.ipv6.conf.all.accept_source_route: 0
+  net.ipv6.conf.default.accept_source_route: 0
+  net.ipv4.conf.all.log_martians: 1
+  net.ipv4.conf.default.log_martians: 1
+  net.ipv4.icmp_echo_ignore_broadcasts: 1
+  net.ipv4.icmp_ignore_bogus_error_responses: 1
+  net.ipv4.tcp_syncookies: 1
+  net.ipv4.tcp_rfc1337: 1
+
+# auditd: watched paths (perm: r/w/x/a, key = search term for ausearch -k).
+# Non-existent paths are skipped (k3s paths from the 2nd run on).
+base_auditd_watches:
+  - { path: /etc/passwd, perm: wa, key: identity }
+  - { path: /etc/group, perm: wa, key: identity }
+  - { path: /etc/shadow, perm: wa, key: identity }
+  - { path: /etc/gshadow, perm: wa, key: identity }
+  - { path: /etc/sudoers, perm: wa, key: sudoers }
+  - { path: /etc/sudoers.d, perm: wa, key: sudoers }
+  - { path: /etc/ssh/sshd_config, perm: wa, key: sshd }
+  - { path: /etc/ssh/sshd_config.d, perm: wa, key: sshd }
+  - { path: /etc/nftables.conf, perm: wa, key: firewall }
+  - { path: /etc/nftables.d, perm: wa, key: firewall }
+  - { path: /etc/rancher/k3s, perm: wa, key: k3s-config }
+  - { path: /var/lib/rancher/k3s/server/cred, perm: wa, key: k3s-cred }
+  - { path: /var/lib/rancher/k3s/server/token, perm: wa, key: k3s-cred }
+  - { path: /var/lib/rancher/k3s/server/tls, perm: wa, key: k3s-tls }
+
+# UFW stays off: the host firewall is the role "firewall" (nftables,
+# own table). Do not enable both together.
+# In the cloud additionally use the provider's firewall in front of the server.
+base_ufw_enabled: false
+# Only relevant if base_ufw_enabled: true.
+base_ufw_rules:
+  - { rule: allow, port: "22", proto: tcp, comment: "SSH" }
+  - { rule: allow, port: "6443", proto: tcp, comment: "k3s API" }
+  # Pod and service network must reach the host (k3s docs).
+  - { rule: allow, from_ip: "{{ k3s_cluster_cidr }}", comment: "k3s Pods" }
+  - { rule: allow, from_ip: "{{ k3s_service_cidr }}", comment: "k3s Services" }
+  # Only needed with several nodes, open only from the node network:
+  # - { rule: allow, port: "10250", proto: tcp, from_ip: "10.0.0.0/24", comment: "Kubelet" }
+  # - { rule: allow, port: "8472", proto: udp, from_ip: "10.0.0.0/24", comment: "Flannel VXLAN" }
+  # For LoadBalancer services (ServiceLB), e.g. ingress:
+  # - { rule: allow, port: "443", proto: tcp, comment: "HTTPS" }

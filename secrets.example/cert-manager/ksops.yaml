@@ -1,0 +1,18 @@
+---
+# KSOPS generator: Kustomize runs the program ksops (exec), ksops
+# decrypts the files under files with the age key from the
+# secret argocd/sops-age and prints the finished secrets.
+# Plaintext exists only in the memory of the repo-server, never in Git.
+apiVersion: viaduct.ai/v1
+kind: ksops
+metadata:
+  name: secrets-cert-manager
+  annotations:
+    config.kubernetes.io/function: |
+      exec:
+        path: ksops
+files:
+  # CA of the lab PKI (ClusterIssuer lab-ca), formerly role lab_ca (stage 6).
+  - ./lab-ca.sops.yaml
+  # API token for ACME DNS-01 (public probe); empty as long as acme_* is not set.
+  - ./acme-dns01-token.sops.yaml

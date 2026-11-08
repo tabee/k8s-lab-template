@@ -1,0 +1,34 @@
+---
+# Role "lab_ca": create namespace cert-manager (PSA), wait for the CA secret
+# (comes since stage 7 from Argo CD out of secrets/cert-manager) and store the
+# public CA certificate.
+galaxy_info:
+  author: k8s-lab
+  description: Create namespace cert-manager, store CA certificate of the lab CA (localhost, k8s-API)
+  license: MIT
+  min_ansible_version: "2.17"
+  platforms:
+    - name: GenericLinux
+      versions:
+        - all
+dependencies: []
+
+# Required variables; values come from inventory/group_vars/all/lab_ca.yml.
+# The kubeconfig is set by the playbook (module_defaults in argocd.yml).
+argument_specs:
+  main:
+    short_description: Bring the lab CA into the cluster (runs on localhost)
+    options:
+      lab_ca_namespace: { type: str, required: true, description: Namespace of cert-manager (owned by Ansible) }
+      lab_ca_psa_level:
+        type: str
+        required: true
+        choices: [privileged, baseline, restricted]
+        description: PSA level for the namespace (enforce, audit, warn)
+      lab_ca_psa_version: { type: str, required: true, description: PSA version (latest or v1.x) }
+      lab_ca_secret_name: { type: str, required: true, description: Name des CA-Secrets im Cluster }
+      lab_ca_secret_app: { type: str, required: true, description: Argo CD application with the CA secret }
+      lab_ca_wait_retries: { type: int, required: true, description: Attempts while waiting for the CA secret }
+      lab_ca_wait_delay: { type: int, required: true, description: Seconds between the attempts }
+      lab_ca_cert_path: { type: str, required: true, description: Target for the public CA certificate }
+      lab_probe_image: { type: str, required: true, description: "Probe image with tag and digest (group_vars/all/images.yml)" }

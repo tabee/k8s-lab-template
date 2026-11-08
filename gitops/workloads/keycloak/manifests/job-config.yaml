@@ -1,0 +1,128 @@
+---
+# Realm as code: keycloak-config-cli applies the realm file (ConfigMap
+# keycloak-realm from gitops/charts/keycloak) to the running Keycloak. Idempotent:
+# the same file twice changes nothing; a changed file updates the realm.
+# Argo CD runs the job as PostSync hook after every sync (Keycloak is healthy
+# by then) and replaces the old job (BeforeHookCreation).
+# Managed mode "no-delete": what the file lists is created or updated, groups,
+# clients and roles made by hand are never deleted. Users are not in the file.
+# Admin login: the bootstrap admin of the secret keycloak-admin, over the
+# Service address (no internet, no public route needed). Client secrets come
+# from keycloak-oidc-clients (gitea, synapse) and keycloak-notes-client (notes) and
+# are replaced into the file in memory only.
+# Two files, in this order: realm.json is the lab realm, realm-master.json sets
+# frontendUrl of the master realm (admin console over the port-forward, persistent
+# instead of a manual kcadm call). Changing frontendUrl changes the issuer of the
+# master realm, so the admin token of the running import becomes invalid and the
+# FIRST run that really changes it ends with "HTTP 401" and exit 1 right after the
+# master file. That is why the lab realm comes first (already done by then) and
+# why backoffLimit retries: the second pod logs in again and finds nothing to do.
+# The attributes of the master realm belong to this file (unlisted ones are removed).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: keycloak-config
+  namespace: keycloak
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 6
+  activeDeadlineSeconds: 900
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: keycloak-config
+        app.kubernetes.io/part-of: keycloak
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: config-cli
+          image: quay.io/adorsys/keycloak-config-cli:6.5.1-26.5.5@sha256:0955d98c8a341898b7aa177477edf8a1e90569ae50bbe7598141c1270b773274
+          env:
+            - name: KEYCLOAK_URL
+              value: http://keycloak.keycloak.svc:8080
+            - name: KEYCLOAK_USER
+              valueFrom:
+                secretKeyRef:
+                  name: keycloak-admin
+                  key: username
+            - name: KEYCLOAK_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: keycloak-admin
+                  key: password
+            - name: KEYCLOAK_AVAILABILITYCHECK_ENABLED
+              value: "true"
+            - name: KEYCLOAK_AVAILABILITYCHECK_TIMEOUT
+              value: 300s
+            - name: IMPORT_FILES_LOCATIONS
+              value: /config/realm.json,/config/realm-master.json
+            - name: IMPORT_VARSUBSTITUTION_ENABLED
+              value: "true"
+            - name: IMPORT_MANAGED_GROUP
+              value: no-delete
+            - name: IMPORT_MANAGED_CLIENT
+              value: no-delete
+            - name: IMPORT_MANAGED_CLIENT_SCOPE
+              value: no-delete
+            - name: IMPORT_MANAGED_CLIENT_SCOPE_MAPPING
+              value: no-delete
+            - name: IMPORT_MANAGED_ROLE
+              value: no-delete
+            - name: IMPORT_MANAGED_COMPONENT
+              value: no-delete
+            - name: IMPORT_MANAGED_AUTHENTICATION_FLOW
+              value: no-delete
+            - name: IMPORT_MANAGED_REQUIRED_ACTION
+              value: no-delete
+            - name: IMPORT_MANAGED_IDENTITY_PROVIDER
+              value: no-delete
+            - name: GITEA_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: keycloak-oidc-clients
+                  key: GITEA_CLIENT_SECRET
+            - name: SYNAPSE_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: keycloak-oidc-clients
+                  key: SYNAPSE_CLIENT_SECRET
+            - name: NOTES_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: keycloak-notes-client
+                  key: NOTES_CLIENT_SECRET
+            - name: JAVA_OPTS
+              value: "-Xmx192m"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - "ALL"
+          resources:
+            requests:
+              cpu: 50m
+              memory: 192Mi
+            limits:
+              memory: 384Mi  # lab-limit: keycloak/keycloak-config/config-cli
+          volumeMounts:
+            - name: realm
+              mountPath: /config
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: realm
+          configMap:
+            name: keycloak-realm
+        - name: tmp
+          emptyDir: {}

@@ -1,0 +1,35 @@
+---
+# Incoming in the namespace cert-manager only what is needed:
+# - Default: nothing (controller and CA injector need no connections
+#   from outside; kubelet probes from the own node are allowed by kube-router).
+# - Webhook: only TCP 10250 (securePort). The API server runs on k3s in the
+#   host network; its source IP is not stably predictable, hence without from.
+# Outgoing stays open: the pods only talk to the API server
+# (service -> node:6443, DNAT). Egress rules for that are error-prone
+# with kube-router and bring little in the lab.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: cert-manager
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: webhook-allow-apiserver
+  namespace: cert-manager
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: webhook
+      app.kubernetes.io/instance: cert-manager
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - port: 10250
+          protocol: TCP

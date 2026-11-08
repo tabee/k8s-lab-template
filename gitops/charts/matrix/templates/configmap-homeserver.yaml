@@ -1,0 +1,104 @@
+---
+# Non-secret Synapse configuration. Secrets (database password, macaroon,
+# form secret, registration shared secret) are placeholders. The entrypoint
+# writes the filled file to an emptyDir and never onto the backed-up volume.
+# Federation is off: client listener only, empty whitelist, no server well-known.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: matrix-homeserver
+  namespace: {{ .Release.Namespace }}
+data:
+  homeserver.yaml: |
+    server_name: {{ .Values.serverName | quote }}
+    public_baseurl: {{ printf "https://matrix.%s/" .Values.domain | quote }}
+    pid_file: /tmp/homeserver.pid
+    web_client_location: {{ printf "https://element.%s/" .Values.domain | quote }}
+    serve_server_wellknown: false
+    report_stats: false
+    enable_registration: false
+    allow_guest_access: false
+    # Password login stays on: the local admin (secret matrix-admin) is the
+    # break-glass account. Registration stays off; accounts come from Keycloak
+    # on first login, only for members of the realm group lab-users.
+    password_config:
+      enabled: true
+    oidc_providers:
+      - idp_id: keycloak
+        idp_name: {{ .Values.oidcDisplayName | quote }}
+        discover: false
+        # Synapse insists on https for token_endpoint/jwks_uri/userinfo_endpoint
+        # during metadata validation. Those three point at the in-cluster Keycloak
+        # Service (plain http, NetworkPolicy-gated), so the validation is skipped.
+        # The ID token signature is still verified against the realm keys.
+        skip_verification: true
+        issuer: {{ printf "https://sso.%s/realms/%s" .Values.domain .Values.oidcRealm | quote }}
+        authorization_endpoint: {{ printf "https://sso.%s/realms/%s/protocol/openid-connect/auth" .Values.domain .Values.oidcRealm | quote }}
+        token_endpoint: {{ printf "%s/realms/%s/protocol/openid-connect/token" .Values.oidcInternalBase .Values.oidcRealm | quote }}
+        jwks_uri: {{ printf "%s/realms/%s/protocol/openid-connect/certs" .Values.oidcInternalBase .Values.oidcRealm | quote }}
+        userinfo_endpoint: {{ printf "%s/realms/%s/protocol/openid-connect/userinfo" .Values.oidcInternalBase .Values.oidcRealm | quote }}
+        client_id: synapse
+        client_secret: "__OIDC_CLIENT_SECRET__"
+        client_auth_method: client_secret_basic
+        scopes: ["openid", "profile", "email", "groups"]
+        allow_existing_users: {{ .Values.oidcAllowExistingUsers | ternary "true" "false" }}
+        user_mapping_provider:
+          config:
+            localpart_template: "{{ "{{ user.preferred_username }}" }}"
+            display_name_template: "{{ "{{ user.name }}" }}"
+        attribute_requirements:
+          - attribute: groups
+            value: lab-users
+    url_preview_enabled: false
+    # With two or three family accounts, the directory finds every account by
+    # name, also without a shared room (the old server did the same).
+    user_directory:
+      enabled: true
+      search_all_users: true
+    federation_domain_whitelist: []
+    federation_ip_range_blacklist:
+      - "0.0.0.0/0"
+      - "::/0"
+    trusted_key_servers: []
+    suppress_key_server_warning: true
+    signing_key_path: /data/signing.key
+    media_store_path: /data/media_store
+    max_upload_size: 50M
+    listeners:
+      - port: 8008
+        tls: false
+        type: http
+        x_forwarded: true
+        resources:
+          - names: [client]
+            compress: false
+    database:
+      name: psycopg2
+      args:
+        user: matrix
+        password: "__DATABASE_PASSWORD__"
+        database: matrix
+        host: "__DATABASE_HOST__"
+        port: 5432
+        cp_min: 1
+        cp_max: 5
+    macaroon_secret_key: "__MACAROON_SECRET__"
+    form_secret: "__FORM_SECRET__"
+    registration_shared_secret: "__REGISTRATION_SECRET__"
+    log_config: /config/log.yaml
+  log.yaml: |
+    version: 1
+    disable_existing_loggers: false
+    formatters:
+      precise:
+        format: "%(asctime)s - %(name)s - %(lineno)d - %(levelname)s - %(message)s"
+    handlers:
+      console:
+        class: logging.StreamHandler
+        formatter: precise
+    loggers:
+      synapse.storage.SQL:
+        level: WARNING
+    root:
+      level: INFO
+      handlers: [console]

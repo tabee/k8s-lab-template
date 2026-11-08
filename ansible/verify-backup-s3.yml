@@ -1,0 +1,503 @@
+---
+# Check stage 8a (backup target rustfs). Usage in the directory ansible/:
+#   ansible-playbook verify-backup-s3.yml -K
+# -K: sudo for "ufw status" on the owner's PC.
+# Writes only test objects under backup_s3_verify_prefix into the buckets
+# backup_s3_bucket and backup_s3_k8up_bucket (stage 8c) and deletes them at the
+# end for good (all versions).
+# The pod test creates the namespace backup_s3_verify_namespace and deletes
+# it again; without the pod test: --skip-tags pod
+# Keys: only under no_log, never in the output.
+
+- name: Check backup host (service, port, ufw, bucket)
+  hosts: backup_host
+  gather_facts: true
+  gather_subset: [min]
+  vars:
+    verify_xdg: { XDG_RUNTIME_DIR: "/run/user/{{ ansible_facts['user_uid'] }}" }
+    verify_helper: "{{ playbook_dir }}/roles/backup_s3/files/rustfs-s3.py"
+    verify_unit: "{{ backup_s3_container_name }}.service"
+    verify_port_rules: "{{ verify_ufw.stdout_lines | select('search', ' ' ~ backup_s3_port ~ '/tcp( |$)') | list }}"
+  tasks:
+    - name: Read service status
+      ansible.builtin.systemd_service:
+        name: "{{ verify_unit }}"
+        scope: user
+      environment: "{{ verify_xdg }}"
+      register: verify_svc
+
+    - name: Read the autostart link of the generated unit
+      ansible.builtin.stat:
+        path: "/run/user/{{ ansible_facts['user_uid'] }}/systemd/generator/default.target.wants/{{ verify_unit }}"
+      register: verify_wants
+
+    - name: Read linger
+      ansible.builtin.stat:
+        path: /var/lib/systemd/linger/{{ ansible_facts['user_id'] }}
+      register: verify_linger
+
+    - name: Service runs, starts at boot (linger + default.target), never gives up
+      ansible.builtin.assert:
+        that:
+          - verify_svc.status.ActiveState == 'active'
+          - verify_svc.status.SubState == 'running'
+          - verify_svc.status.FragmentPath is search('/generator/')
+          - verify_svc.status.StartLimitIntervalUSec in ['0', 'infinity']
+          - verify_wants.stat.exists
+          - verify_linger.stat.exists
+        fail_msg: >-
+          {{ verify_svc.status | dict2items | selectattr('key', 'in', verify_keys) | items2dict }}
+          wants={{ verify_wants.stat.exists }} linger={{ verify_linger.stat.exists }}
+        success_msg: "rustfs active (restarts so far: {{ verify_svc.status.NRestarts | default('?') }}), Autostart + linger ok"
+      vars:
+        verify_keys: [ActiveState, SubState, FragmentPath, StartLimitIntervalUSec, NRestarts]
+
+    - name: Read quadlet file
+      ansible.builtin.slurp:
+        src: "{{ backup_s3_quadlet_dir }}/{{ backup_s3_container_name }}.container"
+      register: verify_quadlet
+
+    - name: Read container state (Image, Health)
+      ansible.builtin.command: >-
+        podman inspect {{ backup_s3_container_name }}
+        --format "{{ '{{' }}.ImageName{{ '}}' }} {{ '{{' }}.State.Health.Status{{ '}}' }}"
+      environment: "{{ verify_xdg }}"
+      register: verify_inspect
+      changed_when: false
+      until: verify_inspect.stdout.split() | last == 'healthy'
+      retries: 12
+      delay: 10
+
+    - name: Pinned image runs, healthcheck healthy, quadlet unchanged
+      ansible.builtin.assert:
+        that:
+          - verify_inspect.stdout.split() | first is search('@' ~ (backup_s3_image.split('@') | last) ~ '$')
+          - ('Image=' ~ backup_s3_image) in (verify_quadlet.content | b64decode)
+          - ('PublishPort=' ~ backup_s3_bind_address ~ ':' ~ backup_s3_port ~ ':9000') in (verify_quadlet.content | b64decode)
+        fail_msg: "{{ verify_inspect.stdout }}"
+        success_msg: "{{ verify_inspect.stdout }}"
+
+    - name: Read open ports
+      ansible.builtin.command: ss -Hltn
+      register: verify_ss
+      changed_when: false
+
+    - name: S3 port listens on all addresses (independent of bridges)
+      ansible.builtin.assert:
+        that:
+          - verify_ss.stdout is search('\s(' ~ (backup_s3_bind_address | regex_escape) ~ '|[*]):' ~ backup_s3_port ~ '\s')
+        fail_msg: "{{ verify_ss.stdout_lines | select('search', ':' ~ backup_s3_port ~ '\\s') | list }}"
+        success_msg: "{{ verify_ss.stdout_lines | select('search', ':' ~ backup_s3_port ~ '\\s') | list }} (ufw limited)"
+
+    - name: External path answers (bridge address, like the VM; not 127.0.0.1)
+      ansible.builtin.uri:
+        url: "{{ backup_s3_probe_url }}"
+        use_proxy: false
+        timeout: 10
+      register: verify_ext
+      retries: 3
+      delay: 5
+      until: verify_ext.status == 200
+
+    - name: Read watchdog timer
+      ansible.builtin.systemd_service:
+        name: rustfs-watchdog.timer
+        scope: user
+      environment: "{{ verify_xdg }}"
+      register: verify_wd
+
+    - name: Read scripts
+      ansible.builtin.stat:
+        path: "{{ backup_s3_script_dir }}/{{ item }}"
+      loop: [rustfs-wait-net.sh, rustfs-watchdog.sh]
+      register: verify_scripts
+
+    - name: Waiting for the network at start and watchdog are set up
+      ansible.builtin.assert:
+        that:
+          - verify_wd.status.ActiveState == 'active'
+          - verify_wd.status.UnitFileState == 'enabled'
+          - verify_scripts.results | map(attribute='stat.executable') | min
+          - ('ExecStartPre=' ~ backup_s3_script_dir ~ '/rustfs-wait-net.sh ' ~ backup_s3_wait_net_timeout) in (verify_quadlet.content | b64decode)
+        fail_msg: >-
+          Timer {{ verify_wd.status.ActiveState }}/{{ verify_wd.status.UnitFileState }},
+          Scripts {{ verify_scripts.results | map(attribute='stat.exists') | list }}
+        success_msg: >-
+          Probe {{ backup_s3_probe_url }} ok; watchdog timer active and enabled;
+          ExecStartPre waits up to {{ backup_s3_wait_net_timeout }} s for the network
+
+    - name: Health and version (local)
+      ansible.builtin.command:
+        argv: ["{{ ansible_playbook_python }}", "{{ verify_helper }}", health,
+               --endpoint, "http://127.0.0.1:{{ backup_s3_port }}", --version, "{{ backup_s3_version }}"]
+      register: verify_health
+      changed_when: false
+      failed_when: verify_health.rc != 0
+
+    - name: Read ufw rules (sudo)
+      ansible.builtin.command: /usr/sbin/ufw status numbered
+      become: true
+      register: verify_ufw
+      changed_when: false
+
+    - name: Check ufw - active, allowed sources before the block, no foreign allow rule
+      ansible.builtin.assert:
+        that:
+          - "'Status: active' in verify_ufw.stdout"
+          - verify_deny_nr | length >= 1
+          - verify_present | reject('in', verify_allow_src) | list | length == 0
+          - verify_absent | select('in', verify_allow_src) | list | length == 0
+          - verify_allow_src | reject('in', verify_present) | list | length == 0
+          - verify_allow_nr | select('gt', verify_deny_nr | min) | list | length == 0
+        fail_msg: "ufw rules for {{ backup_s3_port }}/tcp: {{ verify_port_rules }}"
+        success_msg: "ufw ok: {{ verify_port_rules }}"
+      vars:
+        verify_rules: >-
+          {{ backup_s3_ufw_sources
+             + (backup_s3_wireguard_cidrs | map('community.general.dict_kv', 'cidr') | map('combine', {'state': 'present'}) | list) }}
+        verify_present: "{{ verify_rules | rejectattr('state', 'eq', 'absent') | map(attribute='cidr') | list }}"
+        verify_absent: "{{ verify_rules | selectattr('state', 'eq', 'absent') | map(attribute='cidr') | list }}"
+        verify_allow: "{{ verify_port_rules | select('search', 'ALLOW IN') | list }}"
+        verify_allow_src: "{{ verify_allow | map('regex_replace', '^.*ALLOW IN\\s+(\\S+).*$', '\\1') | list }}"
+        verify_allow_nr: "{{ verify_allow | map('regex_replace', '^\\[\\s*(\\d+)\\].*$', '\\1') | map('int') | list }}"
+        verify_deny_nr: >-
+          {{ verify_port_rules | select('search', 'DENY IN\s+Anywhere') | reject('search', '\(v6\)')
+             | map('regex_replace', '^\[\s*(\d+)\].*$', '\1') | map('int') | list }}
+
+    - name: Check ufw - no legacy rules (e.g. minikube network {{ backup_s3_ufw_purge_cidrs | join(', ') }})
+      ansible.builtin.assert:
+        that:
+          - verify_legacy | length == 0
+        fail_msg: "Still there (stage 8a deletes them, run the role again): {{ verify_legacy }}"
+        success_msg: "no ufw rule for {{ backup_s3_ufw_purge_cidrs | join(', ') }} and none with comment ~ {{ backup_s3_ufw_purge_comment_regex }}"
+      vars:
+        verify_rules: "{{ verify_ufw.stdout_lines | select('match', '^\\[') | list }}"
+        verify_legacy: >-
+          {{ verify_rules | select('search', '(^|\s)(' ~ (backup_s3_ufw_purge_cidrs | map('regex_escape') | join('|')) ~ ')(\s|$)') | list
+             + (verify_rules | select('search', ' # ') | select('search', backup_s3_ufw_purge_comment_regex) | list) }}
+
+    - name: Read key files (permissions only)
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        get_checksum: false
+      loop: ["{{ backup_s3_root_env }}", "{{ backup_s3_user_env }}", "{{ backup_s3_k8up_user_env }}"]
+      register: verify_envs
+
+    - name: Key files are 0600 and belong to the owner
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+          - item.stat.mode == '0600'
+          - item.stat.pw_name == ansible_facts['user_id']
+        fail_msg: "{{ item.item }}: {{ item.stat.mode | default('missing') }}"
+        quiet: true
+      loop: "{{ verify_envs.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Bucket, versioning, policy, user as configured (check only)
+      ansible.builtin.command:
+        argv: >-
+          {{ [ansible_playbook_python, verify_helper, 'ensure', '--check',
+              '--endpoint', 'http://127.0.0.1:' ~ backup_s3_port,
+              '--root-env', backup_s3_root_env, '--user-env', backup_s3_user_env,
+              '--bucket', backup_s3_bucket, '--policy', backup_s3_policy_name,
+              '--policy-json', backup_s3_policy | to_json,
+              '--versioning', 'on' if backup_s3_versioning else 'off',
+              '--noncurrent-days', backup_s3_noncurrent_days | string] }}
+      register: verify_ensure
+      changed_when: false
+      failed_when: verify_ensure.rc != 0 or (verify_ensure.stdout | from_json).changed
+
+    - name: K8up bucket, versioning, policy, user as configured (stage 8c, check only)
+      ansible.builtin.command:
+        argv: >-
+          {{ [ansible_playbook_python, verify_helper, 'ensure', '--check',
+              '--endpoint', 'http://127.0.0.1:' ~ backup_s3_port,
+              '--root-env', backup_s3_root_env, '--user-env', backup_s3_k8up_user_env,
+              '--bucket', backup_s3_k8up_bucket, '--policy', backup_s3_k8up_policy_name,
+              '--policy-json', backup_s3_k8up_policy | to_json,
+              '--versioning', 'on' if backup_s3_versioning else 'off',
+              '--noncurrent-days', backup_s3_noncurrent_days | string] }}
+      register: verify_k8up_ensure
+      changed_when: false
+      failed_when: verify_k8up_ensure.rc != 0 or (verify_k8up_ensure.stdout | from_json).changed
+
+    - name: Read VM autostart
+      ansible.builtin.command: virsh -c {{ backup_s3_libvirt_uri }} dominfo {{ backup_s3_vm_name }}
+      environment:
+        LC_ALL: C
+      register: verify_dominfo
+      changed_when: false
+      failed_when: (backup_s3_vm_autostart | bool) and verify_dominfo.rc != 0
+
+    - name: VM autostart is on (if backup_s3_vm_autostart, otherwise a note only)
+      ansible.builtin.assert:
+        that:
+          - not (backup_s3_vm_autostart | bool) or verify_dominfo.stdout is search('(?m)^Autostart:\s+enable')
+        fail_msg: >-
+          backup_s3_vm_autostart is true, but virsh -c {{ backup_s3_libvirt_uri }} dominfo {{ backup_s3_vm_name }} reports:
+          {{ verify_dominfo.stdout_lines | select('match', 'Autostart') | list }}
+        success_msg: >-
+          VM {{ backup_s3_vm_name }}:
+          {{ verify_dominfo.stdout_lines | select('match', 'Autostart') | list | first | default('virsh not readable') }}
+
+    - name: Read VM network (autostart)
+      ansible.builtin.command: virsh -c {{ backup_s3_libvirt_uri }} net-info {{ backup_s3_vm_network }}
+      environment:
+        LC_ALL: C
+      register: verify_netinfo
+      changed_when: false
+      failed_when: (backup_s3_vm_autostart | bool) and verify_netinfo.rc != 0
+
+    - name: VM network starts with libvirt (if backup_s3_vm_autostart)
+      ansible.builtin.assert:
+        that:
+          - not (backup_s3_vm_autostart | bool) or verify_netinfo.stdout is search('(?m)^Autostart:\s+yes')
+        fail_msg: "Network {{ backup_s3_vm_network }}: {{ verify_netinfo.stdout_lines | select('match', 'Autostart') | list }}"
+        success_msg: >-
+          Network {{ backup_s3_vm_network }}:
+          {{ verify_netinfo.stdout_lines | select('match', 'Autostart') | list | first | default('virsh not readable') }}
+
+- name: Check from the VM (health, roundtrip, foreign buckets blocked)
+  hosts: k3s
+  gather_facts: false
+  vars:
+    verify_user_env: "{{ lookup('ansible.builtin.file', backup_s3_user_env) }}"
+    verify_k8up_env: "{{ lookup('ansible.builtin.file', backup_s3_k8up_user_env) }}"
+  tasks:
+    - name: Health and version from the VM ({{ backup_s3_vm_endpoint }})
+      ansible.builtin.script:
+        cmd: >-
+          {{ playbook_dir }}/roles/backup_s3/files/rustfs-s3.py health
+          --endpoint {{ backup_s3_vm_endpoint }} --version {{ backup_s3_version }}
+        executable: python3
+      register: verify_vm_health
+      changed_when: false
+
+    - name: S3 roundtrip with the bucket key (output follows)
+      ansible.builtin.script:
+        cmd: >-
+          {{ playbook_dir }}/roles/backup_s3/files/rustfs-s3.py roundtrip
+          --endpoint {{ backup_s3_vm_endpoint }} --bucket {{ backup_s3_bucket }}
+          --prefix {{ backup_s3_verify_prefix }}
+          {{ (backup_s3_foreign_buckets + [backup_s3_k8up_bucket]) | map('regex_replace', '^', '--deny ') | join(' ') }}
+        executable: python3
+      environment:
+        S3_ACCESS_KEY_ID: "{{ verify_user_env | regex_search('(?m)^ACCESS_KEY_ID=(.*)$', '\\1') | first }}"
+        S3_SECRET_ACCESS_KEY: "{{ verify_user_env | regex_search('(?m)^ACCESS_SECRET_KEY=(.*)$', '\\1') | first }}"
+      register: verify_vm_rt
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Roundtrip result (without key)
+      ansible.builtin.assert:
+        that:
+          - verify_vm_rt.rc == 0
+          - (verify_vm_rt.stdout | from_json).ok
+        fail_msg: "{{ verify_vm_rt.stdout | default('no output') }}"
+        success_msg: "{{ (verify_vm_rt.stdout | from_json).actions }}"
+
+    - name: S3 roundtrip with the K8up key (stage 8c, output follows)
+      ansible.builtin.script:
+        cmd: >-
+          {{ playbook_dir }}/roles/backup_s3/files/rustfs-s3.py roundtrip
+          --endpoint {{ backup_s3_vm_endpoint }} --bucket {{ backup_s3_k8up_bucket }}
+          --prefix {{ backup_s3_verify_prefix }}
+          {{ (backup_s3_foreign_buckets + [backup_s3_bucket]) | map('regex_replace', '^', '--deny ') | join(' ') }}
+        executable: python3
+      environment:
+        S3_ACCESS_KEY_ID: "{{ verify_k8up_env | regex_search('(?m)^ACCESS_KEY_ID=(.*)$', '\\1') | first }}"
+        S3_SECRET_ACCESS_KEY: "{{ verify_k8up_env | regex_search('(?m)^ACCESS_SECRET_KEY=(.*)$', '\\1') | first }}"
+      register: verify_vm_rt_k8up
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Roundtrip result K8up (without key)
+      ansible.builtin.assert:
+        that:
+          - verify_vm_rt_k8up.rc == 0
+          - (verify_vm_rt_k8up.stdout | from_json).ok
+        fail_msg: "{{ verify_vm_rt_k8up.stdout | default('no output') }}"
+        success_msg: "{{ (verify_vm_rt_k8up.stdout | from_json).actions }}"
+
+    - name: Read firewall chains of the VM (sudo)
+      ansible.builtin.command: nft -j list chains
+      become: true
+      register: verify_vm_chains
+      changed_when: false
+
+    - name: Note on the outgoing firewall of the VM (the roundtrip above is the actual test)
+      ansible.builtin.debug:
+        msg: >-
+          {{ ('Attention: IPv4 chains with an outgoing default block: ' ~ (verify_out_drop | join(', '))
+              ~ '. Port ' ~ backup_s3_port ~ ' is free today (roundtrip ok), keep it in mind for firewall changes in the VM.')
+             if verify_out_drop | length > 0
+             else 'No outgoing default block in the VM, port ' ~ backup_s3_port ~ ' free' }}
+      vars:
+        verify_out_drop: >-
+          {{ (verify_vm_chains.stdout | from_json).nftables | selectattr('chain', 'defined') | map(attribute='chain')
+             | selectattr('family', 'in', ['ip', 'inet']) | selectattr('hook', 'defined') | selectattr('hook', 'eq', 'output')
+             | selectattr('policy', 'defined') | selectattr('policy', 'eq', 'drop')
+             | map(attribute='name') | list }}
+
+- name: Check from a pod (like CNPG later)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tags: [pod]
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: "{{ argocd_kubeconfig }}"
+  vars:
+    verify_user_env: "{{ lookup('ansible.builtin.file', backup_s3_user_env) }}"
+    verify_ns: "{{ backup_s3_verify_namespace }}"
+    verify_script: |
+      set -eu
+      T="--connect-timeout 5 --max-time 20"
+      s3() { curl -fsS $T --aws-sigv4 aws:amz:us-east-1:s3 -u "$S3_ACCESS_KEY_ID:$S3_SECRET_ACCESS_KEY" "$@"; }
+      K="${PREFIX}pod-$(hostname).txt"
+      curl -fsS $T -o /dev/null "$EP/health" && echo "OK health $EP"
+      s3 -o /dev/null -X PUT --data-binary "stage8a $K" "$EP/$BUCKET/$K" && echo "OK PUT $BUCKET/$K"
+      test "$(s3 "$EP/$BUCKET/$K")" = "stage8a $K" && echo "OK GET"
+      s3 -o /dev/null -X DELETE "$EP/$BUCKET/$K" && echo "OK DELETE"
+      for d in $DENY; do
+        c=$(curl -sS $T -o /dev/null -w '%{http_code}' --aws-sigv4 aws:amz:us-east-1:s3 -u "$S3_ACCESS_KEY_ID:$S3_SECRET_ACCESS_KEY" "$EP/$d/?list-type=2")
+        if [ "$c" = 403 ]; then echo "OK $d blocked (403)"; else echo "ERROR $d: HTTP $c"; exit 1; fi
+      done
+      echo DONE
+  tasks:
+    - name: Pod-Test
+      block:
+        - name: Wegwerf-Namespace (PSA restricted)
+          kubernetes.core.k8s:
+            definition:
+              apiVersion: v1
+              kind: Namespace
+              metadata:
+                name: "{{ verify_ns }}"
+                labels:
+                  pod-security.kubernetes.io/enforce: restricted
+                  pod-security.kubernetes.io/enforce-version: latest
+
+        - name: Secret with the bucket key (like later in stage 8b)
+          kubernetes.core.k8s:
+            definition:
+              apiVersion: v1
+              kind: Secret
+              metadata:
+                name: s3-verify
+                namespace: "{{ verify_ns }}"
+              type: Opaque
+              stringData:
+                ACCESS_KEY_ID: "{{ verify_user_env | regex_search('(?m)^ACCESS_KEY_ID=(.*)$', '\\1') | first }}"
+                ACCESS_SECRET_KEY: "{{ verify_user_env | regex_search('(?m)^ACCESS_SECRET_KEY=(.*)$', '\\1') | first }}"
+          no_log: true
+
+        - name: Start test pod
+          kubernetes.core.k8s:
+            definition:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                name: s3-verify
+                namespace: "{{ verify_ns }}"
+              spec:
+                restartPolicy: Never
+                automountServiceAccountToken: false
+                securityContext:
+                  runAsNonRoot: true
+                  runAsUser: 100
+                  runAsGroup: 101
+                  seccompProfile: { type: RuntimeDefault }
+                containers:
+                  - name: s3
+                    image: "{{ backup_s3_verify_image }}"
+                    command: [/bin/sh, -c, "{{ verify_script }}"]
+                    env:
+                      - { name: EP, value: "{{ backup_s3_vm_endpoint }}" }
+                      - { name: BUCKET, value: "{{ backup_s3_bucket }}" }
+                      - { name: PREFIX, value: "{{ backup_s3_verify_prefix }}" }
+                      - { name: DENY, value: "{{ backup_s3_foreign_buckets | join(' ') }}" }
+                      - name: S3_ACCESS_KEY_ID
+                        valueFrom: { secretKeyRef: { name: s3-verify, key: ACCESS_KEY_ID } }
+                      - name: S3_SECRET_ACCESS_KEY
+                        valueFrom: { secretKeyRef: { name: s3-verify, key: ACCESS_SECRET_KEY } }
+                    securityContext:
+                      allowPrivilegeEscalation: false
+                      readOnlyRootFilesystem: true
+                      capabilities: { drop: [ALL] }
+                    resources:
+                      requests: { cpu: 10m, memory: 16Mi }
+                      limits: { memory: 64Mi }
+
+        - name: Wait until the pod is done
+          kubernetes.core.k8s_info:
+            kind: Pod
+            namespace: "{{ verify_ns }}"
+            name: s3-verify
+          register: verify_pod
+          until: >-
+            (verify_pod.resources | first).status.phase | default('') in ['Succeeded', 'Failed']
+            or verify_pod_waiting | length > 0
+          retries: 36
+          delay: 5
+          vars:
+            verify_pod_waiting: &verify_pod_waiting >-
+              {{ (verify_pod.resources | first).status.containerStatuses | default([])
+                 | selectattr('state.waiting', 'defined') | map(attribute='state.waiting')
+                 | selectattr('reason', 'in', ['ImagePullBackOff', 'CreateContainerConfigError'])
+                 | map(attribute='message', default='') | list }}
+
+        - name: Pod has started (image, secret)
+          ansible.builtin.assert:
+            that:
+              - verify_pod_waiting | length == 0
+            fail_msg: "Pod does not start: {{ verify_pod_waiting }}"
+            quiet: true
+          vars:
+            verify_pod_waiting: *verify_pod_waiting
+
+        - name: Read pod log
+          kubernetes.core.k8s_log:
+            namespace: "{{ verify_ns }}"
+            name: s3-verify
+          register: verify_pod_log
+
+        - name: Pod reaches rustfs, roundtrip ok, foreign buckets blocked
+          ansible.builtin.assert:
+            that:
+              - (verify_pod.resources | first).status.phase == 'Succeeded'
+              - "'DONE' in verify_pod_log.log_lines"
+            fail_msg: "{{ verify_pod_log.log_lines }}"
+            success_msg: "{{ verify_pod_log.log_lines }}"
+      always:
+        - name: Delete throwaway namespace
+          kubernetes.core.k8s:
+            api_version: v1
+            kind: Namespace
+            name: "{{ verify_ns }}"
+            state: absent
+            wait: true
+            wait_timeout: 120
+
+- name: Delete test objects for good (all versions, as root)
+  hosts: backup_host
+  gather_facts: false
+  tags: [always]
+  tasks:
+    - name: Delete all versions of the test objects (CNPG and K8up bucket)
+      ansible.builtin.command:
+        argv: ["{{ ansible_playbook_python }}", "{{ playbook_dir }}/roles/backup_s3/files/rustfs-s3.py", purge,
+               --endpoint, "http://127.0.0.1:{{ backup_s3_port }}", --root-env, "{{ backup_s3_root_env }}",
+               --bucket, "{{ item }}", --prefix, "{{ backup_s3_verify_prefix }}"]
+      loop: ["{{ backup_s3_bucket }}", "{{ backup_s3_k8up_bucket }}"]
+      register: verify_purge
+      changed_when: false
+      failed_when: verify_purge.rc != 0
+
+    - name: Cleaned up
+      ansible.builtin.debug:
+        msg: "{{ verify_purge.results | map(attribute='stdout') | map('from_json') | map(attribute='message') | list }}"

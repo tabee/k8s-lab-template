@@ -1,0 +1,205 @@
+---
+# Incoming in the namespace gitea first everything closed, then open selectively:
+#   - Pods in the same namespace among each other (Gitea -> pooler -> Postgres,
+#     replication, backup pods of K8up),
+#   - the CNPG operator to the instances (status 8000, Postgres 5432),
+#   - Traefik to Gitea (port 3000).
+# Outgoing (wave 2, issue 5): likewise first everything closed, then open selectively; see the
+# egress policies at the end of the file (DNS, namespace, Postgres/K8up -> API and S3).
+# As in db-lab (stage 8b) k3s enforces the rules via kube-router.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: gitea
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-same-namespace
+  namespace: gitea
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector: {}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-cnpg-operator
+  namespace: gitea
+spec:
+  # All pods: also a rebuild with a different name (gitea-db-2, see
+  # docs/how-to/troubleshooting.md) needs the operator.
+  podSelector: {}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: cnpg-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: cloudnative-pg
+      ports:
+        - protocol: TCP
+          port: 8000
+        - protocol: TCP
+          port: 5432
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gitea-allow-traefik
+  namespace: gitea
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: gitea
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: traefik
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: traefik
+      ports:
+        - protocol: TCP
+          port: 3000
+---
+# Egress (wave 2, issue #5): nothing leaves a pod unless a policy below allows it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-egress
+  namespace: gitea
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+---
+# DNS: only the cluster DNS pods.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-dns
+  namespace: gitea
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+# Inside the namespace: Gitea/Pooler -> Postgres, replication.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-same-namespace
+  namespace: gitea
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector: {}
+---
+# Postgres instance, backup and initdb pods (label cnpg.io/cluster): API server (Cluster status,
+# leader lease; rule is evaluated after DNAT, so node IP:6443) and S3 of the backup target
+# (barman-cloud plugin: WAL archive, base backup, restore). Nothing else.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-cnpg-api-s3
+  namespace: gitea
+spec:
+  podSelector:
+    matchExpressions:
+      - key: cnpg.io/cluster
+        operator: Exists
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 192.168.122.50/32
+      ports:
+        - protocol: TCP
+          port: 6443
+    - to:
+        - ipBlock:
+            cidr: 192.168.122.1/32
+      ports:
+        - protocol: TCP
+          port: 9000
+---
+# Pooler pods read their Pooler/Secret objects from the API server. No S3.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-pooler-api
+  namespace: gitea
+spec:
+  podSelector:
+    matchExpressions:
+      - key: cnpg.io/poolerName
+        operator: Exists
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 192.168.122.50/32
+      ports:
+        - protocol: TCP
+          port: 6443
+---
+# K8up backup/restore job pods (label k8upjob): API server (Snapshot objects) and S3 of the backup
+# target (restic). Nothing else.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-k8up
+  namespace: gitea
+spec:
+  podSelector:
+    matchLabels:
+      k8upjob: "true"
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 192.168.122.50/32
+      ports:
+        - protocol: TCP
+          port: 6443
+    - to:
+        - ipBlock:
+            cidr: 192.168.122.1/32
+      ports:
+        - protocol: TCP
+          port: 9000

@@ -1,0 +1,416 @@
+---
+# Check Keycloak (single sign-on for Gitea and Matrix): realm, OIDC discovery,
+# admin console closed, backups.
+# Usage (from ansible/):
+#   ansible-playbook verify-keycloak.yml                 everything
+#   ansible-playbook verify-keycloak.yml --tags repo     repo only, without a cluster
+#   ansible-playbook verify-keycloak.yml --tags repo,cluster
+# Prerequisite: argocd.yml has run and the state is on the branch Argo CD reads.
+#
+# Names come from the manifests under gitops/workloads/keycloak and the chart
+# gitops/charts/keycloak. The bucket and endpoint come from backup_s3.yml.
+# Keycloak has no volume: all its state is in the database keycloak-db, so
+# there is no K8up check (ADR-0019).
+#
+# Cluster proof: Keycloak and the realm job are done, the discovery document of
+# the realm answers through Traefik with the public issuer, the admin console
+# and the master realm do NOT answer through the public name, the login page
+# offers no registration, and Gitea knows the authentication source keycloak.
+# Nothing secret is printed.
+
+- name: Check Keycloak
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: "{{ argocd_kubeconfig }}"
+  vars:
+    verify_retries: 60
+    verify_delay: 10
+    verify_repo: "{{ playbook_dir }}/.."
+    verify_wl: "{{ verify_repo }}/gitops/workloads/keycloak"
+    verify_mf: "{{ verify_wl }}/manifests"
+    verify_chart: "{{ verify_repo }}/gitops/charts/keycloak"
+    verify_k3s_host: "{{ groups['k3s'] | first }}"
+    verify_lb_ip: "{{ hostvars[verify_k3s_host]['ansible_host'] }}"
+    verify_k_cluster: "{{ lookup('ansible.builtin.file', verify_mf ~ '/cluster.yaml') | from_yaml }}"
+    verify_k_os: "{{ lookup('ansible.builtin.file', verify_mf ~ '/objectstore.yaml') | from_yaml }}"
+    verify_k_sb: "{{ lookup('ansible.builtin.file', verify_mf ~ '/scheduledbackup.yaml') | from_yaml }}"
+    verify_k_cert: "{{ lookup('ansible.builtin.file', verify_mf ~ '/certificate.yaml') | from_yaml }}"
+    verify_k_ns: "{{ lookup('ansible.builtin.file', verify_mf ~ '/namespace.yaml') | from_yaml }}"
+    verify_k_dep: "{{ lookup('ansible.builtin.file', verify_mf ~ '/deployment.yaml') | from_yaml }}"
+    verify_k_job: "{{ lookup('ansible.builtin.file', verify_mf ~ '/job-config.yaml') | from_yaml }}"
+    verify_k_values: "{{ lookup('ansible.builtin.file', verify_chart ~ '/values.yaml') | from_yaml }}"
+    verify_k_app: "{{ lookup('ansible.builtin.file', verify_repo ~ '/gitops/apps/keycloak.yaml') | from_yaml }}"
+    verify_k_app_sec: "{{ lookup('ansible.builtin.file', verify_repo ~ '/gitops/apps/secrets-keycloak.yaml') | from_yaml }}"
+    verify_k_route: "{{ lookup('ansible.builtin.file', verify_mf ~ '/ingressroute.yaml') | from_yaml }}"
+    verify_dep_text: "{{ lookup('ansible.builtin.file', verify_mf ~ '/deployment.yaml') }}"
+    verify_job_text: "{{ lookup('ansible.builtin.file', verify_mf ~ '/job-config.yaml') }}"
+    verify_netpol_text: "{{ lookup('ansible.builtin.file', verify_mf ~ '/networkpolicy.yaml') }}"
+    verify_realm_text: "{{ lookup('ansible.builtin.file', verify_chart ~ '/templates/configmap-realm.yaml') }}"
+    verify_gitea_values: "{{ lookup('ansible.builtin.file', verify_repo ~ '/gitops/workloads/gitea/values-gitea.yaml') | from_yaml }}"
+    verify_matrix_hs: "{{ lookup('ansible.builtin.file', verify_repo ~ '/gitops/charts/matrix/templates/configmap-homeserver.yaml') }}"
+    verify_matrix_values: "{{ lookup('ansible.builtin.file', verify_repo ~ '/gitops/charts/matrix/values.yaml') | from_yaml }}"
+    verify_other_schedules:
+      - "{{ lookup('ansible.builtin.file', verify_repo ~ '/gitops/workloads/gitea/manifests/scheduledbackup.yaml') | from_yaml }}"
+      - "{{ lookup('ansible.builtin.file', verify_repo ~ '/gitops/workloads/matrix/manifests/scheduledbackup.yaml') | from_yaml }}"
+      - "{{ lookup('ansible.builtin.file', verify_repo ~ '/gitops/workloads/db-lab/scheduledbackup.yaml') | from_yaml }}"
+    verify_ns: "{{ verify_k_cluster.metadata.namespace }}"
+    verify_cluster: "{{ verify_k_cluster.metadata.name }}"
+    verify_boot: "{{ verify_k_cluster.spec.bootstrap.initdb | default(verify_k_cluster.spec.bootstrap.recovery) }}"
+    verify_realm: "{{ verify_k_values.realm }}"
+    verify_host: "sso.{{ lab.domain }}"
+    verify_issuer: "https://{{ verify_host }}/realms/{{ verify_realm }}"
+    verify_curl_base:
+      - curl
+      - --silent
+      - --show-error
+      - --max-time
+      - "20"
+      - --cacert
+      - "{{ lab_ca_cert_path | expanduser }}"
+      - --write-out
+      - "\n%{http_code}"
+    verify_connect: "{{ verify_host }}:443:{{ verify_lb_ip }}:443"
+    verify_db_env: "{{ verify_k_dep.spec.template.spec.containers[0].env }}"
+    verify_kc_hostname_admin: "{{ verify_db_env | selectattr('name', 'equalto', 'KC_HOSTNAME_ADMIN') | map(attribute='value') | first }}"
+  tasks:
+    # ================= Repo (without cluster) =================
+    - name: Check repo
+      tags: [repo]
+      block:
+        - name: Realm name, public host and the in-cluster endpoints agree
+          ansible.builtin.assert:
+            that:
+              - verify_k_values.domain == lab.domain
+              - verify_k_cert.spec.dnsNames == [verify_host]
+              - "'/realms/' ~ verify_realm ~ '/' in verify_k_route.spec.routes[0].match"
+              - verify_host in verify_k_route.spec.routes[0].match
+              - verify_k_route.spec.routes | length == 1
+              - "'/admin' not in verify_k_route.spec.routes[0].match"
+              - "'/realms/master' not in verify_k_route.spec.routes[0].match"
+              - verify_gitea_values.postExtraInitContainers[0].args[0] is search('/realms/' ~ verify_realm ~ '/.well-known/openid-configuration')
+              - verify_gitea_values.postExtraInitContainers[0].args[0] is search('--required-claim-value lab-users')
+              - verify_gitea_values.gitea.oauth is not defined
+              - verify_matrix_values.oidcRealm == verify_realm
+              - "'sso.' in verify_matrix_hs"
+              - "'.Values.oidcDisplayName' in verify_matrix_hs"
+              - "'attribute_requirements' in verify_matrix_hs"
+              - "'.Values.realm' in verify_realm_text"
+              - verify_k_values.adminUrl == verify_kc_hostname_admin
+              - "'.Values.adminUrl' in verify_realm_text"
+              - verify_job_text is search('/config/realm.json,/config/realm-master.json')
+              - "'\"registrationAllowed\": false' in verify_realm_text"
+            fail_msg: >-
+              Keycloak realm name, host or route drifted. Realm {{ verify_realm }}, host {{ verify_host }},
+              route {{ verify_k_route.spec.routes[0].match }}.
+            success_msg: "realm {{ verify_realm }} at {{ verify_host }}, only the realm is routed, registration off"
+
+        - name: Images are pinned, the user is fixed, the database names match
+          ansible.builtin.assert:
+            that:
+              - "'@sha256:' in verify_dep_text"
+              - "'@sha256:' in verify_job_text"
+              - verify_k_dep.spec.template.spec.securityContext.runAsNonRoot | bool
+              - verify_k_dep.spec.template.spec.containers[0].securityContext.readOnlyRootFilesystem | bool
+              - verify_k_dep.spec.template.spec.containers[0].securityContext.allowPrivilegeEscalation | bool == false
+              - verify_k_job.spec.template.spec.securityContext.runAsNonRoot | bool
+              - verify_k_job.metadata.annotations['argocd.argoproj.io/hook'] == 'PostSync'
+              - verify_db_env | selectattr('name', 'equalto', 'KC_DB_URL_DATABASE') | map(attribute='value') | first == verify_boot.database
+              - verify_db_env | selectattr('name', 'equalto', 'KC_DB_URL_HOST') | map(attribute='value') | first
+                == verify_cluster ~ '-rw.' ~ verify_ns ~ '.svc'
+              - verify_k_cluster.spec.plugins[0].enabled | bool
+              - verify_k_cluster.spec.enableSuperuserAccess | bool == false
+              - verify_k_cluster.spec.bootstrap.initdb is defined
+              - verify_k_cluster.spec.bootstrap.recovery is not defined
+            fail_msg: "Keycloak image pin, user, hardening or database names drifted."
+            success_msg: "Keycloak pinned, read-only root, database {{ verify_boot.database }} on {{ verify_cluster }}-rw"
+
+        - name: Backup copies, schedule, NetworkPolicy and revision
+          ansible.builtin.assert:
+            that:
+              - verify_k_os.spec.configuration.endpointURL == backup_s3_vm_endpoint
+              - verify_k_os.spec.configuration.destinationPath == 's3://' ~ backup_s3_bucket ~ '/' ~ verify_ns
+              - verify_k_os.spec.retentionPolicy == '14d'
+              - verify_k_sb.spec.cluster.name == verify_cluster
+              - verify_k_sb.spec.schedule not in (verify_other_schedules | map(attribute='spec.schedule') | list)
+              - "'0.0.0.0/0' not in verify_netpol_text"
+              - verify_k_ns.metadata.labels['pod-security.kubernetes.io/enforce'] == 'restricted'
+              - verify_k_app.spec.sources | map(attribute='targetRevision') | unique | list == [argocd_repo_revision]
+              - verify_k_app_sec.spec.source.targetRevision == argocd_repo_revision
+            fail_msg: >-
+              Backup copy or policy drifted. CNPG {{ verify_k_os.spec.configuration.destinationPath }}
+              (expected s3://{{ backup_s3_bucket }}/{{ verify_ns }}).
+            success_msg: "CNPG prefix {{ verify_ns }}, retention 14d, own backup time, no 0.0.0.0/0"
+
+    # ================= Cluster =================
+    - name: Read Argo CD applications
+      kubernetes.core.k8s_info:
+        api_version: argoproj.io/v1alpha1
+        kind: Application
+        namespace: "{{ argocd_namespace }}"
+        name: "{{ item }}"
+      register: verify_app_info
+      until: >-
+        verify_app_info.resources | length == 1 and
+        (verify_app_info.resources | first).status.sync.status | default('') == 'Synced' and
+        (verify_app_info.resources | first).status.health.status | default('') == 'Healthy'
+      retries: "{{ verify_retries }}"
+      delay: "{{ verify_delay }}"
+      failed_when: false
+      loop:
+        - "{{ verify_k_app_sec.metadata.name }}"
+        - "{{ verify_k_app.metadata.name }}"
+      tags: [cluster]
+
+    - name: Applications are Synced and Healthy
+      ansible.builtin.assert:
+        that:
+          - item.resources | default([]) | length == 1
+          - (item.resources | first).status.sync.status | default('') == 'Synced'
+          - (item.resources | first).status.health.status | default('') == 'Healthy'
+        fail_msg: "Application {{ item.item }} is not Synced and Healthy."
+        success_msg: "{{ item.item }} Synced and Healthy"
+      loop: "{{ verify_app_info.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      tags: [cluster]
+
+    - name: Read the namespace
+      kubernetes.core.k8s_info:
+        kind: Namespace
+        name: "{{ verify_ns }}"
+      register: verify_ns_info
+      tags: [cluster]
+
+    - name: Namespace enforces restricted Pod Security
+      ansible.builtin.assert:
+        that:
+          - (verify_ns_info.resources | first).metadata.labels['pod-security.kubernetes.io/enforce'] == 'restricted'
+        fail_msg: "Namespace {{ verify_ns }} does not enforce restricted."
+        success_msg: "{{ verify_ns }} PSA restricted"
+      tags: [cluster]
+
+    - name: Read database keycloak-db
+      kubernetes.core.k8s_info:
+        api_version: postgresql.cnpg.io/v1
+        kind: Cluster
+        namespace: "{{ verify_ns }}"
+        name: "{{ verify_cluster }}"
+      register: verify_cl
+      until: (verify_cl.resources | first).status.phase | default('') == 'Cluster in healthy state'
+      retries: "{{ verify_retries }}"
+      delay: "{{ verify_delay }}"
+      tags: [cluster]
+
+    - name: Database is healthy
+      ansible.builtin.assert:
+        that:
+          - (verify_cl.resources | first).status.phase == 'Cluster in healthy state'
+        fail_msg: "{{ verify_cluster }} is not healthy."
+        success_msg: "{{ verify_cluster }} healthy"
+      tags: [cluster]
+
+    - name: Wait until a completed database backup exists
+      kubernetes.core.k8s_info:
+        api_version: postgresql.cnpg.io/v1
+        kind: Backup
+        namespace: "{{ verify_ns }}"
+      register: verify_cnpg_bk
+      until: >-
+        verify_cnpg_bk.resources
+        | selectattr('spec.cluster.name', 'equalto', verify_cluster)
+        | selectattr('status.phase', 'defined')
+        | selectattr('status.phase', 'equalto', 'completed')
+        | list | length > 0
+      retries: 90
+      delay: 10
+      tags: [cluster]
+
+    - name: A completed database backup exists
+      ansible.builtin.assert:
+        that: >-
+          verify_cnpg_bk.resources
+          | selectattr('spec.cluster.name', 'equalto', verify_cluster)
+          | selectattr('status.phase', 'defined')
+          | selectattr('status.phase', 'equalto', 'completed')
+          | list | length > 0
+        fail_msg: "No completed CNPG backup of {{ verify_cluster }} yet."
+        success_msg: "CNPG backup of {{ verify_cluster }} completed"
+      tags: [cluster]
+
+    - name: Wait until Keycloak is ready
+      kubernetes.core.k8s_info:
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ verify_ns }}"
+        name: "{{ verify_k_dep.metadata.name }}"
+      register: verify_dep
+      until: (verify_dep.resources | first).status.readyReplicas | default(0) | int >= 1
+      retries: "{{ verify_retries }}"
+      delay: "{{ verify_delay }}"
+      tags: [cluster]
+
+    - name: Read the realm job
+      kubernetes.core.k8s_info:
+        api_version: batch/v1
+        kind: Job
+        namespace: "{{ verify_ns }}"
+        name: "{{ verify_k_job.metadata.name }}"
+      register: verify_job
+      until: (verify_job.resources | first).status.succeeded | default(0) | int >= 1
+      retries: "{{ verify_retries }}"
+      delay: "{{ verify_delay }}"
+      tags: [cluster]
+
+    - name: The realm job has applied the realm
+      ansible.builtin.assert:
+        that:
+          - (verify_job.resources | first).status.succeeded | default(0) | int >= 1
+        fail_msg: "Job {{ verify_k_job.metadata.name }} has not succeeded (kubectl -n {{ verify_ns }} logs job/{{ verify_k_job.metadata.name }})."
+        success_msg: "realm job succeeded"
+      tags: [cluster]
+
+    - name: Find the Keycloak pod
+      kubernetes.core.k8s_info:
+        kind: Pod
+        namespace: "{{ verify_ns }}"
+        label_selectors:
+          - app.kubernetes.io/name={{ verify_k_dep.metadata.name }}
+      register: verify_kc_pods
+      tags: [cluster]
+
+    - name: Ask the master realm for its issuer over the admin address (port-forward path)
+      kubernetes.core.k8s_exec:
+        namespace: "{{ verify_ns }}"
+        pod: "{{ (verify_kc_pods.resources | selectattr('status.phase', 'equalto', 'Running') | first).metadata.name }}"
+        container: "{{ verify_k_dep.spec.template.spec.containers[0].name }}"
+        command: >-
+          bash -c 'exec 3<>/dev/tcp/127.0.0.1/8080;
+          printf "GET /realms/master/.well-known/openid-configuration HTTP/1.0\r\nHost: localhost:8080\r\n\r\n" >&3;
+          cat <&3'
+      register: verify_master_disc
+      changed_when: false
+      tags: [cluster]
+
+    - name: The master realm issuer is the admin address (admin console iframe check works)
+      ansible.builtin.assert:
+        that:
+          - verify_master_disc.rc == 0
+          - verify_master_disc.stdout is search('"issuer":"' ~ verify_kc_hostname_admin ~ '/realms/master"')
+        fail_msg: >-
+          The master realm issuer is not {{ verify_kc_hostname_admin }}/realms/master: the admin console shows
+          "Timeout when waiting for 3rd party check iframe message". Run the realm job again (docs/how-to/keycloak.md).
+        success_msg: "master realm issuer {{ verify_kc_hostname_admin }}/realms/master"
+      tags: [cluster]
+
+    - name: OIDC discovery document through Traefik  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        argv: >-
+          {{ verify_curl_base + ['--connect-to', verify_connect,
+             verify_issuer ~ '/.well-known/openid-configuration'] }}
+      register: verify_disc
+      changed_when: false
+      tags: [cluster]
+
+    - name: Parse the discovery document
+      ansible.builtin.set_fact:
+        verify_disc_doc: "{{ verify_disc.stdout_lines[:-1] | join(' ') | from_json }}"
+      when: verify_disc.rc == 0 and verify_disc.stdout_lines[-1] == '200'
+      tags: [cluster]
+
+    - name: Discovery names the public issuer and the code flow
+      ansible.builtin.assert:
+        that:
+          - verify_disc.rc == 0
+          - verify_disc.stdout_lines[-1] == '200'
+          - verify_disc_doc.issuer == verify_issuer
+          - verify_disc_doc.authorization_endpoint is match(verify_issuer)
+          - "'authorization_code' in verify_disc_doc.grant_types_supported"
+        fail_msg: "Discovery document of realm {{ verify_realm }} wrong or missing (HTTP {{ verify_disc.stdout_lines[-1] | default(verify_disc.rc) }})."
+        success_msg: "issuer {{ verify_issuer }}"
+      tags: [cluster]
+
+    - name: Admin console, master realm and admin API through Traefik  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        argv: >-
+          {{ verify_curl_base + ['--connect-to', verify_connect, '--output', '/dev/null',
+             'https://' ~ verify_host ~ item] }}
+      register: verify_closed
+      changed_when: false
+      failed_when: false
+      loop:
+        - /admin/master/console/
+        - /realms/master/.well-known/openid-configuration
+        - /admin/realms/{{ verify_realm }}
+        - /metrics
+        - /health/ready
+      tags: [cluster]
+
+    - name: Only the realm is public (everything else is 404 from Traefik)
+      ansible.builtin.assert:
+        that:
+          - item.rc == 0
+          - item.stdout_lines[-1] == '404'
+        fail_msg: "{{ item.item }} answered HTTP {{ item.stdout_lines[-1] | default(item.rc) }} on the public name (expected 404)."
+        success_msg: "{{ item.item }} is not routed"
+      loop: "{{ verify_closed.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      tags: [cluster]
+
+    - name: Login page of a client  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        argv: >-
+          {{ verify_curl_base + ['--connect-to', verify_connect,
+             verify_issuer ~ '/protocol/openid-connect/auth?client_id=gitea&response_type=code&scope=openid&redirect_uri=https%3A%2F%2Fgit.'
+             ~ lab.domain ~ '%2Fuser%2Foauth2%2Fkeycloak%2Fcallback'] }}
+      register: verify_login
+      changed_when: false
+      tags: [cluster]
+
+    - name: The login page answers and offers no registration
+      ansible.builtin.assert:
+        that:
+          - verify_login.rc == 0
+          - verify_login.stdout_lines[-1] == '200'
+          - "'login-actions/registration' not in verify_login.stdout"
+          - "'login-actions/authenticate' in verify_login.stdout"
+        fail_msg: "Login page of client gitea wrong (HTTP {{ verify_login.stdout_lines[-1] | default(verify_login.rc) }}) or it offers registration."
+        success_msg: "client gitea known, login form, no registration link"
+      tags: [cluster]
+
+    - name: Gitea knows the authentication source keycloak
+      kubernetes.core.k8s_info:
+        kind: Pod
+        namespace: gitea
+        label_selectors:
+          - app.kubernetes.io/name=gitea
+      register: verify_gitea_pods
+      tags: [cluster]
+
+    - name: Ask Gitea for its authentication sources
+      kubernetes.core.k8s_exec:
+        namespace: gitea
+        pod: "{{ (verify_gitea_pods.resources | selectattr('status.phase', 'equalto', 'Running') | first).metadata.name }}"
+        container: gitea
+        command: gitea admin auth list --vertical-bars
+      register: verify_gitea_auth
+      changed_when: false
+      tags: [cluster]
+
+    - name: The source is there and enabled
+      ansible.builtin.assert:
+        that:
+          - verify_gitea_auth.rc == 0
+          - verify_gitea_auth.stdout is regex('\|keycloak\s+\|OAuth2\s+\|true')
+        fail_msg: "Gitea has no enabled OAuth2 source keycloak (is secrets/gitea/gitea-oidc.sops.yaml committed and synced?)."
+        success_msg: "Gitea source keycloak (OAuth2) enabled"
+      tags: [cluster]
+
+    - name: Egress probes (allowed targets connect, everything else is blocked)
+      ansible.builtin.include_tasks: tasks/egress-probe.yml
+      vars:
+        egress_probes: "{{ egress_probe_control + egress_probe_keycloak }}"
+      tags: [cluster, egress]

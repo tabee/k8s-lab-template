@@ -1,0 +1,220 @@
+# Zensical configuration of the docs site (address: site_url).
+# Lives in the repo root because Zensical only accepts a docs_dir below this
+# folder. Content: docs/ (Diataxis: tutorials, how-to, reference, concepts,
+# learning path). gitops/README.md joins through the symlink
+# docs/reference/gitops-layout.md, no copies in Git.
+# Local build: bash docs/build.sh /workspace/docs-site   (guide:
+# docs/how-to/docs-site.md). Tested with Zensical 0.0.72 (docs/requirements.txt).
+
+[project]
+site_name = "k8s-lab Doku"
+site_description = "Handbuch zum k3s-Lab: Tutorials, Anleitungen, Referenz, Konzepte"
+# Public address: needed for navigation.instant (sitemap) and canonical links.
+# verify-docs.yml checks that it matches the ingress.
+site_url = "https://docs.lab.example/"
+# Source repository: the "edit" button on every page and the repository link
+# point here (feature content.action.edit). The only place of these two values;
+# the public export replaces them (scripts/public/export.conf). Gitea: _edit/,
+# GitHub: edit/. The path is relative to the repo root, docs_dir is docs/.
+repo_url = "https://github.com/tabee/k8s-lab-template"
+edit_uri = "edit/main/docs/"
+docs_dir = "docs"
+# Lives in docs/ but does not belong on the site. "_includes" holds the
+# abbreviation list that the snippets extension appends to every page.
+exclude_docs = """
+_includes
+build.sh
+requirements.txt
+vendor-mermaid.py
+"""
+# Output in the repo root (listed in .gitignore); build.sh copies it to the target.
+site_dir = "site"
+use_directory_urls = true
+extra_css = ["stylesheets/neon.css"]
+# Menu, in this order. New page in docs/: add it here (otherwise it is only
+# reachable by link). A folder with an index.md becomes a section whose first
+# entry is that index (navigation.indexes).
+nav = [
+  { "Start" = "index.md" },
+  { "Tutorials" = [
+    "tutorials/index.md",
+    { "Lab in 30 Minuten" = "tutorials/lab-in-30-minutes.md" },
+    { "Lab für Freunde" = "tutorials/lab-for-friends.md" },
+  ] },
+  { "Anleitungen" = [
+    "how-to/index.md",
+    { "Betrieb" = [
+      { "Neuaufbau" = "how-to/rebuild.md" },
+      { "Abnahme" = "how-to/acceptance.md" },
+      { "VM exportieren und zurückholen" = "how-to/export-and-restore-vm.md" },
+      { "Fehlersuche" = "how-to/troubleshooting.md" },
+    ] },
+    { "Netz, Zertifikate, Zugang" = [
+      { "Netz-Kante und Profil edge" = "how-to/edge-profile.md" },
+      { "Lab-CA vertrauen" = "how-to/trust-lab-ca.md" },
+      { "Lab-CA rotieren" = "how-to/ca-rotation.md" },
+      { "Öffentliches Zertifikat" = "how-to/public-certificate.md" },
+      { "Argo CD bedienen" = "how-to/argocd-access.md" },
+    ] },
+    { "Daten und Geheimnisse" = [
+      { "Geheimnisse erzeugen und rotieren" = "how-to/secrets.md" },
+      { "Datenbank wiederherstellen" = "how-to/restore-database.md" },
+      { "Gitea wiederherstellen" = "how-to/restore-gitea.md" },
+      { "Keycloak wiederherstellen" = "how-to/restore-keycloak.md" },
+      { "Gitea-Import" = "how-to/gitea-import.md" },
+      { "Matrix" = "how-to/matrix.md" },
+      { "Keycloak (Single Sign-on)" = "how-to/keycloak.md" },
+      { "Matrix-Import" = "how-to/matrix-import.md" },
+      { "Gitea-Backup prüfen" = "how-to/verify-gitea-backup.md" },
+      { "Failover üben" = "how-to/failover-drill.md" },
+      { "Restore-Test" = "how-to/restore-drill.md" },
+      { "Backup-Replikat" = "how-to/backup-replica.md" },
+      { "Alarm" = "how-to/alerts.md" },
+      { "Secret-Scan" = "how-to/secret-scan.md" },
+      { "Sicherheitsprüfung" = "how-to/security-scan.md" },
+    ] },
+    { "Erweitern und veröffentlichen" = [
+      { "Neue App hinzufügen" = "how-to/add-app.md" },
+      { "Notiz-Sites" = "how-to/notes-sites.md" },
+      { "Doku-Site" = "how-to/docs-site.md" },
+      { "CI-Prüfung" = "how-to/ci-lint.md" },
+      { "Gitea Actions im Cluster" = "how-to/gitea-actions.md" },
+      { "Öffentliche Fassung" = "how-to/public-release.md" },
+      { "Privates Secrets-Repo" = "how-to/private-secrets-repo.md" },
+      { "Privater GitHub-Spiegel" = "how-to/github-push-mirror.md" },
+      { "Neuaufbau aus GitHub" = "how-to/neuaufbau-github.md" },
+      { "Notfall-Neuaufbau" = "how-to/notfall-neuaufbau.md" },
+      { "SSH-Commit-Signatur" = "how-to/signed-commits.md" },
+    ] },
+  ] },
+  { "Referenz" = [
+    "reference/index.md",
+    { "lab.sh" = "reference/lab-sh.md" },
+    { "Werkzeuge des Steuerrechners" = "reference/control-tools.md" },
+    { "Konfiguration" = "reference/configuration.md" },
+    { "Geheimnis-Karte" = "reference/secrets-map.md" },
+    { "Notfall-Kit" = "reference/emergency-kit.md" },
+    { "Ports und Netze" = "reference/ports-and-networks.md" },
+    { "Versionen und Pins" = "reference/versions.md" },
+    { "Memory-Budget" = "reference/memory-budget.md" },
+    { "Abnahme-Prüfungen" = "reference/acceptance-checks.md" },
+    { "Verify-Playbooks" = "reference/verify-playbooks.md" },
+    { "Repository-Aufbau" = "reference/repository-layout.md" },
+    { "gitops/" = "reference/gitops-layout.md" },
+    { "Glossar" = "reference/glossary.md" },
+  ] },
+  { "Konzepte" = [
+    "concepts/index.md",
+    { "Architektur" = "concepts/architecture.md" },
+    { "Bootstrap und GitOps" = "concepts/bootstrap-and-gitops.md" },
+    { "Netz-Kante" = "concepts/network-edge.md" },
+    { "Zertifikate" = "concepts/certificates.md" },
+    { "Geheimnisfluss" = "concepts/secret-flow.md" },
+    { "Backup und Restore" = "concepts/backup-and-restore.md" },
+    { "Sicherheitsmodell" = "concepts/security-model.md" },
+    { "Öffentliches Repo und Personendaten" = "concepts/public-release-security.md" },
+    { "Quellvertrauen und signierte Commits" = "concepts/source-trust.md" },
+    { "Entscheidungen (ADR)" = [
+      "concepts/decisions/index.md",
+      { "0001 Eine Quelle" = "concepts/decisions/0001-one-source-lab-yaml.md" },
+      { "0002 OpenTofu und Ansible" = "concepts/decisions/0002-tofu-and-ansible.md" },
+      { "0003 Wiederholungen statt Sync-Waves" = "concepts/decisions/0003-retries-instead-of-sync-waves.md" },
+      { "0004 SOPS, age, KSOPS" = "concepts/decisions/0004-sops-age-ksops.md" },
+      { "0005 nftables und Original-Zielport" = "concepts/decisions/0005-nftables-forward-check.md" },
+      { "0006 Traefik Traffic-Policy Cluster" = "concepts/decisions/0006-traefik-traffic-policy-cluster.md" },
+      { "0007 Lab-CA mit nameConstraints" = "concepts/decisions/0007-lab-ca-name-constraints.md" },
+      { "0008 Backup ausserhalb der VM" = "concepts/decisions/0008-backup-outside-vm.md" },
+      { "0009 Neuaufbau ist ein sauberer Start" = "concepts/decisions/0009-rebuild-is-clean-start.md" },
+      { "0010 Mermaid selbst ausgeliefert" = "concepts/decisions/0010-mermaid-cdn.md" },
+      { "0011 Zensical, im Cluster gebaut" = "concepts/decisions/0011-zensical-docs-cluster-build.md" },
+      { "0012 Öffentliche Kopie mit Wächter" = "concepts/decisions/0012-public-export.md" },
+      { "0013 Replikat mit rsync und rrsync" = "concepts/decisions/0013-replica-rsync-rrsync.md" },
+      { "0014 Restore-Test im Wegwerf-Namespace" = "concepts/decisions/0014-restore-drill-throwaway-namespace.md" },
+      { "0015 Gitea-Import per gitea dump" = "concepts/decisions/0015-gitea-import-dump.md" },
+      { "0016 Matrix ohne Föderation" = "concepts/decisions/0016-matrix-federation-off.md" },
+      { "0017 End-WAL vor dem VM-Stopp" = "concepts/decisions/0017-wal-before-vm-stop.md" },
+      { "0018 Wiederherstellung nur zur Laufzeit" = "concepts/decisions/0018-recover-from-backup.md" },
+      { "0019 Keycloak als Single Sign-on" = "concepts/decisions/0019-keycloak-sso.md" },
+      { "0020 Matrix-Import" = "concepts/decisions/0020-matrix-import.md" },
+      { "0021 Notiz-Sites hinter Keycloak" = "concepts/decisions/0021-notes-sso.md" },
+      { "0022 Privates Secrets-Repo" = "concepts/decisions/0022-private-secrets-repo.md" },
+      { "0023 Signierte Commits und Quellvertrauen" = "concepts/decisions/0023-signed-main-and-source-trust.md" },
+      { "0024 GitHub als schaltbare Quelle" = "concepts/decisions/0024-github-as-switchable-source.md" },
+      { "0025 Notfall-Kit auf einem USB-Stick" = "concepts/decisions/0025-emergency-kit.md" },
+      { "0026 Unbeaufsichtigter Restore" = "concepts/decisions/0026-unattended-recovery.md" },
+      { "0027 Mehrere Umgebungen" = "concepts/decisions/0027-environments-one-source.md" },
+      { "0029 Import-Belege nach Restore" = "concepts/decisions/0029-import-evidence-after-restore.md" },
+      { "0030 Gitea Actions mit Job-Pods" = "concepts/decisions/0030-gitea-actions-runner.md" },
+    ] },
+  ] },
+  { "Lernreise" = [
+    "learning-path/index.md",
+    { "Stufe 3: Härtung" = "learning-path/stage-3-hardening.md" },
+    { "Stufe 4: Argo CD" = "learning-path/stage-4-argocd.md" },
+    { "Stufe 5: Traefik" = "learning-path/stage-5-traefik.md" },
+    { "Stufe 6: cert-manager" = "learning-path/stage-6-certmanager.md" },
+    { "Stufe 6c: Argo-CD-Oberfläche" = "learning-path/stage-6c-argocd-ingress.md" },
+    { "Stufe 7: Secrets (KSOPS)" = "learning-path/stage-7-ksops.md" },
+    { "Stufe 8a: Backup-Ziel" = "learning-path/stage-8a-backup-target.md" },
+    { "Stufe 8b: CloudNativePG" = "learning-path/stage-8b-cnpg.md" },
+    { "Stufe 8c: Gitea" = "learning-path/stage-8c-gitea.md" },
+    { "Stufe 9: Keycloak" = "learning-path/stage-9-keycloak.md" },
+  ] },
+]
+
+[project.theme]
+variant = "modern"
+language = "de"
+# System fonts: no requests to Google Fonts.
+font = false
+features = [
+  "navigation.instant",
+  "navigation.top",
+  "navigation.tabs",
+  "navigation.sections",
+  "navigation.indexes",
+  "navigation.path",
+  "toc.follow",
+  "search.suggest",
+  "search.highlight",
+  "content.code.annotate",
+  "content.code.copy",
+  "content.tabs.link",
+  "content.tooltips",
+  "content.action.edit",
+]
+
+[[project.theme.palette]]
+scheme = "slate"
+primary = "deep-purple"
+accent = "pink"
+
+[project.plugins.search]
+
+# Python-Markdown extensions. Mermaid: the fence "mermaid" becomes
+# <pre class="mermaid">; the theme loads mermaid@11 from a CDN at view time
+# (ADR-0010). Abbreviations: docs/_includes/abbreviations.md is appended to
+# every page by the snippets extension (tooltips via content.tooltips).
+[project.markdown_extensions]
+abbr = {}
+admonition = {}
+attr_list = {}
+def_list = {}
+footnotes = {}
+md_in_html = {}
+tables = {}
+toc = { permalink = true }
+pymdownx.betterem = {}
+pymdownx.caret = {}
+pymdownx.details = {}
+pymdownx.emoji = { emoji_generator = "zensical.extensions.emoji.to_svg", emoji_index = "zensical.extensions.emoji.twemoji" }
+pymdownx.highlight = { anchor_linenums = true, line_spans = "__span", pygments_lang_class = true }
+pymdownx.inlinehilite = {}
+pymdownx.keys = {}
+pymdownx.mark = {}
+pymdownx.snippets = { base_path = ["docs"], auto_append = ["_includes/abbreviations.md"] }
+pymdownx.superfences = { custom_fences = [{ name = "mermaid", class = "mermaid", format = "pymdownx.superfences.fence_code_format" }] }
+pymdownx.tabbed = { alternate_style = true }
+pymdownx.tasklist = { custom_checkbox = true }
+pymdownx.tilde = {}
+

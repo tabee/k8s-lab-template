@@ -1,0 +1,384 @@
+---
+# Replace the empty file PVC and restore the newest K8up snapshot of THIS
+# claim into it. spec.snapshot is the full Snapshot spec.id (not the short
+# CR name). spec.paths is /data/<claim>. No snapshot for that path is a
+# failure: K8up would otherwise restore the newest snapshot of the whole
+# repo. The Snapshot objects only exist in a cluster that has run a K8up
+# backup, so on a new VM the list comes from the restic repository. The
+# Restore object, the snapshot-list pod and the content-check pod are always
+# deleted, including after a failure, so a rejected repo does not keep running.
+# The Deployment is scaled to zero and no pod may mount the PVC, otherwise the
+# delete hangs in Terminating (pvc-protection). A PVC that is already
+# Terminating is waited for. See recover-free-pvc-one.yml.
+- name: Free the file PVC on the new disk
+  ansible.builtin.include_tasks: recover-free-pvc-one.yml
+
+- name: Recreate the PVC from its manifest
+  when: target.pvc_src | length > 0
+  kubernetes.core.k8s:
+    src: "{{ target.pvc_src }}"
+
+- name: Recreate the Gitea PVC from the chart values
+  when: target.pvc_src | length == 0
+  kubernetes.core.k8s:
+    definition:
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: "{{ target.claim }}"
+        namespace: "{{ target.namespace }}"
+        annotations: "{{ target.annotations }}"
+      spec:
+        accessModes: "{{ target.access_modes }}"
+        resources:
+          requests:
+            storage: "{{ target.size }}"
+
+- name: Apply the K8up PodConfig from Git
+  kubernetes.core.k8s:
+    src: "{{ target.podconfig_src }}"
+
+- name: Restore the snapshot and drop the Restore object afterwards
+  block:
+    - name: Forget snapshots chosen for the previous volume
+      ansible.builtin.set_fact:
+        recover_pvc_snaps: []
+        recover_restic_snaps: []
+        recover_restic_all: []
+
+    - name: List K8up snapshots in this namespace
+      kubernetes.core.k8s_info:
+        api_version: k8up.io/v1
+        kind: Snapshot
+        namespace: "{{ target.namespace }}"
+      register: recover_snaps
+
+    # selectattr 'contains' treats a list as a substring search and would
+    # accept a string paths field. Membership is the test we want.
+    - name: Keep snapshots whose paths contain this PVC
+      ansible.builtin.set_fact:
+        recover_pvc_snaps: "{{ recover_pvc_snaps + [item] }}"
+      loop: "{{ recover_snaps.resources | default([]) }}"
+      when: >-
+        (item.spec.paths | default(none)) is not string
+        and (item.spec.paths | default(none)) is not mapping
+        and (item.spec.paths | default(none)) is sequence
+        and (item.spec.id | default('') | length) > 0
+        and (item.spec.date | default('') | length) > 0
+        and (('/data/' ~ target.claim) in item.spec.paths)
+
+    # A new VM has no Snapshot objects: they live in the cluster, and only a
+    # K8up backup job creates them. After rebuild --restore the list above is
+    # empty although the restic repository holds the snapshots. Then ask the
+    # repository itself (read-only, `restic snapshots`) in a one-off pod. The
+    # pod carries the label k8upjob, so the egress policy of the namespace lets
+    # it reach S3, and it uses the backend and the pod security context of the
+    # Schedule that owns this volume.
+    - name: Ask the restic repository for the snapshots of this PVC
+      when: recover_pvc_snaps | length == 0
+      block:
+        - name: Read the PodConfig security context for this volume
+          ansible.builtin.set_fact:
+            recover_pod_sc: >-
+              {{ (lookup('ansible.builtin.file', target.podconfig_src) | from_yaml)
+                 .spec.template.spec.securityContext }}
+
+        - name: Remove a leftover snapshot-list pod
+          kubernetes.core.k8s:
+            state: absent
+            api_version: v1
+            kind: Pod
+            namespace: "{{ target.namespace }}"
+            name: recover-snapshots
+            wait: true
+            wait_timeout: 60
+
+        - name: List the snapshots of this PVC in the restic repository
+          kubernetes.core.k8s:
+            definition:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                name: recover-snapshots
+                namespace: "{{ target.namespace }}"
+                labels:
+                  k8upjob: "true"
+              spec:
+                restartPolicy: Never
+                automountServiceAccountToken: false
+                securityContext: "{{ recover_pod_sc }}"
+                containers:
+                  - name: restic
+                    image: >-
+                      {{ recover_k8up_values.image.registry }}/{{
+                      recover_k8up_values.image.repository }}:{{
+                      recover_k8up_values.image.tag }}
+                    command: [/usr/local/bin/restic]
+                    args:
+                      - snapshots
+                      - --json
+                      - --quiet
+                      - --no-lock
+                      - --cache-dir=/tmp/restic-cache
+                      - --path
+                      - "/data/{{ target.claim }}"
+                    env:
+                      - name: RESTIC_REPOSITORY
+                        value: "s3:{{ target.backend.s3.endpoint }}/{{ target.backend.s3.bucket }}"
+                      - name: RESTIC_PASSWORD
+                        valueFrom:
+                          secretKeyRef:
+                            name: "{{ target.backend.repoPasswordSecretRef.name }}"
+                            key: "{{ target.backend.repoPasswordSecretRef.key }}"
+                      - name: AWS_ACCESS_KEY_ID
+                        valueFrom:
+                          secretKeyRef:
+                            name: "{{ target.backend.s3.accessKeyIDSecretRef.name }}"
+                            key: "{{ target.backend.s3.accessKeyIDSecretRef.key }}"
+                      - name: AWS_SECRET_ACCESS_KEY
+                        valueFrom:
+                          secretKeyRef:
+                            name: "{{ target.backend.s3.secretAccessKeySecretRef.name }}"
+                            key: "{{ target.backend.s3.secretAccessKeySecretRef.key }}"
+                    securityContext:
+                      allowPrivilegeEscalation: false
+                      readOnlyRootFilesystem: true
+                      capabilities:
+                        drop:
+                          - ALL
+                    resources:
+                      requests:
+                        cpu: 10m
+                        memory: 64Mi
+                      limits:
+                        memory: 256Mi
+                    volumeMounts:
+                      - name: tmp
+                        mountPath: /tmp
+                volumes:
+                  - name: tmp
+                    emptyDir: {}
+
+        - name: Wait until the snapshot list is ready
+          kubernetes.core.k8s_info:
+            api_version: v1
+            kind: Pod
+            namespace: "{{ target.namespace }}"
+            name: recover-snapshots
+          register: recover_list_pod
+          retries: 30
+          delay: 5
+          until: >-
+            (recover_list_pod.resources | default([]) | length) == 1
+            and (recover_list_pod.resources[0].status.phase | default('')
+                 in ['Succeeded', 'Failed'])
+          failed_when: >-
+            (recover_list_pod.resources | default([]) | length) == 0
+            or (recover_list_pod.resources[0].status.phase | default('')) != 'Succeeded'
+
+        - name: Read the snapshot list
+          kubernetes.core.k8s_log:
+            api_version: v1
+            kind: Pod
+            namespace: "{{ target.namespace }}"
+            name: recover-snapshots
+          register: recover_list_log
+
+        # restic --json prints one JSON array. Only a line that starts with [
+        # counts, so a warning line cannot break the parse. id is the full
+        # snapshot id, time is RFC3339 (a string sort is a time sort).
+        - name: Keep the snapshots that contain this PVC
+          ansible.builtin.set_fact:
+            recover_restic_all: >-
+              {{ (recover_list_log.log_lines | default([]) | select('match', '^[[]')
+                  | list | last | default('[]') | from_json)
+                 | selectattr('id', 'defined') | selectattr('time', 'defined')
+                 | selectattr('paths', 'defined')
+                 | selectattr('paths', 'contains', '/data/' ~ target.claim)
+                 | list }}
+
+        # A snapshot of an empty volume (restic summary: no file processed) is
+        # no restore source. K8up takes one every night, also when a restore
+        # was left half done, and the newest snapshot would otherwise win. A
+        # snapshot without summary (an old one) counts as unknown and is kept.
+        - name: Skip snapshots of an empty volume
+          ansible.builtin.set_fact:
+            recover_restic_snaps: >-
+              {%- set ns = namespace(keep=[]) -%}
+              {%- for snap in recover_restic_all -%}
+              {%- if (snap.summary | default({})).total_files_processed | default(1) | int > 0 -%}
+              {%- set ns.keep = ns.keep + [snap] -%}
+              {%- endif -%}
+              {%- endfor -%}
+              {{ ns.keep }}
+      always:
+        - name: Remove the snapshot-list pod
+          kubernetes.core.k8s:
+            state: absent
+            api_version: v1
+            kind: Pod
+            namespace: "{{ target.namespace }}"
+            name: recover-snapshots
+
+    - name: Abort when this PVC has no snapshot, in the cluster or in restic
+      ansible.builtin.fail:
+        msg: >-
+          {{ target.namespace }}/{{ target.claim }}:
+          {{ 'all ' ~ (recover_restic_all | length) ~ ' restic snapshots of this volume are EMPTY (no file in them).'
+             ~ ' Nothing to restore. An older backup may exist outside this repository (replica, docs/how-to/backup-replica.md).'
+             if (recover_restic_all | default([]) | length) > 0
+             else 'take a K8up backup first' }}
+      when: (recover_pvc_snaps | length) + (recover_restic_snaps | length) == 0
+
+    # Snapshot objects first (K8up spec.id and spec.date), else the restic
+    # list (id and time). Both are RFC3339, so a string sort is a time sort.
+    - name: Pin the newest snapshot id of this PVC
+      ansible.builtin.set_fact:
+        recover_snapshot_id: >-
+          {{ (recover_pvc_snaps | sort(attribute='spec.date') | last).spec.id
+             if recover_pvc_snaps | length > 0
+             else (recover_restic_snaps | sort(attribute='time') | last).id }}
+
+    - name: Restore the pinned K8up snapshot into the empty PVC
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: k8up.io/v1
+          kind: Restore
+          metadata:
+            name: recover
+            namespace: "{{ target.namespace }}"
+          spec:
+            podConfigRef:
+              name: "{{ target.pod_config }}"
+            backend: "{{ target.backend }}"
+            snapshot: "{{ recover_snapshot_id }}"
+            paths:
+              - "/data/{{ target.claim }}"
+            restoreMethod:
+              folder:
+                claimName: "{{ target.claim }}"
+
+    - name: Wait until the file restore has succeeded
+      kubernetes.core.k8s_info:
+        api_version: k8up.io/v1
+        kind: Restore
+        namespace: "{{ target.namespace }}"
+        name: recover
+      register: recover_done
+      retries: 60
+      delay: 10
+      until: >-
+        (recover_done.resources | default([]) | length == 1)
+        and ((recover_done.resources[0].status.conditions | default([]))
+             | selectattr('type', 'equalto', 'Completed')
+             | selectattr('reason', 'equalto', 'Succeeded')
+             | list | length == 1)
+      failed_when: >-
+        (recover_done.resources | default([]) | length == 1)
+        and ((recover_done.resources[0].status.conditions | default([]))
+             | selectattr('type', 'equalto', 'Completed')
+             | selectattr('reason', 'equalto', 'Failed')
+             | list | length == 1)
+  always:
+    - name: Remove the Restore object
+      kubernetes.core.k8s:
+        state: absent
+        api_version: k8up.io/v1
+        kind: Restore
+        namespace: "{{ target.namespace }}"
+        name: recover
+
+# After a successful restore, before the app is resumed. The image is the
+# pinned K8up image (shell, find, grep). The uid comes from the PodConfig
+# that owns this volume, so the checker can read the restored files.
+- name: Check the restored files and drop the checker afterwards
+  block:
+    - name: Read the PodConfig security context for this volume
+      ansible.builtin.set_fact:
+        recover_pod_sc: >-
+          {{ (lookup('ansible.builtin.file', target.podconfig_src) | from_yaml)
+             .spec.template.spec.securityContext }}
+
+    - name: Remove a leftover content-check pod
+      kubernetes.core.k8s:
+        state: absent
+        api_version: v1
+        kind: Pod
+        namespace: "{{ target.namespace }}"
+        name: recover-check
+        wait: true
+        wait_timeout: 60
+
+    - name: Check that the restored volume has the expected files
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: recover-check
+            namespace: "{{ target.namespace }}"
+          spec:
+            restartPolicy: Never
+            automountServiceAccountToken: false
+            securityContext: "{{ recover_pod_sc }}"
+            containers:
+              - name: check
+                image: >-
+                  {{ recover_k8up_values.image.registry }}/{{
+                  recover_k8up_values.image.repository }}:{{
+                  recover_k8up_values.image.tag }}
+                command: [/bin/bash, -c]
+                args:
+                  - |
+                    set -euo pipefail
+                    {{ target.content_test }}
+                securityContext:
+                  allowPrivilegeEscalation: false
+                  readOnlyRootFilesystem: true
+                  capabilities:
+                    drop:
+                      - ALL
+                resources:
+                  requests:
+                    cpu: 10m
+                    memory: 32Mi
+                  limits:
+                    memory: 64Mi
+                volumeMounts:
+                  - name: data
+                    mountPath: /data
+                    readOnly: true
+                  - name: tmp
+                    mountPath: /tmp
+            volumes:
+              - name: data
+                persistentVolumeClaim:
+                  claimName: "{{ target.claim }}"
+                  readOnly: true
+              - name: tmp
+                emptyDir: {}
+
+    - name: Wait until the content check has finished
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Pod
+        namespace: "{{ target.namespace }}"
+        name: recover-check
+      register: recover_check
+      retries: 30
+      delay: 5
+      until: >-
+        (recover_check.resources | default([]) | length) == 1
+        and (recover_check.resources[0].status.phase | default('')
+             in ['Succeeded', 'Failed'])
+      failed_when: >-
+        (recover_check.resources | default([]) | length) == 0
+        or (recover_check.resources[0].status.phase | default('')) != 'Succeeded'
+  always:
+    - name: Remove the content-check pod
+      kubernetes.core.k8s:
+        state: absent
+        api_version: v1
+        kind: Pod
+        namespace: "{{ target.namespace }}"
+        name: recover-check

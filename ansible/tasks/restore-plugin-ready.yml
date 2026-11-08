@@ -1,0 +1,123 @@
+---
+# Wait until the barman-cloud plugin can serve a recovery Cluster (rebuild
+# --restore, ADR-0018). The chain, in this order, shares ONE budget
+# (restore_plugin_timeout_min in group_vars/all/restore.yml):
+#   1. cert-manager runs (controller, webhook, CA injector)
+#   2. the Certificates barman-cloud-client and barman-cloud-server are Ready
+#      (the plugin chart creates them; their secrets are mounted by the plugin pod)
+#   3. the plugin Deployment is Available
+# Why not only "Deployment Available" (third real run, 2026-11-03): the Deployment
+# was created at once, but its pod waited 12 minutes for secrets that
+# cert-manager had not issued yet, the Argo CD sync that had to create the
+# Certificates had run out of retries, and the old wait (10 minutes) gave up.
+# Two one-off helps, each only when the plain wait did not work:
+#   - cnpg application sync FAILED and Certificates still missing/not Ready:
+#     one sync by hand (what automated sync does after a new revision)
+#   - plugin Deployment not Available although the secrets exist: delete the
+#     plugin pod once (only that pod, the Deployment makes a new one)
+# Files: restore-plugin-certs.yml and restore-plugin-deploy.yml (each runs up to twice:
+# round 1 up to the help, round 2 after it), restore-plugin-fail.yml (diagnosis, stops the play).
+# Polls, not wall time, are counted (a poll is restore_plugin_delay seconds), so a
+# test can run it with delay 0. No secret is read: only Secret names are looked up.
+- name: Work out the poll budget of the whole chain
+  ansible.builtin.set_fact:
+    restore_pl_total: "{{ ((restore_plugin_timeout_min | float * 60) / ([restore_plugin_delay | int, 1] | max)) | int }}"
+    restore_pl_t0: "{{ now(utc=True).timestamp() | int }}"
+
+- name: Remember the budget that is left
+  ansible.builtin.set_fact:
+    restore_pl_left: "{{ restore_pl_total }}"
+    restore_pl_nudge_polls: "{{ ((restore_plugin_nudge_after_min | float * 60) / ([restore_plugin_delay | int, 1] | max)) | int }}"
+    restore_pl_grace_polls: "{{ ((restore_plugin_pod_grace_min | float * 60) / ([restore_plugin_delay | int, 1] | max)) | int }}"
+
+# ---------------------------------------------------------------- 1. cert-manager
+- name: Wait until cert-manager is running
+  kubernetes.core.k8s_info:
+    api_version: apps/v1
+    kind: Deployment
+    namespace: "{{ restore_cm_ns }}"
+    label_selectors:
+      - "app.kubernetes.io/instance={{ restore_cm_name }}"
+  register: restore_pl_cm
+  retries: "{{ [restore_pl_left | int, 1] | max }}"
+  delay: "{{ restore_plugin_delay }}"
+  until: restore_pl_cm_ok | bool
+  failed_when: false
+  vars:
+    restore_pl_cm_ok: >-
+      {{ (restore_pl_cm.resources | default([]) | length) >= (restore_cm_deployments | int)
+         and (restore_pl_cm.resources | default([]) | map(attribute='status.availableReplicas', default=0)
+              | select('gt', 0) | list | length) == (restore_pl_cm.resources | default([]) | length) }}
+
+- name: Count the polls cert-manager used
+  ansible.builtin.set_fact:
+    restore_pl_left: "{{ restore_pl_left | int - (restore_pl_cm.attempts | default(1) | int) }}"
+    restore_pl_t_cm: "{{ now(utc=True).timestamp() | int }}"
+    restore_pl_cm_done: >-
+      {{ (restore_pl_cm.resources | default([]) | length) >= (restore_cm_deployments | int)
+         and (restore_pl_cm.resources | default([]) | map(attribute='status.availableReplicas', default=0)
+              | select('gt', 0) | list | length) == (restore_pl_cm.resources | default([]) | length) }}
+
+- name: Stop when cert-manager does not come up
+  ansible.builtin.include_tasks: restore-plugin-fail.yml
+  vars:
+    restore_pl_stage: "cert-manager is not running ({{ restore_cm_deployments }} Deployments in {{ restore_cm_ns }} must be Available)"
+  when: not (restore_pl_cm_done | bool)
+
+# ---------------------------------------------------------------- 2. Certificates
+- name: Wait for the plugin Certificates (round 1 up to the sync help, round 2 for the rest)
+  ansible.builtin.include_tasks: restore-plugin-certs.yml
+  loop: [1, 2]
+  loop_control:
+    loop_var: restore_pl_round
+
+- name: Stop when the plugin Certificates do not become Ready
+  ansible.builtin.include_tasks: restore-plugin-fail.yml
+  vars:
+    restore_pl_stage: "the Certificates {{ restore_plugin_certs | join(' and ') }} in {{ restore_op_ns }} are not Ready"
+  when: not (restore_pl_certs_done | default(false) | bool)
+
+- name: Remember when the Certificates were Ready
+  ansible.builtin.set_fact:
+    restore_pl_t_certs: "{{ now(utc=True).timestamp() | int }}"
+
+# Ready means the secret is written. The check is for the message only.
+- name: Look up the TLS secrets of the plugin by name
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Secret
+    namespace: "{{ restore_op_ns }}"
+    name: "{{ item }}"
+  loop: "{{ restore_plugin_secrets }}"
+  register: restore_pl_secrets
+  no_log: true
+  failed_when: false
+
+- name: Both TLS secrets exist
+  ansible.builtin.assert:
+    that: >-
+      restore_pl_secrets.results | map(attribute='resources', default=[]) | map('length')
+      | select('equalto', 1) | list | length == (restore_plugin_secrets | length)
+    fail_msg: "The Certificates are Ready but a secret of {{ restore_plugin_secrets | join(', ') }} is missing in {{ restore_op_ns }}."
+    quiet: true
+
+# ---------------------------------------------------------------- 3. plugin Deployment
+- name: Wait for the barman-cloud plugin Deployment (round 1 up to the pod help, round 2 for the rest)
+  ansible.builtin.include_tasks: restore-plugin-deploy.yml
+  loop: [1, 2]
+  loop_control:
+    loop_var: restore_pl_round
+
+- name: Stop when the plugin Deployment does not become Available
+  ansible.builtin.include_tasks: restore-plugin-fail.yml
+  vars:
+    restore_pl_stage: "the plugin Deployment {{ restore_plugin_name }} in {{ restore_op_ns }} is not Available"
+  when: not (restore_pl_dep_done | default(false) | bool)
+
+- name: Report how long the plugin took
+  ansible.builtin.debug:
+    msg: >-
+      The barman-cloud plugin is ready after {{ now(utc=True).timestamp() | int - restore_pl_t0 | int }} s
+      (cert-manager {{ restore_pl_t_cm | int - restore_pl_t0 | int }} s,
+      Certificates {{ restore_pl_t_certs | int - restore_pl_t0 | int }} s;
+      budget {{ restore_plugin_timeout_min }} min).

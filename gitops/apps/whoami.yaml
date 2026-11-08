@@ -1,0 +1,34 @@
+---
+# Child application of the root app (app of apps): Argo CD syncs
+# gitops/workloads/whoami from this repo into the cluster.
+# repoURL, targetRevision and project must match
+# ansible/inventory/group_vars/all/argocd.yml.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: whoami
+  namespace: argocd
+  # Deleting this file also cleans up the whoami objects in the cluster.
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: lab
+  source:
+    repoURL: ssh://git@github.com/YOUR-NAME/k8s-lab.git
+    targetRevision: main
+    path: gitops/workloads/whoami
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: whoami
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    # IngressRoute needs the CRD from the app traefik, Certificate the one from
+    # the app cert-manager: on failure try again.
+    retry:
+      limit: 5
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 3m

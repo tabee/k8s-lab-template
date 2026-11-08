@@ -1,0 +1,604 @@
+---
+# Check stage 3, read only. Changes nothing on the host or in the cluster
+# (only read commands and kubectl --dry-run=server).
+# Usage: ansible-playbook verify.yml
+# Only sysctl and apport (e.g. right after a reboot):
+#   ansible-playbook verify.yml --tags sysctl
+# Note: The secretbox check is green only after the manual migration
+# (docs/learning-path/stage-3-hardening.md).
+
+- name: Check stage 3 hardening
+  hosts: k3s
+  become: true
+  gather_facts: false
+  tasks:
+    # ---------- Firewall ----------
+    - name: Read table host_filter
+      ansible.builtin.command: /usr/sbin/nft -j list table inet host_filter
+      register: verify_nft
+      changed_when: false
+      check_mode: false
+
+    - name: Input chain with policy drop is active
+      ansible.builtin.assert:
+        that:
+          - verify_nft_chain | length == 1
+          - verify_nft_chain[0].hook == 'input'
+          - verify_nft_chain[0].policy == 'drop'
+        fail_msg: "Chain input in inet host_filter is missing or policy is not drop"
+        quiet: true
+      vars:
+        verify_nft_chain: >-
+          {{ (verify_nft.stdout | from_json).nftables | selectattr('chain', 'defined')
+             | map(attribute='chain') | selectattr('name', 'equalto', 'input') | list }}
+
+    # Since wave 1 (issue #2) the forward chain always exists: it blocks new
+    # connections from outside to NodePorts/hostPorts (except 80/443 and the admin network).
+    - name: Forward chain is active and lets k3s forwarding through (policy accept)
+      ansible.builtin.assert:
+        that:
+          - verify_nft_fwd | length == 1
+          - verify_nft_fwd[0].hook == 'forward'
+          - verify_nft_fwd[0].policy == 'accept'
+        fail_msg: "Chain forward in inet host_filter is missing or policy is not accept"
+        quiet: true
+      vars:
+        verify_nft_fwd: >-
+          {{ (verify_nft.stdout | from_json).nftables | selectattr('chain', 'defined')
+             | map(attribute='chain') | selectattr('name', 'equalto', 'forward') | list }}
+
+    - name: Check chains for ingress and DNAT ports exist, otherwise nothing is dropped
+      ansible.builtin.assert:
+        that:
+          - ('admin_check' in verify_nft_chains) == (firewall_dnat_admin_only | bool)
+          - ('ingress_check' in verify_nft_chains) == (firewall_ingress_tcp_ports | length > 0)
+          - verify_nft_chains | select('equalto', 'forward') | list | length == 1
+        fail_msg: "Chains in inet host_filter: {{ verify_nft_chains }} (expected admin_check with firewall_dnat_admin_only, ingress_check with ingress ports)"
+        quiet: true
+      vars:
+        verify_nft_chains: >-
+          {{ (verify_nft.stdout | from_json).nftables | selectattr('chain', 'defined')
+             | map(attribute='chain') | map(attribute='name') | list }}
+
+    - name: Read /etc/nftables.conf
+      ansible.builtin.slurp:
+        src: /etc/nftables.conf
+      register: verify_nft_conf
+
+    # Without "state" the module only reads the unit status.
+    - name: Read status of nftables.service
+      ansible.builtin.systemd_service:
+        name: nftables.service
+      register: verify_nft_unit
+
+    - name: Read the status of the dead man's timer
+      ansible.builtin.systemd_service:
+        name: host-filter-rollback.timer
+      register: verify_rollback
+      failed_when: false
+
+    - name: Persistence without flush ruleset, service enabled, no timer open
+      ansible.builtin.assert:
+        that:
+          - not (verify_nft_conf.content | b64decode is search('(?m)^\s*flush\s+ruleset'))
+          - "'include \"/etc/nftables.d/*.nft\"' in (verify_nft_conf.content | b64decode)"
+          - "'delete table inet host_filter' in verify_nft_unit.status.ExecStop"
+          - "'flush ruleset' not in verify_nft_unit.status.ExecStop"
+          - verify_nft_unit.status.UnitFileState == 'enabled'
+          - verify_rollback.status.ActiveState | default('inactive') != 'active'
+        quiet: true
+
+    - name: Kubelet port is blocked from the control machine
+      ansible.builtin.wait_for:
+        host: "{{ ansible_host }}"
+        port: 10250
+        state: stopped
+        timeout: 5
+      delegate_to: localhost
+      become: false
+
+    - name: API port is reachable from the control machine
+      ansible.builtin.wait_for:
+        host: "{{ ansible_host }}"
+        port: 6443
+        state: started
+        timeout: 5
+      delegate_to: localhost
+      become: false
+
+    # ---------- NodePorts closed from outside (issue #2) ----------
+    # Throwaway NodePort on CoreDNS (TCP 53). Control: from the control machine (admin network)
+    # it opens. Negative: from a network namespace with a non-admin address
+    # (veth pair, not cni0/flannel.1) the connection setup must not work.
+    # The always block removes everything (service by label, namespace, veth).
+    - name: NodePort is closed from non-admin addresses and open from the admin network
+      when: firewall_dnat_admin_only | bool
+      tags: [nodeport]
+      vars:
+        verify_np_ns: lab-verify-np
+        verify_np_host: 10.99.0.1
+        verify_np_peer: 10.99.0.2
+        verify_np_k3s: [/usr/local/bin/k3s, kubectl]
+      block:
+        - name: Clean up old leftovers of the test
+          ansible.builtin.shell:
+            cmd: |
+              ip netns del {{ verify_np_ns }} 2>/dev/null
+              ip link del vnp-host 2>/dev/null
+              {{ verify_np_k3s | join(' ') }} -n kube-system delete service -l lab-verify=nodeport --ignore-not-found
+              true
+          changed_when: false
+          check_mode: false
+
+        - name: Create throwaway NodePort service
+          ansible.builtin.command:
+            argv: "{{ verify_np_k3s + ['apply', '-f', '-'] }}"
+            stdin: |
+              apiVersion: v1
+              kind: Service
+              metadata:
+                name: lab-verify-nodeport
+                namespace: kube-system
+                labels:
+                  lab-verify: nodeport
+              spec:
+                type: NodePort
+                selector:
+                  k8s-app: kube-dns
+                ports:
+                  - name: dns-tcp
+                    protocol: TCP
+                    port: 53
+                    targetPort: 53
+          changed_when: false
+          check_mode: false
+
+        - name: Read NodePort
+          ansible.builtin.command:
+            argv: "{{ verify_np_k3s + ['-n', 'kube-system', 'get', 'service', 'lab-verify-nodeport', '-o', 'jsonpath={.spec.ports[0].nodePort}'] }}"
+          register: verify_np_port
+          changed_when: false
+          check_mode: false
+
+        - name: NodePort is in the range 30000-32767
+          ansible.builtin.assert:
+            that: verify_np_port.stdout | int >= 30000 and verify_np_port.stdout | int <= 32767
+            fail_msg: "No NodePort assigned: '{{ verify_np_port.stdout }}'"
+            quiet: true
+
+            # The service needs a moment until kube-proxy has the rules.
+        - name: Control, from the control machine (admin network) the NodePort is open
+          ansible.builtin.wait_for:
+            host: "{{ ansible_host }}"
+            port: "{{ verify_np_port.stdout | int }}"
+            state: started
+            timeout: 60
+          delegate_to: localhost
+          become: false
+
+        - name: Build test network (namespace, veth, addresses)
+          ansible.builtin.shell:
+            cmd: |
+              set -e
+              ip netns add {{ verify_np_ns }}
+              ip link add vnp-host type veth peer name vnp-peer
+              ip link set vnp-peer netns {{ verify_np_ns }}
+              ip addr add {{ verify_np_host }}/30 dev vnp-host
+              ip link set vnp-host up
+              ip netns exec {{ verify_np_ns }} ip addr add {{ verify_np_peer }}/30 dev vnp-peer
+              ip netns exec {{ verify_np_ns }} ip link set vnp-peer up
+              ip netns exec {{ verify_np_ns }} ip link set lo up
+          changed_when: false
+          check_mode: false
+
+        - name: Control, the test network works (ping to the host is allowed)
+          ansible.builtin.command:
+            argv: [ip, netns, exec, "{{ verify_np_ns }}", ping, -c, "2", -W, "2", "{{ verify_np_host }}"]
+          changed_when: false
+          check_mode: false
+
+        - name: Try a connection to the NodePort from the non-admin address
+          ansible.builtin.command:
+            argv:
+              - ip
+              - netns
+              - exec
+              - "{{ verify_np_ns }}"
+              - timeout
+              - "5"
+              - bash
+              - -c
+              - "exec 3<>/dev/tcp/{{ verify_np_host }}/{{ verify_np_port.stdout | int }}"
+          register: verify_np_try
+          failed_when: false
+          changed_when: false
+          check_mode: false
+
+        - name: NodePort stays closed from the non-admin address
+          ansible.builtin.assert:
+            that: verify_np_try.rc != 0
+            fail_msg: >-
+              NodePort {{ verify_np_port.stdout }} is reachable from {{ verify_np_peer }} (not the admin network):
+              the forward rule (admin_check) does not apply.
+            success_msg: "NodePort {{ verify_np_port.stdout }} from {{ verify_np_peer }} is closed (rc {{ verify_np_try.rc | default('?') }})"
+            quiet: false
+      always:
+        - name: Remove throwaway service, namespace and veth
+          ansible.builtin.shell:
+            cmd: |
+              ip netns del {{ verify_np_ns }} 2>/dev/null
+              ip link del vnp-host 2>/dev/null
+              {{ verify_np_k3s | join(' ') }} -n kube-system delete service -l lab-verify=nodeport --ignore-not-found
+              true
+          changed_when: false
+          check_mode: false
+
+    # ---------- Pod to pod keeps working (the forward rule must not hit cni0) ----------
+    # DNS query of a pod to the service IP of CoreDNS (resolver from resolv.conf): pod -> service -> pod (DNAT
+    # in the cluster, ingress cni0). kube-router rejects new pods in the first second,
+    # so repeat.
+    - name: Pod resolves a name through CoreDNS (pod to pod after DNAT)
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/k3s
+          - kubectl
+          - run
+          - lab-verify-p2p
+          - --rm
+          - -i
+          - --restart=Never
+          - --quiet
+          - "--image={{ lab_probe_image }}"
+          - --overrides={{ verify_p2p_overrides | to_json }}
+      register: verify_p2p
+      until: verify_p2p.rc == 0
+      retries: 5
+      delay: 5
+      changed_when: false
+      check_mode: false
+      tags: [nodeport]
+      vars:
+        verify_p2p_overrides:
+          spec:
+            securityContext:
+              runAsNonRoot: true
+              runAsUser: 65534
+              seccompProfile: { type: RuntimeDefault }
+            containers:
+              - name: lab-verify-p2p
+                image: "{{ lab_probe_image }}"
+                command: [nslookup, kubernetes.default.svc.cluster.local]
+                securityContext:
+                  allowPrivilegeEscalation: false
+                  capabilities: { drop: [ALL] }
+
+    # ---------- SSH ----------
+    - name: Read the effective sshd configuration
+      ansible.builtin.command: /usr/sbin/sshd -T
+      register: verify_sshd
+      changed_when: false
+      check_mode: false
+
+    - name: Check sshd values
+      ansible.builtin.assert:
+        that:
+          - "'permitrootlogin no' in verify_sshd.stdout_lines"
+          - "'passwordauthentication no' in verify_sshd.stdout_lines"
+          - "'kbdinteractiveauthentication no' in verify_sshd.stdout_lines"
+          - "'allowtcpforwarding no' in verify_sshd.stdout_lines"
+          - "'allowstreamlocalforwarding no' in verify_sshd.stdout_lines"
+          - "'permittunnel no' in verify_sshd.stdout_lines"
+          - "'gatewayports no' in verify_sshd.stdout_lines"
+          - "'x11forwarding no' in verify_sshd.stdout_lines"
+          - "'allowagentforwarding no' in verify_sshd.stdout_lines"
+          - "'permituserenvironment no' in verify_sshd.stdout_lines"
+          - "'addressfamily inet' in verify_sshd.stdout_lines"
+          - "('listenaddress ' ~ base_ssh_listen_address ~ ':22') in verify_sshd.stdout_lines"
+          - "('kexalgorithms ' ~ base_ssh_kex_algorithms | join(',')) in verify_sshd.stdout_lines"
+          - "('ciphers ' ~ base_ssh_ciphers | join(',')) in verify_sshd.stdout_lines"
+          - "('macs ' ~ base_ssh_macs | join(',')) in verify_sshd.stdout_lines"
+          - "('hostkeyalgorithms ' ~ base_ssh_host_key_algorithms | join(',')) in verify_sshd.stdout_lines"
+          - "('pubkeyacceptedalgorithms ' ~ base_ssh_pubkey_algorithms | join(',')) in verify_sshd.stdout_lines"
+        quiet: true
+
+    - name: Read open sockets on port 22
+      ansible.builtin.command:
+        argv: [ss, -Htln, "sport = :22"]
+      register: verify_ss
+      changed_when: false
+      check_mode: false
+
+    - name: Check sshd listens only on the listen address
+      ansible.builtin.assert:
+        that:
+          - verify_ss.stdout_lines | length > 0
+          - verify_ss.stdout_lines | map('split') | map(attribute=3) | unique == [base_ssh_listen_address ~ ':22']
+        fail_msg: "Port 22 open on: {{ verify_ss.stdout_lines | map('split') | map(attribute=3) | list }}"
+        quiet: true
+
+    # ---------- sysctl ----------
+    # Two checks: runtime (sysctl -n) and boot (what systemd-sysctl sets at the
+    # next start). The runtime alone is not enough: after site.yml
+    # it is always right, even if a reboot flips it again.
+    - name: Read sysctl values
+      ansible.builtin.command:
+        argv: "{{ ['sysctl', '-n'] + verify_sysctl_expected.keys() | list }}"
+      vars:
+        verify_sysctl_expected: "{{ base_sysctl | combine(base_sysctl_hardening) }}"
+      register: verify_sysctl
+      changed_when: false
+      check_mode: false
+      tags: [sysctl]
+
+    - name: Compare sysctl values
+      ansible.builtin.assert:
+        that:
+          - item.1 | string == item.2 | trim
+        fail_msg: "{{ item.0 }}: expected {{ item.1 }}, is {{ item.2 }}"
+        quiet: true
+      loop: >-
+        {{ verify_sysctl_expected.keys() | list
+           | zip(verify_sysctl_expected.values() | list, verify_sysctl.stdout_lines) | list }}
+      vars:
+        verify_sysctl_expected: "{{ base_sysctl | combine(base_sysctl_hardening) }}"
+      loop_control:
+        label: "{{ item.0 }}"
+      tags: [sysctl]
+
+    # Exactly the files and the order that systemd-sysctl takes at boot
+    # (one header line "# /path" per file, then the content).
+    - name: Read sysctl files in boot order
+      ansible.builtin.command: /usr/lib/systemd/systemd-sysctl --cat-config --no-pager
+      register: verify_sysctl_cfg
+      changed_when: false
+      check_mode: false
+      tags: [sysctl]
+
+    # Last assignment per key wins, like with systemd-sysctl. "-" at the
+    # start (ignore errors) and "/" instead of "." are normalized.
+    # Glob lines (net.ipv4.conf.*.x) do not count: an explicit key
+    # always takes precedence over a glob in systemd.
+    - name: Sysctl values also hold after a reboot
+      ansible.builtin.assert:
+        that:
+          - verify_sysctl_boot[item.key] | default('') == item.value | string
+        fail_msg: >-
+          {{ item.key }}: expected {{ item.value }}, at boot
+          {{ verify_sysctl_boot[item.key] | default('not set') }}. Which file:
+          /usr/lib/systemd/systemd-sysctl --cat-config | grep -e '^# /' -e {{ item.key }}
+        quiet: true
+      loop: "{{ base_sysctl | combine(base_sysctl_hardening) | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+      vars:
+        verify_sysctl_pairs: >-
+          {{ verify_sysctl_cfg.stdout_lines | map('trim') | reject('match', '[#;]')
+             | select('search', '=') | map('regex_replace', '^-', '')
+             | map('split', '=', 1) | map('map', 'trim') | list }}
+        verify_sysctl_boot: >-
+          {{ dict(verify_sysctl_pairs | map('first') | map('replace', '/', '.')
+             | zip(verify_sysctl_pairs | map('last'))) }}
+      tags: [sysctl]
+
+    - name: Read status of apport.service
+      ansible.builtin.systemd_service:
+        name: apport.service
+      register: verify_apport
+      tags: [sysctl]
+
+    - name: Read core pattern
+      ansible.builtin.command: sysctl -n kernel.core_pattern
+      register: verify_core_pattern
+      changed_when: false
+      check_mode: false
+      tags: [sysctl]
+
+    # apport.service sets fs.suid_dumpable=2 at start (after systemd-sysctl).
+    - name: Apport is masked and does not redirect core dumps
+      ansible.builtin.assert:
+        that:
+          - verify_apport.status.LoadState | default('') == 'masked'
+          - verify_apport.status.ActiveState | default('inactive') != 'active'
+          - "'apport' not in verify_core_pattern.stdout"
+        fail_msg: >-
+          apport.service: LoadState {{ verify_apport.status.LoadState | default('?') }},
+          ActiveState {{ verify_apport.status.ActiveState | default('?') }},
+          core_pattern {{ verify_core_pattern.stdout }} (expected: masked, not active,
+          without apport; role base, apport.yml)
+        quiet: true
+      tags: [sysctl]
+
+    # ---------- auditd / AppArmor ----------
+    - name: Read active audit rules
+      ansible.builtin.command: auditctl -l
+      register: verify_auditctl
+      changed_when: false
+      check_mode: false
+
+    - name: Audit rules are loaded
+      ansible.builtin.assert:
+        that:
+          - "'key=time-change' in verify_auditctl.stdout"
+          - "'key=modules' in verify_auditctl.stdout"
+          - "'key=priv-esc' in verify_auditctl.stdout"
+          - "'-w /etc/passwd -p wa -k identity' in verify_auditctl.stdout"
+          - "'-w /etc/rancher/k3s -p wa -k k3s-config' in verify_auditctl.stdout"
+        quiet: true
+
+    - name: Count AppArmor profiles
+      ansible.builtin.command: aa-status --enforced
+      register: verify_apparmor
+      changed_when: false
+      check_mode: false
+
+    - name: AppArmor is active and enforces profiles
+      ansible.builtin.assert:
+        that:
+          - verify_apparmor.stdout | int > 0
+        quiet: true
+
+    # ---------- k3s ----------
+    - name: Read k3s config.yaml
+      ansible.builtin.slurp:
+        src: /etc/rancher/k3s/config.yaml
+      register: verify_k3s_config
+
+    - name: Check k3s config.yaml matches the inventory
+      ansible.builtin.assert:
+        that:
+          - verify_k3s_config.content | b64decode | from_yaml == k3s_server_config
+          - "'traefik' in k3s_server_config.disable"
+        fail_msg: "config.yaml differs from the inventory, run site.yml first"
+        quiet: true
+
+    - name: Look for the built-in k3s Traefik (HelmChart)
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/k3s
+          - kubectl
+          - get
+          - "{{ item }}"
+          - --all-namespaces
+          - -o
+          - name
+      loop:
+        - helmcharts.helm.cattle.io
+      register: verify_addons
+      changed_when: false
+      check_mode: false
+
+    - name: No built-in k3s Traefik present
+      ansible.builtin.assert:
+        that:
+          - item.stdout_lines | select('search', 'traefik') | list | length == 0
+        fail_msg: "Found: {{ item.stdout_lines | select('search', 'traefik') | list }}"
+        quiet: true
+      loop: "{{ verify_addons.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Test a privileged pod in default (dry run, not created)
+      ansible.builtin.command:
+        argv: [/usr/local/bin/k3s, kubectl, apply, --dry-run=server, -f, "-"]
+        stdin: "{{ verify_pod_privileged | to_json }}"
+      vars:
+        verify_pod_privileged:
+          apiVersion: v1
+          kind: Pod
+          metadata: { name: verify-psa-privileged, namespace: default }
+          spec:
+            containers:
+              - name: c
+                image: "{{ lab_probe_image }}"
+                securityContext: { privileged: true }
+      register: verify_psa_bad
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Test restricted-compliant pod in default (dry-run)
+      ansible.builtin.command:
+        argv: [/usr/local/bin/k3s, kubectl, apply, --dry-run=server, -f, "-"]
+        stdin: "{{ verify_pod_restricted | to_json }}"
+      vars:
+        verify_pod_restricted:
+          apiVersion: v1
+          kind: Pod
+          metadata: { name: verify-psa-restricted, namespace: default }
+          spec:
+            securityContext:
+              runAsNonRoot: true
+              runAsUser: 65534
+              seccompProfile: { type: RuntimeDefault }
+            containers:
+              - name: c
+                image: "{{ lab_probe_image }}"
+                securityContext:
+                  allowPrivilegeEscalation: false
+                  capabilities: { drop: [ALL] }
+      register: verify_psa_good
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: PSA restricted applies in default
+      ansible.builtin.assert:
+        that:
+          - verify_psa_bad.rc != 0
+          - "'violates PodSecurity' in verify_psa_bad.stderr | default('')"
+          - verify_psa_good.rc == 0
+        fail_msg: >-
+          privileged: rc={{ verify_psa_bad.rc | default('?') }} {{ verify_psa_bad.stderr | default(verify_psa_bad.msg | default('')) }} /
+          restricted: rc={{ verify_psa_good.rc | default('?') }} {{ verify_psa_good.stderr | default(verify_psa_good.msg | default('')) }}
+        quiet: true
+
+    - name: Read the status of the secrets encryption
+      ansible.builtin.command: /usr/local/bin/k3s secrets-encrypt status
+      register: verify_secrets
+      changed_when: false
+      check_mode: false
+
+    # Fresh VM: k3s starts directly with secretbox, stage stays "start".
+    # Migrated VM (from AES-CBC): stage "reencrypt_finished". Both are good,
+    # as long as no AES-CBC key is left and secretbox is active.
+    - name: Encryption active, active key is secretbox
+      ansible.builtin.assert:
+        that:
+          - "'Encryption Status: Enabled' in verify_secrets.stdout"
+          - verify_secrets.stdout is search('(?m)^Current Rotation Stage:\s+(start|reencrypt_finished)\s*$')
+          - verify_secrets.stdout is search('(?m)^\s*\*\s+XSalsa20-POLY1305\s')
+          - verify_secrets.stdout is not search('AES-CBC')
+        fail_msg: >-
+          Not migrated to secretbox yet (or rotation in progress).
+          See docs/learning-path/stage-3-hardening.md, section secretbox.
+          Output: {{ verify_secrets.stdout }}
+        quiet: true
+
+    - name: Read audit log and directory
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ k3s_audit_log_path | dirname }}"
+        - "{{ k3s_audit_log_path }}"
+      register: verify_audit_files
+
+    - name: Audit log exists, directory only for root
+      ansible.builtin.assert:
+        that:
+          - verify_audit_files.results[0].stat.mode == '0700'
+          - verify_audit_files.results[1].stat.exists
+          - verify_audit_files.results[1].stat.size > 0
+        quiet: true
+
+    - name: Read the effective kubelet configuration
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/k3s
+          - kubectl
+          - get
+          - --raw
+          - "/api/v1/nodes/{{ k3s_server_config['node-name'] }}/proxy/configz"
+      register: verify_kubelet
+      changed_when: false
+      check_mode: false
+
+    - name: Kubelet arguments are effective
+      ansible.builtin.assert:
+        that:
+          - verify_kubelet_cfg.streamingConnectionIdleTimeout == '5m0s'
+          - verify_kubelet_cfg.podPidsLimit | string == verify_pid_arg | regex_replace('^pod-max-pids=', '')
+          - verify_kubelet_cfg.readOnlyPort | default(0) == 0
+          - not verify_kubelet_cfg.authentication.anonymous.enabled
+        quiet: true
+      vars:
+        verify_kubelet_cfg: "{{ (verify_kubelet.stdout | from_json).kubeletconfig }}"
+        verify_pid_arg: "{{ k3s_server_config['kubelet-arg'] | select('match', '^pod-max-pids=') | first }}"
+
+    - name: Anonymous access to API and kubelet is rejected
+      ansible.builtin.uri:
+        url: "{{ item }}"
+        validate_certs: false
+        status_code: 401
+      loop:
+        - https://127.0.0.1:6443/version
+        - https://127.0.0.1:10250/pods

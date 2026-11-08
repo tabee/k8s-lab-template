@@ -1,0 +1,61 @@
+---
+# Facts for the recover-files plays. One place for the two file volumes.
+# Nothing here is a secret: names and paths from Git only.
+- name: Read the Gitea chart values and the K8up schedules
+  ansible.builtin.set_fact:
+    recover_gitea_values: >-
+      {{ lookup('ansible.builtin.file', playbook_dir
+         ~ '/../gitops/workloads/gitea/values-gitea.yaml') | from_yaml }}
+    recover_gitea_sched: >-
+      {{ lookup('ansible.builtin.file', playbook_dir
+         ~ '/../gitops/workloads/gitea/manifests/k8up-schedule.yaml') | from_yaml }}
+    recover_matrix_sched: >-
+      {{ lookup('ansible.builtin.file', playbook_dir
+         ~ '/../gitops/workloads/matrix/manifests/k8up-schedule.yaml') | from_yaml }}
+    recover_gitea_auto: >-
+      {{ (lookup('ansible.builtin.file', playbook_dir
+         ~ '/../gitops/apps/gitea.yaml') | from_yaml).spec.syncPolicy.automated }}
+    recover_matrix_auto: >-
+      {{ (lookup('ansible.builtin.file', playbook_dir
+         ~ '/../gitops/apps/matrix.yaml') | from_yaml).spec.syncPolicy.automated }}
+    recover_k8up_values: >-
+      {{ lookup('ansible.builtin.file', playbook_dir
+         ~ '/../gitops/platform/k8up/values.yaml') | from_yaml }}
+
+- name: Build the list of file volumes to restore
+  ansible.builtin.set_fact:
+    recover_targets:
+      - namespace: gitea
+        app: gitea
+        deploy: gitea
+        label: app.kubernetes.io/name=gitea
+        claim: "{{ recover_gitea_values.persistence.claimName }}"
+        size: "{{ recover_gitea_values.persistence.size }}"
+        access_modes: "{{ recover_gitea_values.persistence.accessModes }}"
+        annotations: "{{ recover_gitea_values.persistence.annotations }}"
+        pvc_src: ""
+        podconfig_src: >-
+          {{ playbook_dir }}/../gitops/workloads/gitea/manifests/k8up-podconfig.yaml
+        backend: "{{ recover_gitea_sched.spec.backend }}"
+        pod_config: "{{ recover_gitea_sched.spec.podConfigRef.name }}"
+        automated: "{{ recover_gitea_auto }}"
+        # helm-gitea sets repository.ROOT to /data/git/gitea-repositories.
+        # verify-gitea.yml reads that directory back. An empty directory fails.
+        content_test: >-
+          test -d /data/git/gitea-repositories
+          && find /data/git/gitea-repositories -mindepth 1 -print -quit
+          | grep -q .
+      - namespace: matrix
+        app: matrix
+        deploy: synapse
+        label: app.kubernetes.io/name=synapse
+        claim: matrix-data
+        pvc_src: >-
+          {{ playbook_dir }}/../gitops/workloads/matrix/manifests/pvc.yaml
+        podconfig_src: >-
+          {{ playbook_dir }}/../gitops/workloads/matrix/manifests/k8up-podconfig.yaml
+        backend: "{{ recover_matrix_sched.spec.backend }}"
+        pod_config: "{{ recover_matrix_sched.spec.podConfigRef.name }}"
+        automated: "{{ recover_matrix_auto }}"
+        # signing_key_path in the homeserver chart. Empty or missing fails.
+        content_test: test -s /data/signing.key

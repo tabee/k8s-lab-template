@@ -1,0 +1,91 @@
+---
+# Remove snapd completely and prevent reinstallation via apt pin.
+# Important: ubuntu-server(-minimal) and ubuntu-cloud-minimal depend on snapd
+# and are removed with it. Their dependencies (among others openssh-server,
+# cloud-init) we mark as manual beforehand, so that no later
+# "apt autoremove" does not delete them.
+
+- name: Set apt pin against snapd
+  ansible.builtin.copy:
+    dest: /etc/apt/preferences.d/no-snapd.pref
+    content: |
+      # Managed by Ansible (base): never install snapd.
+      Package: snapd
+      Pin: release a=*
+      Pin-Priority: -10
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Collect installed packages
+  ansible.builtin.package_facts:
+    manager: apt
+
+- name: Run the snapd part only if snapd is installed
+  when: "'snapd' in ansible_facts.packages"
+  block:
+    - name: Read dependencies of the Ubuntu metapackages
+      ansible.builtin.command:
+        argv: >-
+          {{ ['apt-cache', 'depends', '--installed', '--no-suggests',
+              '--no-conflicts', '--no-breaks', '--no-replaces', '--no-enhances']
+             + base_metapackages }}
+      vars:
+        base_metapackages: >-
+          {{ ['ubuntu-server', 'ubuntu-server-minimal', 'ubuntu-cloud-minimal']
+             | select('in', ansible_facts.packages) | list }}
+      register: base_meta_depends
+      changed_when: false
+      check_mode: false
+      when: base_metapackages | length > 0
+
+    - name: Mark these dependencies as manually installed
+      ansible.builtin.command:
+        argv: "{{ ['apt-mark', 'manual'] + base_keep_packages }}"
+      vars:
+        base_keep_packages: >-
+          {{ base_meta_depends.stdout
+             | regex_findall('(?:Depends|Recommends): ([a-z0-9][a-z0-9.+-]+)')
+             | reject('equalto', 'snapd') | unique | list }}
+      register: base_apt_mark
+      changed_when: "'set to manually installed' in base_apt_mark.stdout"
+      when:
+        - base_meta_depends.stdout is defined
+        - base_keep_packages | length > 0
+
+    - name: List installed snaps
+      ansible.builtin.command: snap list
+      register: base_snap_list
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Remove snaps (apps, then base snaps, snapd last)
+      ansible.builtin.command: snap remove --purge {{ item }}
+      loop: >-
+        {{ (base_snaps | reject('match', '^(core[0-9]*|bare|snapd)$') | list)
+           + (base_snaps | select('match', '^(core[0-9]*|bare)$') | list)
+           + (base_snaps | select('equalto', 'snapd') | list) }}
+      vars:
+        base_snaps: >-
+          {{ base_snap_list.stdout_lines[1:] | map('split') | map('first') | list }}
+      changed_when: true
+
+    - name: Purge snapd (without autoremove)
+      ansible.builtin.apt:
+        name: snapd
+        state: absent
+        purge: true
+        autoremove: false
+
+- name: Remove snap directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /snap
+    - /var/snap
+    - /var/lib/snapd
+    - /var/cache/snapd
+    - /root/snap
+    - "/home/{{ ansible_user }}/snap"

@@ -1,0 +1,57 @@
+---
+# Values for the chart plugin-barman-cloud (backup/restore to S3).
+# Chart, repo and version are only in gitops/apps/cnpg.yaml.
+# Check on every chart update:
+#   helm show values cnpg/plugin-barman-cloud --version <Version>
+# Images: deliberately chart default (plugin and sidecar = appVersion of the chart).
+# The sidecar image (barman-cloud) later runs in every Postgres pod.
+
+replicaCount: 1
+
+crds:
+  create: true
+
+# mTLS between operator and plugin: own self-signed mini CA in the
+# namespace cnpg-system (cert-manager issuer from the chart). Deliberately not
+# lab-ca: no browser ever sees these certificates, and an error here
+# only affects CNPG.
+certificate:
+  createClientCertificate: true
+  createServerCertificate: true
+  createIssuer: true
+  duration: 2160h
+  renewBefore: 360h
+
+# Sync order inside the app cnpg (measured on 2026-11-03: the Certificates were
+# created 10 min after the Deployment). The chart gives Issuer and Certificates
+# no annotations, so they stay in wave 0. In one wave Argo CD applies the kinds
+# it knows (Deployment) BEFORE custom resources (Certificate), and a pod that
+# waits for its TLS secrets cannot become healthy. commonAnnotations reaches
+# the ServiceAccount, the Service and the Deployment, so these move to wave 1:
+# Argo CD applies them only after the Issuer and both Certificates are Healthy
+# (Ready), and the pod finds both secrets on its first start.
+# Checked offline by tests/argo-waves-tests.sh.
+commonAnnotations:
+  argocd.argoproj.io/sync-wave: "1"
+
+resources:
+  requests:
+    cpu: 10m
+    memory: 64Mi
+  limits:
+    memory: 128Mi  # lab-limit: cnpg-system/plugin-barman-cloud/barman-cloud
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+  capabilities:
+    drop:
+      - "ALL"
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault

@@ -1,0 +1,48 @@
+---
+# Template for all K8up pods in the namespace gitea (backup, prune, check,
+# restore). Without it the job pods would have no container securityContext
+# and PSA restricted would reject them.
+# How K8up applies it (source k8up v2.16.1, operator/job/job.go): it lays
+# template.spec over the job pod (mergo, WithOverride), then it sets
+# name, image and command of the container anew and appends env, mounts and
+# arguments. The container name here is therefore irrelevant.
+# Reference: podConfigRef in k8up-schedule.yaml (inherited by all jobs of the
+# schedule) and in the restore test of ansible/verify-gitea.yml.
+apiVersion: k8up.io/v1
+kind: PodConfig
+metadata:
+  name: k8up-restricted
+  namespace: gitea
+  annotations:
+    # The CRD comes from the app k8up. Until then retry (apps/gitea.yaml).
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+spec:
+  template:
+    spec:
+      terminationGracePeriodSeconds: 30
+      # Gitea rootless writes as uid/gid 1000. With that restic reads everything
+      # in the repo PVC and writes with the same owners on restore.
+      # fsGroup + OnRootMismatch: an empty target PVC is set to gid 1000 once on
+      # restore, afterwards no longer recursively.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: k8up
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - "ALL"
+          # restic needs a bit more on prune/check; repo is small.
+          resources:
+            requests:
+              cpu: 20m
+              memory: 64Mi
+            limits:
+              memory: 512Mi  # lab-limit: gitea/backup-*/* gitea/restore-*/* gitea/prune-*/* gitea/check-*/*

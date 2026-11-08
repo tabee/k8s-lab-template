@@ -1,0 +1,151 @@
+# ONE source for all values of the lab VM (flat YAML, no secrets).
+# Read by:
+#   OpenTofu  infra/envs/local/locals.tf         (yamldecode)
+#   Ansible   ansible/inventory/group_vars/all/lab.yml  (Variable "lab")
+#   Wrapper   scripts/lab.sh                      (flat keys)
+# Do NOT change own values (other machine, other network) here, but set them in
+# lab.local.yaml next to it (in .gitignore; template lab.local.yaml.example).
+# The file lab.local.yaml overrides keys of this file, wholly or not at all
+# per key. Only "key: value" in one line (lists in square brackets),
+# no multi-line, no anchor.
+# Docs: docs/how-to/rebuild.md, docs/tutorials/lab-for-friends.md
+
+---
+# ---------- VM ----------
+vm_name: k3s-lab
+domain: lab.example
+vcpu: 4
+# Same RAM as the prod profile (infra/envs/prod/lab.yaml, issue #9): the lab is the memory test of the server.
+# Do not override it in lab.local.yaml; tests/prod-tests.sh and the preflight of lab.sh check the parity.
+memory_mib: 8192
+# Memory kept free for what is NOT a work pod: kube-system, the OS and kubelet, and one transient
+# backup/restore pod. The sum of the memory limits of all work pods plus this reserve must fit into
+# memory_mib (ansible/verify-budget.yml, docs/reference/memory-budget.md). The acceptance measurement may
+# raise it (scripts/memory-budget.py apply); lower it only after a new measurement.
+memory_reserve_mib: 1536
+disk_gb: 60
+
+# ---------- Network (libvirt network "default" = virbr0, NAT) ----------
+network_name: default
+vm_ip: 192.168.122.50
+vm_cidr: 192.168.122.0/24
+gateway: 192.168.122.1
+dns_servers: ["192.168.122.1"]
+libvirt_uri: qemu:///system
+
+# ---------- Network edge: who may go where (profile edge, docs/how-to/edge-profile.md) ----------
+# Lists as comma text. The words vm_cidr, gateway and vm_ip stand for the values
+# above; otherwise CIDR or single address (one address becomes /32 or /128).
+# edge_admin_cidrs:   SSH (22), k8s API (6443), NodePorts/hostPorts and the admin UI
+#                     (Argo CD, whoami on port 8444). The control machine must be in here.
+# edge_ingress_cidrs: apps via Traefik on 80/443 (Gitea, docs, notes) and on the service
+#                     loadBalancerSourceRanges. Written into gitops/: "lab.sh customize".
+# edge_profile: default = admin network is edge_admin_cidrs (lab in the LAN, as before).
+#              edge     = admin network is only edge_profile_admin (one address, default gateway).
+# Trial run without permanent rebuild: ansible-playbook site.yml -e edge_profile=edge (docs/how-to/edge-profile.md).
+edge_profile: default
+edge_admin_cidrs: vm_cidr
+edge_ingress_cidrs: vm_cidr
+edge_profile_admin: gateway
+
+# ---------- Public probe (optional, off: all four values empty) ----------
+# Proves that the chain is in place for a REAL, publicly trusted certificate (ACME DNS-01,
+# no open port needed). Active only if solver, zone, probe_name and email are set in lab.local.yaml
+# (do NOT enter here: zone and names are personal). The API token is never here:
+# File ~/.config/k8s-lab/acme-dns01.token, per lab.sh init as SOPS file (docs/learning-path/stage-6-certmanager.md).
+# acme_solver:     DNS provider of the zone: cloudflare or digitalocean
+# acme_zone:       zone at the provider (e.g. example.org); probe_name lies in it, NEVER under domain
+# acme_probe_name: a name that only the probe uses (e.g. lab-probe.example.org)
+# acme_email:      contact for the ACME account (expiry warnings)
+# acme_server:     ACME directory; default: Let's Encrypt production
+acme_solver: ""
+acme_zone: ""
+acme_probe_name: ""
+acme_email: ""
+acme_server: https://acme-v02.api.letsencrypt.org/directory
+
+# ---------- Access ----------
+ssh_user: lab
+# Private key; the public one has the same name with .pub
+ssh_key: ~/.ssh/id_ed25519
+
+# ---------- Git server that Argo CD reads (pull model) ----------
+# repo_url: address of YOUR repo (ssh://). Argo CD reads only Git and does not know this file:
+# hence the address is also fixed in gitops/apps/*.yaml. "bash scripts/lab.sh
+# customize" writes it there (and the domain, the gateway and the VM network);
+# gitops/values-state.yaml remembers what is currently there (docs/tutorials/lab-for-friends.md).
+# repo_known_hosts: public host keys of the Git server (known_hosts format, a list
+# in one line). Fetch: bash scripts/lab.sh customize --fetch-host-keys. Empty = the
+# preflight of argocd.yml aborts (no blind trust).
+# secrets_repo_url: repo with the SOPS files (secrets/**, ciphertext only), read by the
+# Argo CD apps secrets-*. Empty = the same repo as repo_url. A separate private repo
+# (ADR 0022, docs/how-to/private-secrets-repo.md) must use the same host and port as
+# repo_url (the egress policies allow one Git server). Fill it with:
+# bash scripts/lab.sh secrets-repo export DIR
+repo_url: ssh://git@git.example.org/YOUR-NAME/k8s-lab.git
+secrets_repo_url: ssh://git@git.example.org/YOUR-NAME/k8s-lab-secrets.git
+# source_trust: check before up/rebuild that the commit Argo CD reads from repo_url is the last trusted commit
+# (recorded outside Git in ~/.config/k8s-lab/trusted-head) or a descendant whose commits are all SSH-signed by a key
+# of .gitea/allowed_signers (ADR 0023, docs/concepts/source-trust.md). auto = on once a trusted commit is recorded
+# (bash scripts/lab.sh trust init COMMIT) or when repo_url is on a public forge; on = always; off = never.
+source_trust: auto
+repo_known_hosts: []
+# repo_egress_cidrs: address(es) of the git server as comma text (one address becomes /32).
+# Egress NetworkPolicies cannot name a host, only IPs: the Argo CD repo-server and the docs and
+# notes builders may reach the git server only here, on the SSH port of repo_url. The placeholder
+# 203.0.113.10 (documentation range) blocks everything. Set it with
+# bash scripts/lab.sh repo-egress --resolve (looks up the host of repo_url, writes
+# lab.local.yaml); bash scripts/lab.sh repo-egress then writes it into gitops/ (Argo CD reads only Git).
+repo_egress_cidrs: 203.0.113.10
+
+# ---------- Alternative source: private GitHub mirror (ADR 0024, docs/how-to/neuaufbau-github.md) ----------
+# source: gitea = Argo CD reads repo_url (the default, everything above). github = Argo CD reads github_repo_url
+# instead (a private repo that the git server pushes to, docs/how-to/github-push-mirror.md): the effective repo_url,
+# repo_known_hosts and repo_egress_cidrs are then the github_* values below, and the source trust check is
+# always on (source_trust off is refused). Switch with: bash scripts/lab.sh source github|gitea (writes
+# lab.local.yaml and gitops/, then commit and push). Only github.com on SSH port 22 is supported.
+# github_repo_url: the mirror, SSH, read-only deploy key (~/.ssh/argocd-k8s-lab, key of the mirror repo on GitHub).
+# github_known_hosts: GitHub's published host keys (docs.github.com, "GitHub's SSH key fingerprints", the same
+# three keys as `ssh_key_fingerprints` of api.github.com/meta); tests/trust-tests.sh compares their fingerprints
+# with the list in scripts/lab-customize.py. Refresh: bash scripts/lab.sh customize --fetch-host-keys.
+# github_egress_cidrs: the address ranges GitHub documents for git over SSH (api.github.com/meta, field "git"),
+# comma text. Wider than a single host on purpose (github.com resolves to several addresses in these ranges);
+# bash scripts/lab.sh repo-egress --resolve narrows them to the ranges that hold the addresses github.com has now.
+source: gitea
+github_repo_url: ssh://git@github.com/YOUR-NAME/k8s-lab.git
+# yamllint disable-line rule:line-length
+github_known_hosts: ["github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl", "github.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=", "github.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk="]
+github_egress_cidrs: 140.82.112.0/20,192.30.252.0/22
+
+# ---------- Base image (pinned: fixed release + SHA-256) ----------
+# Source: https://cloud-images.ubuntu.com/releases/noble/release-20261017/SHA256SUMS
+# New image = change all three values together (the file in the cache is called image_file).
+image_url: https://cloud-images.ubuntu.com/releases/noble/release-20261017/ubuntu-24.04-server-cloudimg-amd64.img
+image_sha256: 04e8f2461a16a44e78a370284471f29616cdd9baf1893df25807b71f985b6c94
+image_file: ubuntu-24.04-noble-20261017.img
+
+# ---------- Storage on the PC (outside the repo) ----------
+image_cache_dir: ~/k8s-lab-data/images
+export_dir: ~/k8s-lab-data/vm-export
+log_dir: ~/k8s-lab-data/logs
+
+# ---------- Matrix (Synapse). ONE place for the Matrix server_name. ----------
+# Public HTTPS names follow "domain" (matrix.<domain>, element.<domain>) because the lab CA
+# only signs names under that domain. server_name is the identity of the homeserver and does
+# NOT follow a domain change: phase 2 sets it to the name of the server being imported.
+# lab.sh customize writes this value to gitops/charts/matrix/values.yaml (key serverName)
+# after the domain replacement, so the identity is not rewritten with the lab domain.
+# A fresh instance uses a name under the lab domain (matrix.<domain>); this lab runs the imported homeserver.
+# scripts/matrix-import.sh prepare rewrites this line. No other file may hard-code this value.
+matrix_server_name: matrix.lab.example
+
+# ---------- Time limits of the wrapper (seconds) ----------
+# wait_ssh: until the VM answers via SSH after tofu and cloud-init is done
+# wait_argo: until all Argo CD applications are Synced and Healthy
+# export_max_age_h: so old the last export may be before down/rebuild/purge abort
+wait_ssh: 600
+wait_argo: 1800
+export_max_age_h: 24
+
+# false: an over-budget sum of memory limits only warns in the acceptance (limits are measured properly in a later phase).
+memory_budget_enforce: false

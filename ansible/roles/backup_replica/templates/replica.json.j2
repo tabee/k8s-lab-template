@@ -1,0 +1,19 @@
+{{ {
+  'host': backup_replica_host,
+  'user': backup_replica_user,
+  'port': backup_replica_port,
+  'from_cidr': backup_replica_from_cidr,
+  'key': backup_replica_key,
+  'install_key': backup_replica_install_key,
+  'known_hosts': backup_replica_known_hosts,
+  'rrsync': backup_replica_rrsync,
+  'remote_dir': backup_replica_remote_dir,
+  'data_dir': backup_replica_source,
+  'exclude': backup_replica_exclude,
+  'allow_delete': backup_replica_allow_delete,
+  'max_age_min': backup_replica_max_age_min,
+  'connect_timeout': backup_replica_connect_timeout,
+  'io_timeout': backup_replica_io_timeout,
+  'min_free_factor': backup_replica_min_free_factor,
+  'min_free_mib': backup_replica_min_free_mib
+} | to_nice_json }}

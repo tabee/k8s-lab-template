@@ -1,0 +1,106 @@
+---
+# Egress check (wave 2, issue #5): the NetworkPolicies exist in every namespace and really block.
+# Throwaway pods (PSA restricted) try TCP connections from each policy namespace: what the policies
+# allow must connect, everything else must not. A control pod in a namespace without any policy
+# proves that the blocked targets are reachable at all. Pods and the control namespace are removed
+# afterwards. Run it after every change to a NetworkPolicy and after every change of the git server
+# address (bash scripts/lab.sh repo-egress). Call: ansible-playbook verify-egress.yml
+# (the probes also run inside verify-gitea.yml, verify-cnpg.yml, verify-docs.yml, verify-argocd.yml).
+
+- name: Check the egress policies
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: "{{ argocd_kubeconfig }}"
+  vars:
+    # Policy names per namespace (mirror of gitops/, Ansible does not read gitops/).
+    verify_egress_policies:
+      gitea:
+        - default-deny-egress
+        - allow-egress-dns
+        - allow-egress-same-namespace
+        - allow-egress-cnpg-api-s3
+        - allow-egress-pooler-api
+        - allow-egress-k8up
+      keycloak:
+        - default-deny-egress
+        - allow-egress-dns
+        - allow-egress-same-namespace
+        - allow-egress-cnpg-api-s3
+      db-lab:
+        - default-deny-egress
+        - allow-egress-dns
+        - allow-egress-same-namespace
+        - allow-egress-cnpg-api-s3
+        - allow-egress-pooler-api
+      docs:
+        - docs-allow-egress
+      argocd:
+        - argocd-repo-server-egress
+    verify_egress_notes_sites: "{{ lookup('ansible.builtin.file', notes_sites_file) | from_yaml | default([], true) }}"
+    # Sites with a login proxy (auth sso; the default is notes_auth_default).
+    verify_egress_sso_sites: >-
+      {{ verify_egress_notes_sites | rejectattr('auth', 'equalto', 'basic') | list
+         if notes_auth_default == 'sso' else verify_egress_notes_sites | selectattr('auth', 'equalto', 'sso') | list }}
+  tasks:
+    - name: Read the NetworkPolicies of every namespace
+      kubernetes.core.k8s_info:
+        kind: NetworkPolicy
+        namespace: "{{ item.key }}"
+      register: verify_egress_found
+      loop: "{{ verify_egress_policies | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    - name: Every egress policy exists
+      ansible.builtin.assert:
+        that: item.item.value | difference(item.resources | map(attribute='metadata.name') | list) | length == 0
+        fail_msg: >-
+          Namespace {{ item.item.key }}: missing {{ item.item.value | difference(item.resources | map(attribute='metadata.name') | list) }}
+          (is the Argo CD app synced? Git server address: bash scripts/lab.sh repo-egress --dry-run)
+        quiet: true
+      loop: "{{ verify_egress_found.results }}"
+      loop_control:
+        label: "{{ item.item.key }}"
+
+    - name: Every notes namespace has its egress policy
+      kubernetes.core.k8s_info:
+        kind: NetworkPolicy
+        namespace: "notes-{{ item.name }}"
+        name: notes-allow-egress
+      register: verify_egress_notes_np
+      failed_when: verify_egress_notes_np.resources | length != 1
+      loop: "{{ verify_egress_notes_sites }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Every sso notes namespace has the egress policy of its login proxy
+      kubernetes.core.k8s_info:
+        kind: NetworkPolicy
+        namespace: "notes-{{ item.name }}"
+        name: notes-oauth2-proxy-allow-egress
+      register: verify_egress_proxy_np
+      failed_when: verify_egress_proxy_np.resources | length != 1
+      loop: "{{ verify_egress_sso_sites }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Probes in every namespace (control first; all pods run side by side)
+      ansible.builtin.include_tasks: tasks/egress-probe.yml
+      vars:
+        egress_probes: >-
+          {{ egress_probe_control + egress_probe_gitea + egress_probe_matrix + egress_probe_keycloak + egress_probe_dblab + egress_probe_docs
+             + egress_probe_argocd + (verify_egress_notes_probes | default([])) + (verify_egress_proxy_probes | default([])) }}
+        verify_egress_notes_probes: >-
+          {{ [{'name': 'notes-' ~ verify_egress_notes_sites[0].name, 'namespace': 'notes-' ~ verify_egress_notes_sites[0].name,
+               'labels': {'app.kubernetes.io/name': 'notes', 'app.kubernetes.io/instance': verify_egress_notes_sites[0].name},
+               'open': [egress_t_git], 'closed': [egress_t_api, egress_t_s3] + egress_t_other}]
+             if verify_egress_notes_sites | length > 0 else [] }}
+        # Login proxy: only Keycloak (in-cluster, port 8080) is open; no git server, API server, S3 or internet.
+        verify_egress_proxy_probes: >-
+          {{ [{'name': 'notes-proxy-' ~ verify_egress_sso_sites[0].name, 'namespace': 'notes-' ~ verify_egress_sso_sites[0].name,
+               'labels': {'app.kubernetes.io/name': 'notes-oauth2-proxy', 'app.kubernetes.io/instance': verify_egress_sso_sites[0].name},
+               'open': [egress_t_keycloak], 'closed': [egress_t_api, egress_t_s3, egress_t_git] + egress_t_other}]
+             if verify_egress_sso_sites | length > 0 else [] }}

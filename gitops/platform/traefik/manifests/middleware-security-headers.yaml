@@ -1,0 +1,27 @@
+---
+# Security headers for all responses on websecure. Attached at the
+# Entrypoint (values.yaml: ports.websecure.http.middlewares) als
+# traefik_security-headers@kubernetescrd (safeNaming: underscore).
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: security-headers
+  namespace: traefik
+  annotations:
+    # CRD comes from the chart in the same sync.
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+spec:
+  headers:
+    # HSTS: one year. Browsers ignore the header as long as the certificate
+    # is not trusted (RFC 6797, 8.1), so no lockout in the lab.
+    stsSeconds: 31536000
+    stsIncludeSubdomains: true
+    stsPreload: false
+    contentTypeNosniff: true
+    frameDeny: true
+    referrerPolicy: no-referrer
+    permissionsPolicy: camera=(), microphone=(), geolocation=()
+    # An empty value removes the header (Server comes from the backend).
+    customResponseHeaders:
+      Server: ""
+      X-Powered-By: ""

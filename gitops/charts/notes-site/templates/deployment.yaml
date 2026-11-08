@@ -1,0 +1,205 @@
+---
+# Notes site, built the same way as the docs site (gitops/workloads/docs):
+# - builder: every pollSeconds fetches the branch of the notes repo via SSH
+#   (deploy key from the secret, created by Ansible). On a new commit: copy
+#   without .git (git archive, submodules fetched and copied the same way) to
+#   /tmp/work, docs/build.sh of this repo builds
+#   it with notes-prepare.py (ZENSICAL_PREPARE) to /site/next, then
+#   swap with /site/live (mv --exchange). Failed build: old
+#   version stays online.
+# - web: static-web-server serves /site/live (port 8080, read only).
+# Meets PSA restricted. Runbook: docs/how-to/notes-sites.md
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notes
+  labels:
+    {{- include "notes.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      {{- include "notes.selector" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "notes.labels" . | nindent 8 }}
+      annotations:
+        # New tools (ConfigMap) = new pod.
+        checksum/build: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        # 65534 (nobody) exists in the Python image; ssh needs the entry.
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        # Empty /site/live, so that the web server starts immediately.
+        - name: init
+          image: {{ .Values.images.builder }}
+          command: ["mkdir", "-p", "/site/live"]
+          securityContext: &container-security
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 64Mi
+          volumeMounts:
+            - name: site
+              mountPath: /site
+      containers:
+        - name: builder
+          image: {{ .Values.images.builder }}
+          command: ["bash", "-c"]
+          args:
+            - |
+              set -uo pipefail
+              export GIT_SSH_COMMAND="ssh -i /etc/notes-repo/ssh-privatekey -o IdentitiesOnly=yes \
+                -o UserKnownHostsFile=/etc/notes-repo/known_hosts -o StrictHostKeyChecking=yes \
+                -o BatchMode=yes -o ConnectTimeout=20"
+              src=/tmp/src
+              # Exported: "git submodule foreach" runs its command in a child shell.
+              export work=/tmp/work
+              built=""
+              while :; do
+                if { [ -d "$src/.git" ] || timeout 300 git clone -q --depth 1 --single-branch --branch "$REPO_BRANCH" "$REPO_URL" "$src"; } \
+                  && timeout 300 git -C "$src" fetch -q --depth 1 origin "$REPO_BRANCH" \
+                  && git -C "$src" reset -q --hard FETCH_HEAD; then
+                  rev=$(git -C "$src" rev-parse --short=12 HEAD)
+                  if [ "$rev" != "$built" ]; then
+                    echo "$(date -Is) building $rev"
+                    rm -rf /site/next "$work"
+                    # git archive leaves submodules (gitlinks) out: fetch them and copy
+                    # their trees, again without .git, to the same path in the working
+                    # copy. Public HTTPS URLs need no key; SSH URLs use the deploy key.
+                    if mkdir -p "$work" && git -C "$src" archive HEAD | tar -x -C "$work" \
+                      && git -C "$src" submodule --quiet sync \
+                      && timeout 300 git -C "$src" submodule --quiet update --init \
+                      && git -C "$src" submodule --quiet foreach \
+                        'mkdir -p "$work/$sm_path" && git archive HEAD | tar -x -C "$work/$sm_path"' \
+                      && timeout 900 bash /opt/notes-build/build.sh /site/next \
+                      && mv -T --exchange /site/next /site/live; then
+                      rm -rf /site/next
+                      built=$rev
+                      echo "$(date -Is) online: $rev"
+                    else
+                      echo "$(date -Is) ERROR: build $rev failed, old version stays online"
+                    fi
+                  fi
+                else
+                  echo "$(date -Is) ERROR: git fetch failed (deploy key entered in Gitea?), trying again later"
+                fi
+                sleep "$POLL_SECONDS"
+              done
+          env:
+            - name: REPO_URL
+              value: {{ .Values.site.repo | quote }}
+            - name: REPO_BRANCH
+              value: {{ .Values.site.branch | default "main" | quote }}
+            - name: POLL_SECONDS
+              value: {{ .Values.pollSeconds | quote }}
+            # For docs/build.sh: build the working copy, prepare beforehand,
+            # warnings not as abort (links to excluded pages).
+            - name: ZENSICAL_PROJECT
+              value: /tmp/work
+            - name: ZENSICAL_PREPARE
+              value: /opt/notes-build/notes-prepare.py
+            - name: ZENSICAL_STRICT
+              value: "0"
+            # For notes-prepare.py.
+            - name: SITE_URL
+              value: {{ printf "https://%s/" .Values.site.host | quote }}
+            - name: SITE_TITLE
+              value: {{ .Values.site.title | default .Values.site.name | quote }}
+            - name: PRIVATE_FILTER
+              value: {{ .Values.site.privateFilter | toString | lower | quote }}
+            # git, pip and tool cache write to /tmp.
+            - name: HOME
+              value: /tmp
+          securityContext: *container-security
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 256Mi  # lab-limit: notes-*/notes/builder
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: site
+              mountPath: /site
+            - name: build
+              mountPath: /opt/notes-build
+              readOnly: true
+            - name: repo-key
+              mountPath: /etc/notes-repo
+              readOnly: true
+        - name: web
+          image: {{ .Values.images.web }}
+          env:
+            - name: SERVER_ROOT
+              value: /site/live
+            - name: SERVER_PORT
+              value: "8080"
+            - name: SERVER_HEALTH
+              value: "true"
+            - name: SERVER_LOG_LEVEL
+              value: warn
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          securityContext: *container-security
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 64Mi  # lab-limit: notes-*/notes/web
+          # Ready only with the first build (404 on / before).
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          volumeMounts:
+            - name: site
+              mountPath: /site
+              readOnly: true
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 1Gi
+        - name: site
+          emptyDir:
+            sizeLimit: 256Mi
+        - name: build
+          configMap:
+            name: notes-build
+        # Deploy key (read only) and known_hosts, readable for group 65534.
+        - name: repo-key
+          secret:
+            secretName: {{ .Values.secrets.repo }}
+            defaultMode: 288  # = 0440 octal (r--r-----)
+            items:
+              - key: ssh-privatekey
+                path: ssh-privatekey
+              - key: known_hosts
+                path: known_hosts

@@ -1,0 +1,245 @@
+---
+# Repo access (secret), AppProject and root application.
+
+# The private key is only in the secret (encrypted via secretbox), never in
+# Git and never in the output: no_log and diff: false.
+# rstrip=false: the key needs the trailing newline.
+- name: Create repo secret with deploy key
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      type: Opaque
+      metadata:
+        name: "{{ argocd_repo_secret_name }}"
+        namespace: "{{ argocd_namespace }}"
+        labels:
+          argocd.argoproj.io/secret-type: repository
+      data:
+        type: "{{ 'git' | b64encode }}"
+        url: "{{ argocd_repo_url | b64encode }}"
+        sshPrivateKey: "{{ lookup('ansible.builtin.file', argocd_repo_ssh_key_path | expanduser, rstrip=false) | b64encode }}"
+  no_log: true
+  diff: false
+  # In check mode the namespace is only "simulated" on the first run.
+  when: not (ansible_check_mode and argocd_bootstrap_namespace is changed)
+
+# Separate private secrets repo (ADR 0022): own read-only deploy key, same pattern.
+# Not created while secrets_repo_url equals repo_url (the default).
+- name: Create repo secret for the private secrets repo
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      type: Opaque
+      metadata:
+        name: "{{ argocd_secrets_repo_secret_name }}"
+        namespace: "{{ argocd_namespace }}"
+        labels:
+          argocd.argoproj.io/secret-type: repository
+      data:
+        type: "{{ 'git' | b64encode }}"
+        url: "{{ argocd_secrets_repo_url | b64encode }}"
+        sshPrivateKey: "{{ lookup('ansible.builtin.file', argocd_secrets_repo_ssh_key_path | expanduser, rstrip=false) | b64encode }}"
+  no_log: true
+  diff: false
+  when:
+    - argocd_secrets_repo_separate | bool
+    - not (ansible_check_mode and argocd_bootstrap_namespace is changed)
+
+# AppProject and Application are CRDs from the chart. In check mode Helm has
+# nothing installed, so the CRDs are missing on the first run and the task
+# would fail. Hence only in the real run (same lesson as with auditd).
+- name: Create AppProject and root application
+  when: not ansible_check_mode
+  block:
+    # Targets: list of namespaces -> [{server, namespace}, ...].
+    - name: Limit AppProject lab to repo and workload namespaces
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: argoproj.io/v1alpha1
+          kind: AppProject
+          metadata:
+            name: "{{ argocd_project }}"
+            namespace: "{{ argocd_namespace }}"
+          spec:
+            description: k3s lab workloads, only this repo and allowed namespaces
+            # Deny new/continued Keycloak syncs during the bounded K8up slots.
+            # Existing hook pods still use their deadline; keep a 30-minute lead-in.
+            syncWindows:
+              - kind: deny
+                schedule: "0 20 * * *"
+                duration: 6h30m
+                timeZone: UTC
+                applications: [keycloak]
+                manualSync: false
+                syncOverrun: false
+            sourceRepos: "{{ argocd_git_repos + argocd_project_chart_repos }}"
+            destinations: >-
+              {{ argocd_project_namespaces
+                 | map('community.general.dict_kv', 'namespace')
+                 | map('combine', {'server': argocd_destination_server})
+                 | list }}
+            # Cluster-wide only namespaces (their PSA labels are in Git).
+            clusterResourceWhitelist:
+              - group: ""
+                kind: Namespace
+
+    # Platform services (Traefik, cert-manager): Git repo plus chart sources,
+    # only own namespaces, cluster-wide only the kinds from
+    # argocd_platform_cluster_resources.
+    - name: Create AppProject platform for platform services
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: argoproj.io/v1alpha1
+          kind: AppProject
+          metadata:
+            name: "{{ argocd_platform_project }}"
+            namespace: "{{ argocd_namespace }}"
+          spec:
+            description: k3s lab platform (ingress, certificates), only allowed repos and namespaces
+            sourceRepos: "{{ argocd_git_repos + argocd_platform_chart_repos }}"
+            destinations: >-
+              {{ argocd_platform_namespaces
+                 | map('community.general.dict_kv', 'namespace')
+                 | map('combine', {'server': argocd_destination_server})
+                 | list }}
+            clusterResourceWhitelist: "{{ argocd_platform_cluster_resources }}"
+
+    # Wave 2. Project root: only for the root Application. It may create exactly
+    # Application and ApplicationSet in the namespace argocd. No other kind and
+    # nothing cluster-wide (empty cluster whitelist = nothing allowed).
+    - name: AppProject root for the root Application only
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: argoproj.io/v1alpha1
+          kind: AppProject
+          metadata:
+            name: "{{ argocd_root_project }}"
+            namespace: "{{ argocd_namespace }}"
+          spec:
+            description: Root Application only, may create Application and ApplicationSet in the Argo CD namespace
+            sourceRepos:
+              - "{{ argocd_repo_url }}"
+            destinations:
+              - server: "{{ argocd_destination_server }}"
+                namespace: "{{ argocd_namespace }}"
+            clusterResourceWhitelist: []
+            namespaceResourceWhitelist: "{{ argocd_root_project_resources }}"
+
+    # Wave 2. Project argocd-ui: the Application argocd-ingress writes into the
+    # namespace argocd (certificate, route, NetworkPolicies). Only those kinds.
+    - name: AppProject for the Argo CD ingress Application
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: argoproj.io/v1alpha1
+          kind: AppProject
+          metadata:
+            name: "{{ argocd_ui_project }}"
+            namespace: "{{ argocd_namespace }}"
+          spec:
+            description: Argo CD ingress Application only, narrow kinds in the Argo CD namespace
+            sourceRepos:
+              - "{{ argocd_repo_url }}"
+            destinations: >-
+              {{ argocd_ui_namespaces
+                 | map('community.general.dict_kv', 'namespace')
+                 | map('combine', {'server': argocd_destination_server})
+                 | list }}
+            clusterResourceWhitelist: []
+            namespaceResourceWhitelist: "{{ argocd_ui_resources }}"
+
+    # Wave 2. The built-in project default accepts every repo, every destination
+    # and every kind. Empty lists (not absent) mean "nothing allowed". No
+    # Application uses it (verify-argocd.yml checks that).
+    - name: Close the built-in AppProject default
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: argoproj.io/v1alpha1
+          kind: AppProject
+          metadata:
+            name: "{{ argocd_default_project }}"
+            namespace: "{{ argocd_namespace }}"
+          spec:
+            description: Closed in wave 2, no sources, no destinations, no kinds
+            sourceRepos: []
+            destinations: []
+            clusterResourceWhitelist: []
+            namespaceResourceWhitelist: []
+
+    # Pin (issue 71): lab.sh passes the commit it has verified as argocd_pin_revision. The root app then
+    # reads exactly that commit, and its Kustomize patches (scripts/pin-revision.py) do the same for every
+    # child application. A branch that moves while the bootstrap runs brings in nothing unverified.
+    # Empty (the default) = no pin, the root app follows the branch.
+    - name: Compute the Kustomize patches that pin the child applications
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_playbook_python }}"
+          - "{{ playbook_dir }}/../scripts/pin-revision.py"
+          - --repo-url
+          - "{{ argocd_repo_url }}"
+          - --revision
+          - "{{ argocd_pin_revision }}"
+          - --repo
+          - "{{ playbook_dir }}/.."
+          - --apps
+          - "{{ argocd_root_app_path }}"
+          - --from-git
+          - "{{ argocd_pin_revision }}"
+      register: argocd_bootstrap_pin_patches
+      changed_when: false
+      check_mode: false
+      when: argocd_pin_revision | default('') | length > 0
+
+    # Without a pin an existing pin stays as it is (fail closed): releasing it is an explicit step
+    # (lab.sh trust release), because it should follow your own check of the commits.
+    - name: Read the root application (is an earlier pin still on?)
+      kubernetes.core.k8s_info:
+        api_version: argoproj.io/v1alpha1
+        kind: Application
+        namespace: "{{ argocd_namespace }}"
+        name: "{{ argocd_root_app_name }}"
+      register: argocd_bootstrap_root_now
+      when: argocd_pin_revision | default('') | length == 0
+
+    - name: Source of the root application
+      ansible.builtin.set_fact:
+        argocd_bootstrap_root_source: >-
+          {{ argocd_bootstrap_root_now.resources[0].spec.source
+             if (argocd_pin_revision | default('') | length == 0
+                 and argocd_bootstrap_root_now.resources | default([]) | length == 1
+                 and (argocd_bootstrap_root_now.resources[0].spec.source.kustomize | default({})).patches is defined)
+             else {'repoURL': argocd_repo_url,
+                   'targetRevision': (argocd_pin_revision | default('')) or argocd_repo_revision,
+                   'path': argocd_root_app_path}
+                  | combine({'kustomize': {'patches': (argocd_bootstrap_pin_patches.stdout | from_json)}}
+                            if (argocd_pin_revision | default('') | length > 0) else {}) }}
+
+    # Finalizer: deleting the root app also cleans up the child apps (way back).
+    - name: Create root application (app of apps)
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: argoproj.io/v1alpha1
+          kind: Application
+          metadata:
+            name: "{{ argocd_root_app_name }}"
+            namespace: "{{ argocd_namespace }}"
+            finalizers:
+              - resources-finalizer.argocd.argoproj.io
+          spec:
+            project: "{{ argocd_root_project }}"
+            source: "{{ argocd_bootstrap_root_source }}"
+            destination:
+              server: "{{ argocd_destination_server }}"
+              namespace: "{{ argocd_namespace }}"
+            syncPolicy:
+              # Single definition, also used by recover-files.yml.
+              automated: "{{ argocd_root_automated }}"

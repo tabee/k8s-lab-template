@@ -1,0 +1,66 @@
+---
+# File backup of the Gitea repos (PVC gitea-shared-storage) with K8up/restic
+# to rustfs, bucket k8up-k3s-lab (own user, stage 8c).
+# ONLY place for these times. Time zone UTC (values.yaml of the app
+# k8up, timezone: UTC), cron with 5 fields:
+#   Backup 20:30 daily, prune 22:30 daily, check Sunday 00:30.
+# Matrix takes the intervening hourly slots (21:30, 23:30, Sunday 01:30).
+# Each action has a 30-minute wall-clock deadline, plus a 5-minute allowance
+# for termination/controller delay. One-hour spacing leaves 25 minutes idle.
+# concurrentRunsAllowed is per action, NOT a cross-namespace mutex.
+# The Keycloak sync fence and manual-run rule live in memory-budget.md.
+# Only a PVC with k8up.io/backup: "true" is backed up (values-gitea.yaml,
+# persistence.annotations); the Postgres PVCs stay out.
+#
+# COPY: endpoint and bucket actually exist only in
+# ansible/inventory/group_vars/all/backup_s3.yml (backup_s3_vm_endpoint,
+# backup_s3_k8up_bucket). ansible/verify-gitea.yml compares.
+apiVersion: k8up.io/v1
+kind: Schedule
+metadata:
+  name: gitea-files
+  namespace: gitea
+  annotations:
+    # The CRD comes from the app k8up. Until then retry (apps/gitea.yaml).
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+spec:
+  # Security and resources of all jobs (k8up-podconfig.yaml).
+  podConfigRef:
+    name: k8up-restricted
+  backend:
+    # restic password (encrypts the repo). Without this password
+    # every backup is worthless: copy lives on the owner's PC under
+    # ~/.config/k8s-lab/k8up-k3s-lab-repo.pw (0600), in the cluster as
+    # SOPS-Secret k8up-repo.
+    repoPasswordSecretRef:
+      name: k8up-repo
+      key: password
+    s3:
+      endpoint: http://192.168.122.1:9000
+      bucket: k8up-k3s-lab
+      accessKeyIDSecretRef:
+        name: k8up-s3-creds
+        key: ACCESS_KEY_ID
+      secretAccessKeySecretRef:
+        name: k8up-s3-creds
+        key: ACCESS_SECRET_KEY
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 2
+  backup:
+    schedule: "30 20 * * *"
+    concurrentRunsAllowed: false
+    activeDeadlineSeconds: 1800
+  prune:
+    schedule: "30 22 * * *"
+    concurrentRunsAllowed: false
+    activeDeadlineSeconds: 1800
+    # 14 days like the CNPG backups, plus 8 weekly and 6 monthly states
+    # (repos change slowly, restic deduplicates, it costs little).
+    retention:
+      keepDaily: 14
+      keepWeekly: 8
+      keepMonthly: 6
+  check:
+    schedule: "30 0 * * 0"
+    concurrentRunsAllowed: false
+    activeDeadlineSeconds: 1800

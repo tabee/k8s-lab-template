@@ -1,0 +1,42 @@
+---
+# Backup target for matrix-db (Barman cloud plugin): rustfs, same bucket
+# cnpg-k3s-lab as the other clusters, own prefix matrix.
+# Location: s3://cnpg-k3s-lab/matrix/matrix-db/{base,wals}.
+#
+# COPY: endpointURL and bucket exist only in
+# ansible/inventory/group_vars/all/backup_s3.yml. verify-matrix.yml compares.
+apiVersion: barmancloud.cnpg.io/v1
+kind: ObjectStore
+metadata:
+  name: matrix-db
+  namespace: matrix
+spec:
+  retentionPolicy: "14d"
+  configuration:
+    destinationPath: s3://cnpg-k3s-lab/matrix
+    endpointURL: http://192.168.122.1:9000
+    s3Credentials:
+      accessKeyId:
+        name: backup-s3-creds
+        key: ACCESS_KEY_ID
+      secretAccessKey:
+        name: backup-s3-creds
+        key: ACCESS_SECRET_KEY
+    wal:
+      compression: gzip
+      maxParallel: 2
+    data:
+      compression: gzip
+      jobs: 1
+  instanceSidecarConfiguration:
+    env:
+      - name: AWS_REQUEST_CHECKSUM_CALCULATION
+        value: when_required
+      - name: AWS_RESPONSE_CHECKSUM_VALIDATION
+        value: when_required
+    resources:
+      requests:
+        cpu: 10m
+        memory: 64Mi
+      limits:
+        memory: 160Mi  # lab-limit: matrix/matrix-db/plugin-barman-cloud

@@ -1,0 +1,39 @@
+---
+# Role "notes_sites": per entry in gitops/sites.yaml namespace (PSA),
+# deploy key, password and the two secrets; plus the AppProject notes.
+# Secrets stay with Ansible for now (docs/learning-path/stage-7-ksops.md, pattern for later).
+galaxy_info:
+  author: k8s-lab
+  description: Prepare notes sites (namespaces, deploy keys, basic auth; localhost, k8s API)
+  license: MIT
+  min_ansible_version: "2.17"
+  platforms:
+    - name: GenericLinux
+      versions:
+        - all
+dependencies: []
+
+# Values from inventory/group_vars/all/notes.yml and argocd.yml. The
+# Kubeconfig is set by the playbook (module_defaults in argocd.yml).
+argument_specs:
+  main:
+    short_description: Namespaces, deploy keys and basic auth of the notes sites (runs on localhost)
+    options:
+      notes_sites_file: { type: path, required: true, description: "List of the notebooks (gitops/sites.yaml)" }
+      notes_namespace_prefix: { type: str, required: true, description: "Prefix of the namespaces (notes-)" }
+      notes_project: { type: str, required: true, description: AppProject of the notes sites }
+      notes_psa_level:
+        type: str
+        required: true
+        choices: [privileged, baseline, restricted]
+        description: PSA level for the namespaces (enforce, audit, warn)
+      notes_psa_version: { type: str, required: true, description: PSA version (latest or v1.x) }
+      notes_repo_secret_name: { type: str, required: true, description: Secret with deploy key and known_hosts }
+      notes_auth_secret_name: { type: str, required: true, description: Secret with user and password (basic-auth) }
+      notes_deploy_key_dir: { type: str, required: true, description: Folder of the deploy keys on the control machine }
+      notes_password_dir: { type: str, required: true, description: Folder of the password files on the control machine }
+      notes_password_length: { type: int, required: true, description: Length of new passwords }
+      argocd_namespace: { type: str, required: true, description: Namespace of Argo CD (AppProject) }
+      argocd_repo_url: { type: str, required: true, description: "This repo (only allowed source)" }
+      argocd_destination_server: { type: str, required: true, description: Target cluster of the apps }
+      lab_probe_image: { type: str, required: true, description: "Probe image with tag and digest (group_vars/all/images.yml)" }

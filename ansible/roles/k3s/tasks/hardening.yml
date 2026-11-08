@@ -1,0 +1,40 @@
+---
+# Files for Pod Security Admission and API audit. Must exist BEFORE the
+# (re)start of k3s, otherwise the kube-apiserver does not start.
+# Source: https://docs.k3s.io/security/hardening-guide
+# secrets-encryption-provider=secretbox: flag checked in k3s v1.36.5+k3s1
+# (pkg/cli/cmds/server.go). Migration of existing secrets: docs/learning-path/stage-3-hardening.md
+
+- name: Server data directory for root only
+  ansible.builtin.file:
+    path: "{{ k3s_server_data_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Directory for the API audit log (0700 per hardening guide)
+  ansible.builtin.file:
+    path: "{{ k3s_audit_log_path | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Write Pod Security Admission configuration
+  ansible.builtin.template:
+    src: psa.yaml.j2
+    dest: "{{ k3s_psa_config_path }}"
+    owner: root
+    group: root
+    mode: "0600"
+  notify: Restart k3s
+
+- name: Write audit policy
+  ansible.builtin.template:
+    src: audit-policy.yaml.j2
+    dest: "{{ k3s_audit_policy_path }}"
+    owner: root
+    group: root
+    mode: "0600"
+  notify: Restart k3s

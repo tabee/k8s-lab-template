@@ -1,0 +1,61 @@
+---
+# Role "backup_alert": alerts for backup and edge failures (issue #8) on the owner's PC: config (rendered from
+# group_vars/all/alert.yml), script and a systemd user timer. No secret is written: the Matrix token stays in its SOPS file.
+galaxy_info:
+  author: k8s-lab
+  description: Alarm checks for backups, replica and edge with pluggable sinks (Matrix, desktop, journal)
+  license: MIT
+  min_ansible_version: "2.17"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - noble
+dependencies: []
+
+argument_specs:
+  main:
+    short_description: Alert timer on the backup host (values from group_vars/all/alert.yml)
+    options:
+      backup_alert_config: { type: str, required: true, description: JSON config read by lab-alert.py }
+      backup_alert_state_file: { type: str, required: true, description: State of the checks (for deduplication) }
+      backup_alert_script: { type: str, required: true, description: Install path of lab-alert.py }
+      backup_alert_unit_prefix: { type: str, required: true, description: Prefix of the systemd unit names }
+      backup_alert_interval_min: { type: int, required: true, description: Minutes between check runs }
+      backup_alert_boot_delay_min: { type: int, required: true, description: Minutes after boot of the first run }
+      backup_alert_repeat_hours: { type: int, required: true, description: Hours until a reminder for a failing check }
+      backup_alert_maintenance_file: { type: str, required: true, description: Marker file written by lab.sh while it rebuilds the VM }
+      backup_alert_maintenance_max_hours: { type: int, required: true, description: Age after which a marker is ignored }
+      backup_alert_sinks: { type: list, elements: str, required: true, description: Sinks used for every alert }
+      backup_alert_fallback_sinks: { type: list, elements: str, required: true, description: Sinks when nothing was delivered }
+      backup_alert_heartbeat_enabled: { type: bool, required: true, description: External heartbeat ping switched on }
+      alert_heartbeat_url_file: { type: str, required: true, description: SOPS file with the ping (and optional fail) URL }
+      backup_alert_heartbeat_ping_url_key: { type: str, required: true, description: Key of the ping URL in the SOPS file }
+      backup_alert_heartbeat_fail_url_key: { type: str, required: true, description: Key of the optional fail URL (empty string disables) }
+      backup_alert_matrix_enabled: { type: bool, required: true, description: Matrix sink switched on (off until Synapse exists) }
+      backup_alert_matrix_homeserver: { type: str, required: true, description: Homeserver URL (through the VPN) }
+      backup_alert_matrix_room_id: { type: str, required: true, description: Room id of the alert room }
+      alert_matrix_token_file: { type: str, required: true, description: SOPS file with the bot access token }
+      backup_alert_matrix_token_key: { type: str, required: true, description: Key of the token in the SOPS file }
+      backup_alert_sops_bin: { type: str, required: true, description: sops binary }
+      backup_alert_age_key_file: { type: str, required: true, description: age key that decrypts the token file }
+      backup_alert_desktop_bin: { type: str, required: true, description: Desktop notification command }
+      backup_alert_exec_argv: { type: list, elements: str, required: true, description: Command of the exec sink (message on stdin; empty list is off) }
+      backup_alert_cnpg_max_age_hours: { type: int, required: true, description: Maximum age of the last CNPG backup }
+      backup_alert_k8up_max_age_hours: { type: int, required: true, description: Maximum age of the last K8up backup }
+      backup_alert_cnpg_clusters: { type: list, elements: dict, required: true, description: "CNPG clusters (namespace, name)" }
+      backup_alert_k8up_namespaces: { type: list, elements: str, required: true, description: Namespaces with a K8up schedule }
+      backup_alert_kubeconfig: { type: str, required: true, description: kubeconfig for kubectl }
+      backup_alert_kubectl_bin: { type: str, required: true, description: kubectl binary }
+      backup_alert_kubectl_timeout: { type: int, required: true, description: kubectl timeout in seconds }
+      backup_alert_rustfs_url: { type: str, required: true, description: rustfs health URL }
+      backup_alert_http_timeout: { type: int, required: true, description: HTTP timeout in seconds }
+      backup_alert_edge_enabled: { type: bool, required: true, description: Edge check switched on }
+      backup_alert_edge_ip: { type: str, required: true, description: LoadBalancer IP of Traefik }
+      backup_alert_edge_port: { type: int, required: true, description: Admin entrypoint port }
+      backup_alert_edge_host: { type: str, required: true, description: Host name (SNI) of whoami }
+      backup_alert_edge_ca_file: { type: str, required: true, description: Lab CA certificate }
+      backup_alert_edge_expect: { type: str, required: true, description: Text that whoami answers with }
+      backup_replica_enabled: { type: bool, required: true, description: Replica check is part of the alerts when on }
+      backup_replica_config: { type: str, required: true, description: Config of lab-replica.py (for its status) }
+      backup_replica_script: { type: str, required: true, description: Install path of lab-replica.py }
+      backup_replica_io_timeout: { type: int, required: true, description: Timeout of the replica status call }

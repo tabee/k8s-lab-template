@@ -1,0 +1,54 @@
+---
+# Pause auto-sync of the root application (app of apps). Why: root has
+# automated.selfHeal, so within minutes it reverts every change to the child
+# Applications (here: the removed automated block of gitea and matrix) back
+# to Git. Argo CD then scales Gitea up again on an empty PVC. Root must be
+# paused first, the children second. Idempotent: root without automated is
+# left alone. Nothing secret: only the Application name and a policy flag.
+- name: Read the root application
+  kubernetes.core.k8s_info:
+    api_version: argoproj.io/v1alpha1
+    kind: Application
+    namespace: "{{ argocd_namespace }}"
+    name: "{{ argocd_root_app_name }}"
+  register: recover_root
+
+- name: Say what happens to root
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'root has no automated sync, nothing to pause'
+         if (recover_root.resources | default([]) | length == 1
+             and recover_root.resources[0].spec.syncPolicy.automated is not defined)
+         else ('root application not found, nothing to pause'
+               if recover_root.resources | default([]) | length == 0
+               else 'pausing auto-sync of root, resume puts it back') }}
+
+- name: Pause auto-sync of root
+  when:
+    - recover_root.resources | default([]) | length == 1
+    - recover_root.resources[0].spec.syncPolicy.automated is defined
+  kubernetes.core.k8s_json_patch:
+    api_version: argoproj.io/v1alpha1
+    kind: Application
+    namespace: "{{ argocd_namespace }}"
+    name: "{{ argocd_root_app_name }}"
+    patch:
+      - op: remove
+        path: /spec/syncPolicy/automated
+
+# A sync that root started just before the pause must be finished, otherwise
+# it can still revert the children.
+- name: Wait until root has no running sync operation
+  when: recover_root.resources | default([]) | length == 1
+  kubernetes.core.k8s_info:
+    api_version: argoproj.io/v1alpha1
+    kind: Application
+    namespace: "{{ argocd_namespace }}"
+    name: "{{ argocd_root_app_name }}"
+  register: recover_root_op
+  retries: 24
+  delay: 5
+  until: >-
+    recover_root_op.resources | default([]) | length == 1
+    and recover_root_op.resources[0].operation is not defined
+    and (recover_root_op.resources[0].status.operationState.phase | default('Succeeded')) != 'Running'

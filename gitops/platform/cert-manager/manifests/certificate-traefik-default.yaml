@@ -1,0 +1,36 @@
+---
+# Default certificate for Traefik (TLSStore default, namespace traefik).
+# Lives in the app cert-manager (not traefik), so that the app traefik does not
+# on the cert-manager CRDs.
+# Deliberately NO wildcard: the name matches no real host. With sniStrict
+# the default certificate is never served anyway; it only replaces Traefik's
+# self-signed certificate (e.g. for a future TLSOption without
+# sniStrict) and thus makes a hit visible instead of silently valid.
+# Every app gets its own Certificate (see workloads/whoami/certificate.yaml).
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: traefik-default
+  namespace: traefik
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+spec:
+  # Name must match platform/traefik/manifests/tlsstore-default.yaml.
+  secretName: traefik-default-tls
+  dnsNames:
+    - traefik-default.lab.example
+  # 90 days, renewal 30 days before (reasoning: docs/learning-path/stage-6-certmanager.md).
+  duration: 2160h
+  renewBefore: 720h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  usages:
+    - digital signature
+    - server auth
+  issuerRef:
+    group: cert-manager.io
+    kind: ClusterIssuer
+    name: lab-ca

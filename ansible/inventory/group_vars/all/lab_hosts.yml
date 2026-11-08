@@ -1,0 +1,32 @@
+---
+# Values for the role lab_hosts (playbook backup-host.yml, runs on the owner's
+# PC): block with the lab names in /etc/hosts. No secrets.
+# The names are NOT here, the role reads them from the repo:
+#   certificates  gitops/workloads/*/certificate.yaml (spec.dnsNames)
+#   Gitea        gitops/workloads/gitea/values-gitea.yaml (gitea.config.server.DOMAIN)
+#   notes sites  gitops/sites.yaml (field host)
+# A new service with a Certificate under gitops/workloads/ appears on the
+# next run of backup-host.yml by itself. The IP comes from the
+# Inventory (k3s-lab, ansible_host).
+
+lab_hosts_file: /etc/hosts
+# Only names of this domain go into the block (traefik-default and foreign ones do not).
+lab_hosts_domain: "{{ lab.domain }}"
+lab_hosts_ip: "{{ hostvars[groups['k3s'] | first]['ansible_host'] }}"
+# {mark} becomes BEGIN or END; everything in between belongs to Ansible.
+# Legacy marker text, DO NOT translate: existing /etc/hosts blocks are found by it.
+lab_hosts_marker: "# {mark} k8s-lab (Ansible lab_hosts, nicht von Hand aendern)"  # lang-allow: legacy marker, existing /etc/hosts blocks are found by it
+
+lab_hosts_workloads_dir: "{{ playbook_dir }}/../gitops/workloads"
+lab_hosts_cert_file: certificate.yaml
+lab_hosts_gitea_values_file: "{{ lab_hosts_workloads_dir }}/gitea/values-gitea.yaml"
+# Same file as the role notes_sites (group_vars/all/notes.yml).
+lab_hosts_sites_file: "{{ notes_sites_file }}"
+
+# Old lines that the role deletes outside its block (regex per line):
+# - the line of the old minikube (address 10.100.96.102, lab names only),
+# - hand-written lines "<VM-IP> <one name>" (exactly one name per line;
+#   the block always has at least two names in a line).
+lab_hosts_stale_regexps:
+  - '^{{ "10.100.96.102" | regex_escape }}\s+([a-z0-9.-]+[.]{{ lab_hosts_domain | regex_escape }}\s*)+$'
+  - '^{{ lab_hosts_ip | regex_escape }}\s+[a-z0-9-]+[.]{{ lab_hosts_domain | regex_escape }}\s*$'

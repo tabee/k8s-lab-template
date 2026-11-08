@@ -1,0 +1,58 @@
+---
+# WireGuard tunnel (issue #60). Offline-safe to syntax-check. Live apply only when
+# wireguard_enabled is true and keys exist (docs/how-to/wireguard-tunnel.md).
+# Usage in ansible/:
+#   ansible-playbook -i inventory/local.yml wireguard.yml --syntax-check
+
+- name: Create WireGuard keys on the control PC when missing
+  hosts: backup_host
+  gather_facts: false
+  pre_tasks:
+    - name: End when WireGuard is off
+      ansible.builtin.meta: end_play
+      when: not (wireguard_enabled | bool)
+  tasks:
+    - name: Generate WireGuard key pairs (SKIP when present, never prints values)
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/secrets-generate.yml"
+      vars:
+        secret_names: [wireguard-server-key, wireguard-client-key]
+
+- name: WireGuard on the node (server peer)
+  hosts: k3s
+  become: true
+  gather_facts: true
+  gather_subset: [min]
+  pre_tasks:
+    - name: End when WireGuard is off
+      ansible.builtin.meta: end_play
+      when: not (wireguard_enabled | bool)
+    - name: Read client public key on the controller
+      ansible.builtin.set_fact:
+        wireguard_mode: server
+        wireguard_address: "{{ wireguard_address_server }}"
+        wireguard_private_key_path: "{{ wireguard_server_key_path }}"
+        wireguard_peer_public_key: "{{ lookup('ansible.builtin.file', wireguard_client_key_path ~ '.pub') | trim }}"
+        wireguard_peer_allowed_ips: "{{ wireguard_allowed_ips_on_server }}"
+        wireguard_peer_endpoint: ""
+  roles:
+    - role: wireguard
+
+- name: WireGuard on the control PC (client peer)
+  hosts: backup_host
+  become: true
+  gather_facts: true
+  gather_subset: [min]
+  pre_tasks:
+    - name: End when WireGuard is off
+      ansible.builtin.meta: end_play
+      when: not (wireguard_enabled | bool)
+    - name: Read server public key on the controller
+      ansible.builtin.set_fact:
+        wireguard_mode: client
+        wireguard_address: "{{ wireguard_address_client }}"
+        wireguard_private_key_path: "{{ wireguard_client_key_path }}"
+        wireguard_peer_public_key: "{{ lookup('ansible.builtin.file', wireguard_server_key_path ~ '.pub') | trim }}"
+        wireguard_peer_allowed_ips: "{{ wireguard_allowed_ips_on_client }}"
+        wireguard_peer_endpoint: "{{ wireguard_endpoint }}"
+  roles:
+    - role: wireguard

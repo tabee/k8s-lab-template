@@ -1,0 +1,11 @@
+---
+# Required collections, pinned exactly.
+# Installation: ansible-galaxy collection install -r requirements.yml
+collections:
+  - name: ansible.posix
+    version: "2.2.2"
+  - name: community.general
+    version: "13.5.0"
+  # Stage 4: helm/k8s modules for argocd.yml (needs Python package kubernetes).
+  - name: kubernetes.core
+    version: "6.6.0"

@@ -1,0 +1,24 @@
+---
+# Watchdog units changed: reload, restart the timer.
+- name: Reload watchdog
+  ansible.builtin.systemd_service:
+    name: rustfs-watchdog.timer
+    scope: user
+    state: restarted
+    daemon_reload: true
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ ansible_facts['user_uid'] }}"
+  # In the --check run before the first installation the unit does not exist yet.
+  ignore_errors: "{{ ansible_check_mode }}"
+
+# Quadlet changed: regenerate the unit (daemon-reload) and restart rustfs.
+- name: Restart rustfs
+  ansible.builtin.systemd_service:
+    name: "{{ backup_s3_container_name }}.service"
+    scope: user
+    state: restarted
+    daemon_reload: true
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ ansible_facts['user_uid'] }}"
+  # In the --check run before the first installation the unit does not exist yet.
+  ignore_errors: "{{ ansible_check_mode }}"

@@ -1,0 +1,565 @@
+---
+# Check stage 6 (cert-manager, lab CA, TLS), read only: k8s_info, one
+# PSA test pod via server dry run (check_mode: true) and TLS connections
+# from outside (from the control machine) with curl.
+# Usage: ansible-playbook verify-certmanager.yml
+# Prerequisite: argocd.yml has run (creates lab_ca_cert_path), curl
+# is installed. No /etc/hosts entry needed (curl --resolve).
+# Of the CA secret only metadata and key names are checked.
+# The name constraint is checked with throwaway certificates (verify-nc-*), which are deleted again
+# and again (block/always).
+
+- name: Check stage 6 cert-manager
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: "{{ argocd_kubeconfig }}"
+  vars:
+    # Repetitions x pause (seconds) while waiting for sync/ready.
+    verify_retries: 30
+    verify_delay: 10
+    # Mirror of the GitOps values (gitops/apps/cert-manager.yaml,
+    # gitops/platform/cert-manager/manifests, gitops/workloads/whoami);
+    # Ansible does not read gitops/.
+    verify_cm_app: cert-manager
+    verify_issuer: lab-ca
+    verify_certs:
+      - { namespace: whoami, name: whoami, secret: whoami-tls }
+      - { namespace: traefik, name: traefik-default, secret: traefik-default-tls }
+    verify_traefik_namespace: traefik
+    # Name constraint (issue #7): throwaway certificates and the rule of the ValidatingAdmissionPolicy.
+    verify_nc_policy: lab-ca-lab-domain-only
+    verify_nc_prefix: verify-nc
+    # Kind, kind, suffix of the secret name (cert-manager does not delete secrets itself on removal).
+    verify_nc_kinds:
+      - ['cert-manager.io/v1', Certificate, '']
+      - ['v1', Secret, '-tls']
+    verify_nc_cases:
+      - { name: verify-nc-inside, dns: "verify-nc.{{ lab.domain }}", ip: [], expected: issued }
+      - { name: verify-nc-outside, dns: verify-nc.example.org, ip: [], expected: rejected }
+      - { name: verify-nc-ip, dns: "verify-nc.{{ lab.domain }}", ip: ["192.0.2.10"], expected: rejected }
+    verify_whoami_host: "whoami.{{ lab.domain }}"
+    # Names without their own certificate: sniStrict must reject the handshake.
+    verify_unknown_sni:
+      - "not-present.{{ lab.domain }}"
+      - unknown.example.invalid
+    # First k3s host: its IP is the LoadBalancer address (ServiceLB).
+    verify_k3s_host: "{{ groups['k3s'] | first }}"
+    verify_lb_ip: "{{ hostvars[verify_k3s_host]['ansible_host'] }}"
+  tasks:
+    # ---------- Argo CD ----------
+    - name: Read application cert-manager
+      kubernetes.core.k8s_info:
+        api_version: argoproj.io/v1alpha1
+        kind: Application
+        namespace: "{{ argocd_namespace }}"
+        name: "{{ verify_cm_app }}"
+      register: verify_app
+      until: >-
+        verify_app.resources | length == 1 and
+        (verify_app.resources | first).status.sync.status | default('') == 'Synced' and
+        (verify_app.resources | first).status.health.status | default('') == 'Healthy'
+      retries: "{{ verify_retries }}"
+      delay: "{{ verify_delay }}"
+
+    - name: Check cert-manager is Synced, Healthy and in project platform
+      ansible.builtin.assert:
+        that:
+          - verify_app_obj.status.sync.status == 'Synced'
+          - verify_app_obj.status.health.status == 'Healthy'
+          - verify_app_obj.spec.project == argocd_platform_project
+        fail_msg: "Application {{ verify_cm_app }} not Synced/Healthy or wrong project"
+        quiet: true
+      vars:
+        verify_app_obj: "{{ verify_app.resources | first }}"
+
+    # ---------- Namespace and pods ----------
+    - name: Read namespace cert-manager
+      kubernetes.core.k8s_info:
+        kind: Namespace
+        name: "{{ lab_ca_namespace }}"
+      register: verify_ns
+
+    - name: Namespace cert-manager enforces PSA restricted
+      ansible.builtin.assert:
+        that:
+          - verify_ns.resources | length == 1
+          - verify_ns_labels['pod-security.kubernetes.io/enforce'] | default('') == 'restricted'
+          - verify_ns_labels['pod-security.kubernetes.io/audit'] | default('') == 'restricted'
+          - verify_ns_labels['pod-security.kubernetes.io/warn'] | default('') == 'restricted'
+        fail_msg: "Namespace {{ lab_ca_namespace }} is missing or does not have enforce/audit/warn=restricted"
+        quiet: true
+      vars:
+        verify_ns_labels: "{{ (verify_ns.resources | first).metadata.labels | default({}) }}"
+
+    - name: Read cert-manager pods
+      kubernetes.core.k8s_info:
+        kind: Pod
+        namespace: "{{ lab_ca_namespace }}"
+        label_selectors:
+          - app.kubernetes.io/instance=cert-manager
+        field_selectors:
+          - status.phase=Running
+      register: verify_pods
+      until:
+        - verify_pods.resources | length > 0
+        - verify_pods_cs | select('equalto', []) | list | length == 0
+        - verify_pods_cs | flatten | rejectattr('ready') | list | length == 0
+      retries: "{{ verify_retries }}"
+      delay: "{{ verify_delay }}"
+      vars:
+        verify_pods_cs: "{{ verify_pods.resources | map(attribute='status.containerStatuses', default=[]) | list }}"
+
+    - name: Controller, webhook and CA injector run and are Ready
+      ansible.builtin.assert:
+        that:
+          - verify_components | sort == ['cainjector', 'controller', 'webhook']
+        fail_msg: "Expected one pod each of controller, webhook, cainjector; found: {{ verify_components | join(', ') }}"
+        success_msg: "Ready: {{ verify_pods.resources | map(attribute='metadata.name') | join(', ') }}"
+      vars:
+            # Label names with dots do not work via map(attribute=...).
+        verify_components: >-
+          {{ verify_pods.resources | map(attribute='metadata.labels') | map('dict2items') | flatten
+             | selectattr('key', 'equalto', 'app.kubernetes.io/component') | map(attribute='value') | list }}
+
+    # leaderElection.namespace from values.yaml: nothing in kube-system.
+    - name: Read roles in kube-system
+      kubernetes.core.k8s_info:
+        api_version: rbac.authorization.k8s.io/v1
+        kind: Role
+        namespace: kube-system
+      register: verify_ks_roles
+
+    - name: Check cert-manager has nothing in kube-system
+      ansible.builtin.assert:
+        that: verify_ks_roles.resources | map(attribute='metadata.name') | select('search', '^cert-manager') | list | length == 0
+        fail_msg: "Roles of cert-manager found in kube-system (check leaderElection.namespace)"
+        quiet: true
+
+    # ---------- CA secret (metadata only) ----------
+    # k8s_info returns the whole object; so no_log and right afterwards pass on only
+    # name, type, labels and key names.
+    - name: Read CA secret
+      kubernetes.core.k8s_info:
+        kind: Secret
+        namespace: "{{ lab_ca_namespace }}"
+        name: "{{ lab_ca_secret_name }}"
+      register: verify_ca_secret
+      no_log: true
+
+    - name: Extract the metadata of the CA secret
+      ansible.builtin.set_fact:
+        verify_ca_meta:
+          found: "{{ verify_ca_secret.resources | length == 1 }}"
+          type: "{{ (verify_ca_secret.resources | first | default({})).type | default('-') }}"
+          keys: "{{ ((verify_ca_secret.resources | first | default({})).data | default({})).keys() | list | sort }}"
+          labels: "{{ (verify_ca_secret.resources | first | default({})).metadata.labels | default({}) }}"
+          annotations: "{{ ((verify_ca_secret.resources | first | default({})).metadata.annotations | default({})).keys() | list }}"
+      no_log: true
+
+    - name: Discard the raw data of the CA secret
+      ansible.builtin.set_fact:
+        verify_ca_secret: {}
+      no_log: true
+
+    # Stage 7: the secret comes from Argo CD (KSOPS). Against deletion it is protected by
+    # the annotation Prune=false,Delete=false (checked by verify-ksops.yml).
+    - name: CA secret exists, is a TLS secret and belongs to Argo CD
+      ansible.builtin.assert:
+        that:
+          - verify_ca_meta.found | bool
+          - verify_ca_meta.type == 'kubernetes.io/tls'
+          - "'tls.crt' in verify_ca_meta['keys']"
+          - "'tls.key' in verify_ca_meta['keys']"
+          - verify_ca_meta.labels['app.kubernetes.io/managed-by'] | default('') == 'argocd'
+          - "'argocd.argoproj.io/tracking-id' in verify_ca_meta.annotations"
+        fail_msg: >-
+          CA-Secret {{ lab_ca_namespace }}/{{ lab_ca_secret_name }}: found={{ verify_ca_meta.found }},
+          Type={{ verify_ca_meta.type }}, Keys={{ verify_ca_meta['keys'] | join(',') }},
+          Labels={{ verify_ca_meta.labels }}
+        success_msg: "CA secret ok (type {{ verify_ca_meta.type }}, keys {{ verify_ca_meta['keys'] | join(', ') }})"
+
+    # ---------- ClusterIssuer and Certificates ----------
+    - name: Read ClusterIssuer
+      kubernetes.core.k8s_info:
+        api_version: cert-manager.io/v1
+        kind: ClusterIssuer
+        name: "{{ verify_issuer }}"
+      register: verify_ci
+      until: >-
+        verify_ci.resources | length == 1 and
+        ((verify_ci.resources | first).status.conditions | default([])
+          | selectattr('type', 'equalto', 'Ready') | selectattr('status', 'equalto', 'True') | list | length) == 1
+      retries: "{{ verify_retries }}"
+      delay: "{{ verify_delay }}"
+
+    - name: ClusterIssuer is Ready and uses the secret from lab_ca_secret_name
+      ansible.builtin.assert:
+        that: (verify_ci.resources | first).spec.ca.secretName | default('') == lab_ca_secret_name
+        fail_msg: "ClusterIssuer {{ verify_issuer }}: spec.ca.secretName does not match lab_ca_secret_name ({{ lab_ca_secret_name }})"
+        quiet: true
+
+    - name: Read Certificates
+      kubernetes.core.k8s_info:
+        api_version: cert-manager.io/v1
+        kind: Certificate
+        namespace: "{{ item.namespace }}"
+        name: "{{ item.name }}"
+      register: verify_certs_info
+      until: >-
+        verify_certs_info.resources | length == 1 and
+        ((verify_certs_info.resources | first).status.conditions | default([])
+          | selectattr('type', 'equalto', 'Ready') | selectattr('status', 'equalto', 'True') | list | length) == 1
+      retries: "{{ verify_retries }}"
+      delay: "{{ verify_delay }}"
+      loop: "{{ verify_certs }}"
+      loop_control:
+        label: "{{ item.namespace }}/{{ item.name }}"
+
+    - name: Certificates are Ready, from lab-ca and with the expected secret
+      ansible.builtin.assert:
+        that:
+          - (item.resources | first).spec.issuerRef.name == verify_issuer
+          - (item.resources | first).spec.issuerRef.kind | default('Issuer') == 'ClusterIssuer'
+          - (item.resources | first).spec.secretName == item.item.secret
+        fail_msg: "Certificate {{ item.item.namespace }}/{{ item.item.name }}: Issuer or secretName wrong"
+        success_msg: "{{ item.item.namespace }}/{{ item.item.name }} valid until {{ (item.resources | first).status.notAfter | default('-') }}"
+      loop: "{{ verify_certs_info.results }}"
+      loop_control:
+        label: "{{ item.item.namespace }}/{{ item.item.name }}"
+
+    # ---------- Traefik TLS ----------
+    - name: Read TLSOption default
+      kubernetes.core.k8s_info:
+        api_version: traefik.io/v1alpha1
+        kind: TLSOption
+        namespace: "{{ verify_traefik_namespace }}"
+        name: default
+      register: verify_tlsoption
+
+    - name: Read TLSStore default
+      kubernetes.core.k8s_info:
+        api_version: traefik.io/v1alpha1
+        kind: TLSStore
+        namespace: "{{ verify_traefik_namespace }}"
+        name: default
+      register: verify_tlsstore
+
+    - name: SniStrict is on and the TLSStore uses the traefik-default certificate
+      ansible.builtin.assert:
+        that:
+          - (verify_tlsoption.resources | first).spec.sniStrict | default(false) | bool
+          - (verify_tlsstore.resources | first).spec.defaultCertificate.secretName | default('')
+            == (verify_certs | selectattr('namespace', 'equalto', verify_traefik_namespace) | first).secret
+        fail_msg: "TLSOption default without sniStrict or TLSStore default does not point to the default certificate"
+        quiet: true
+
+    # ---------- From outside (control machine) ----------
+    - name: Find the public CA certificate
+      ansible.builtin.stat:
+        path: "{{ lab_ca_cert_path | expanduser }}"
+      register: verify_ca_crt
+
+    - name: Public CA certificate is present
+      ansible.builtin.assert:
+        that: verify_ca_crt.stat.exists
+        fail_msg: "{{ lab_ca_cert_path }} is missing: first run ansible-playbook argocd.yml"
+        quiet: true
+
+    # curl instead of uri: only curl can specify the IP (--resolve) and still
+    # send the right SNI name. Without -k: the chain must be valid against the
+    # lab CA.
+    - name: Query whoami over HTTPS with verification against the lab CA  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        argv:
+          - curl
+          - --silent
+          - --show-error
+          - --max-time
+          - "10"
+          - --cacert
+          - "{{ lab_ca_cert_path | expanduser }}"
+          - --resolve
+          - "{{ verify_whoami_host }}:{{ traefik_admin_port }}:{{ verify_lb_ip }}"
+          - "https://{{ verify_whoami_host }}:{{ traefik_admin_port }}/"
+      register: verify_https
+      changed_when: false
+      check_mode: false
+      until: verify_https.rc == 0
+      retries: "{{ verify_retries }}"
+      delay: "{{ verify_delay }}"
+
+    - name: Answer comes from whoami (chain valid against lab CA)
+      ansible.builtin.assert:
+        that: verify_https.stdout is search('Hostname:')
+        fail_msg: "HTTPS ok, but no whoami answer"
+        quiet: true
+
+    # rc 35 = TLS handshake rejected (Traefik sends "unrecognized name").
+    # Without SNI (IP address) it must fail just the same.
+    - name: Try handshake with unknown SNI  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        argv:
+          - curl
+          - --silent
+          - --insecure
+          - --max-time
+          - "10"
+          - --resolve
+          - "{{ item }}:443:{{ verify_lb_ip }}"
+          - "https://{{ item }}/"
+      register: verify_sni
+      changed_when: false
+      check_mode: false
+      failed_when: false
+      loop: "{{ verify_unknown_sni }}"
+
+    - name: Try handshake without SNI  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        argv: [curl, --silent, --insecure, --max-time, "10", "https://{{ verify_lb_ip }}/"]
+      register: verify_nosni
+      changed_when: false
+      check_mode: false
+      failed_when: false
+
+    - name: SniStrict rejects unknown and missing SNI names
+      ansible.builtin.assert:
+        that:
+          - verify_sni.results | map(attribute='rc', default=-1) | select('equalto', 35) | list | length == verify_unknown_sni | length
+          - verify_nosni.rc | default(-1) == 35
+        fail_msg: >-
+          Expected rc 35 (handshake rejected). Unknown names:
+          {{ verify_sni.results | map(attribute='rc', default=-1) | list }}, without SNI: {{ verify_nosni.rc | default(-1) }}
+        quiet: true
+
+    # ---------- PSA proof ----------
+    - name: Send PSA probe via server dry run
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: psa-probe
+            namespace: "{{ lab_ca_namespace }}"
+          spec:
+            containers:
+              - name: probe
+                image: "{{ lab_probe_image }}"
+                securityContext:
+                  privileged: true
+      check_mode: true
+      register: verify_psa_probe
+      ignore_errors: true  # the assert reads failed and msg; failed_when: false resets them (ansible-core 2.19+)
+
+    - name: PSA rejects insecure pods in namespace cert-manager
+      ansible.builtin.assert:
+        that: verify_psa_probe.msg | default('') is search('violates PodSecurity')
+        fail_msg: "Namespace {{ lab_ca_namespace }}: test pod was NOT rejected by PSA"
+        quiet: true
+
+    # ---------- Name constraint of the lab CA (issue #7) ----------
+    - name: Read lab CA certificate (public)
+      ansible.builtin.command:
+        argv: [openssl, x509, -in, "{{ lab_ca_cert_path | expanduser }}", -noout, -text]
+      register: verify_nc_ca
+      changed_when: false
+      check_mode: false
+
+    - name: Lab CA has critical nameConstraints (only names under the lab domain, no IPs)
+      ansible.builtin.assert:
+        that:
+          - "'X509v3 Name Constraints: critical' in verify_nc_ca.stdout"
+          - "('DNS:' ~ lab.domain) in verify_nc_ca.stdout"
+          - "'IP:0.0.0.0/0.0.0.0' in verify_nc_ca.stdout"
+        fail_msg: >-
+          The lab CA has no critical nameConstraints for {{ lab.domain }}. It was built before issue #7.
+          Rotation: lab.sh ca-rotation (docs/how-to/ca-rotation.md).
+        quiet: true
+
+    - name: Read ValidatingAdmissionPolicy and binding
+      kubernetes.core.k8s_info:
+        api_version: admissionregistration.k8s.io/v1
+        kind: "{{ item }}"
+        name: "{{ verify_nc_policy }}"
+      register: verify_nc_vap
+      loop: [ValidatingAdmissionPolicy, ValidatingAdmissionPolicyBinding]
+      until: verify_nc_vap.resources | default([]) | length == 1
+      retries: "{{ verify_retries }}"
+      delay: "{{ verify_delay }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Policy is bound to the lab domain and type-checked
+      ansible.builtin.assert:
+        that:
+          - verify_nc_policy_obj.spec.failurePolicy == 'Fail'
+          - verify_nc_zone == ["'" ~ lab.domain ~ "'"]
+          - verify_nc_binding_obj.spec.policyName == verify_nc_policy
+          - "'Deny' in verify_nc_binding_obj.spec.validationActions"
+          - verify_nc_warnings | length == 0
+        fail_msg: >-
+          Policy {{ verify_nc_policy }}: failurePolicy, zone ({{ verify_nc_zone }}), Binding or CEL type check
+          (warnings: {{ verify_nc_warnings }}) do not match {{ lab.domain }}
+        quiet: true
+      vars:
+        verify_nc_policy_obj: "{{ verify_nc_vap.results[0].resources | first }}"
+        verify_nc_binding_obj: "{{ verify_nc_vap.results[1].resources | first }}"
+        verify_nc_zone: "{{ verify_nc_policy_obj.spec.variables | selectattr('name', 'equalto', 'zone') | map(attribute='expression') | list }}"
+        verify_nc_warnings: "{{ ((verify_nc_policy_obj.status | default({})).typeChecking | default({})).expressionWarnings | default([]) }}"
+
+    - name: Have throwaway certificates issued or rejected by the policy
+      block:
+        - name: Create throwaway certificate (server side, without fallback)
+          kubernetes.core.k8s:
+            state: present
+            definition:
+              apiVersion: cert-manager.io/v1
+              kind: Certificate
+              metadata:
+                name: "{{ item.name }}"
+                namespace: "{{ lab_ca_namespace }}"
+                labels:
+                  app.kubernetes.io/managed-by: ansible
+                  app.kubernetes.io/part-of: verify-nc
+              spec:
+                secretName: "{{ item.name }}-tls"
+                dnsNames:
+                  - "{{ item.dns }}"
+                ipAddresses: "{{ item.ip }}"
+                duration: 1h
+                renewBefore: 20m
+                privateKey:
+                  algorithm: ECDSA
+                  size: 256
+                issuerRef:
+                  name: "{{ verify_issuer }}"
+                  kind: ClusterIssuer
+                  group: cert-manager.io
+          register: verify_nc_create
+          # ignore_errors keeps item.failed/item.msg; failed_when: false resets them (ansible-core >= 2.19).
+          ignore_errors: true
+          loop: "{{ verify_nc_cases }}"
+          loop_control:
+            label: "{{ item.name }}"
+
+            # Rejected = the API server names our policy. Anything else (e.g. a typo) is red.
+        - name: Rejections come from the policy, not from another error
+          ansible.builtin.assert:
+            that: >-
+              (item.item.expected == 'rejected' and item.failed and (item.msg | default('')) is search(verify_nc_policy))
+              or (item.item.expected == 'issued' and not item.failed)
+            fail_msg: >-
+              {{ item.item.name }} ({{ item.item.dns }}{{ ' + ' ~ item.item.ip | join(',') if item.item.ip else '' }}): expected
+              {{ item.item.expected }}, is {{ 'rejected' if item.failed else 'accepted' }}
+              {{ '(' ~ (item.msg | default('') | truncate(300)) ~ ')' if item.failed else '(the policy ' ~ verify_nc_policy ~ ' does not apply)' }}
+            quiet: true
+          loop: "{{ verify_nc_create.results }}"
+          loop_control:
+            label: "{{ item.item.name }}"
+
+        - name: Certificate in the zone is issued by lab-ca
+          kubernetes.core.k8s_info:
+            api_version: cert-manager.io/v1
+            kind: Certificate
+            namespace: "{{ lab_ca_namespace }}"
+            name: verify-nc-inside
+          register: verify_nc_in
+          until: >-
+            verify_nc_in.resources | length == 1 and
+            (verify_nc_in.resources | first).status.conditions | default([])
+            | selectattr('type', 'equalto', 'Ready') | selectattr('status', 'equalto', 'True') | list | length == 1
+          retries: "{{ verify_retries }}"
+          delay: "{{ verify_delay }}"
+
+        - name: Fetch the issued leaf from the secret (tls.crt only)
+          kubernetes.core.k8s_info:
+            kind: Secret
+            namespace: "{{ lab_ca_namespace }}"
+            name: verify-nc-inside-tls
+          register: verify_nc_secret
+          no_log: true
+
+        - name: Remember only the certificate
+          ansible.builtin.set_fact:
+            verify_nc_pem: "{{ ((verify_nc_secret.resources | first).data['tls.crt']) | b64decode }}"
+            verify_nc_secret: {}
+          no_log: true
+
+        - name: Check the leaf against the lab CA (OpenSSL enforces the nameConstraints)
+          ansible.builtin.command:
+            argv: [openssl, verify, -CAfile, "{{ lab_ca_cert_path | expanduser }}", -purpose, sslserver, /dev/stdin]
+            stdin: "{{ verify_nc_pem }}"
+          register: verify_nc_verify
+          changed_when: false
+          check_mode: false
+
+        - name: Leaf in the zone is valid
+          ansible.builtin.assert:
+            that: verify_nc_verify.rc == 0
+            fail_msg: "openssl verify of the throwaway leaf verify-nc.{{ lab.domain }} failed: {{ verify_nc_verify.stdout }}"
+            quiet: true
+
+        - name: Counter-check - the same leaf under a foreign name would be rejected (openssl -verify_hostname)
+          ansible.builtin.command:
+            argv: [openssl, verify, -CAfile, "{{ lab_ca_cert_path | expanduser }}", -purpose, sslserver, -verify_hostname, verify-nc.example.org, /dev/stdin]
+            stdin: "{{ verify_nc_pem }}"
+          register: verify_nc_against
+          changed_when: false
+          failed_when: verify_nc_against.rc == 0
+          check_mode: false
+      always:
+        - name: Delete throwaway certificates and their secrets
+          kubernetes.core.k8s:
+            state: absent
+            api_version: "{{ item.0 }}"
+            kind: "{{ item.1 }}"
+            namespace: "{{ lab_ca_namespace }}"
+            name: "{{ item.3 }}{{ item.2 }}"
+          loop: "{{ verify_nc_kinds | product(verify_nc_cases | map(attribute='name') | list) | map('flatten') | list }}"
+          loop_control:
+            label: "{{ item.1 }} {{ item.3 }}{{ item.2 }}"
+          failed_when: false
+
+        - name: Discard the raw throwaway certificate
+          ansible.builtin.set_fact:
+            verify_nc_pem: ""
+          no_log: true
+
+    # ---------- Every Certificate has the matching issuer ----------
+    - name: Read all Certificates in the cluster
+      kubernetes.core.k8s_info:
+        api_version: cert-manager.io/v1
+        kind: Certificate
+      register: verify_all_certs
+
+    - name: Lab names come from lab-ca, other names never (lab-acme is for that)
+      ansible.builtin.assert:
+        that:
+          - >-
+            (item.spec.dnsNames | default([])) | map('regex_search', '(^|\.)' ~ (lab.domain | regex_escape) ~ '$') | select | list | length
+            == (item.spec.dnsNames | default([])) | length
+            or item.spec.issuerRef.name != verify_issuer
+        fail_msg: "{{ item.metadata.namespace }}/{{ item.metadata.name }}: mixed or foreign names via lab-ca ({{ item.spec.dnsNames | default([]) }})"
+        quiet: true
+      loop: "{{ verify_all_certs.resources }}"
+      loop_control:
+        label: "{{ item.metadata.namespace }}/{{ item.metadata.name }}"
+
+    - name: Outside the lab domain only the public issuer issues
+      ansible.builtin.assert:
+        that:
+          - item.spec.issuerRef.name == lab_acme_issuer
+        fail_msg: >-
+          {{ item.metadata.namespace }}/{{ item.metadata.name }}: Names outside of {{ lab.domain }}
+          ({{ item.spec.dnsNames | default([]) }}) belong to {{ lab_acme_issuer }}, not {{ item.spec.issuerRef.name }}
+        quiet: true
+      loop: "{{ verify_all_certs.resources }}"
+      loop_control:
+        label: "{{ item.metadata.namespace }}/{{ item.metadata.name }}"
+      # Namespaced Issuers (operator-internal mTLS, e.g. CNPG barman plugin) are out of scope.
+      when: >-
+        (item.spec.issuerRef.kind | default('Issuer')) == 'ClusterIssuer' and
+        (item.spec.dnsNames | default([])) | reject('search', '(^|\.)' ~ (lab.domain | regex_escape) ~ '$') | list | length > 0

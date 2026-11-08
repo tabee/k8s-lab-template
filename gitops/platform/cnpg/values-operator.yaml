@@ -1,0 +1,60 @@
+---
+# Values for the chart cloudnative-pg (operator). Chart, repo and version
+# are only in gitops/apps/cnpg.yaml.
+# Deviations from the chart default and security-relevant
+# defaults that deliberately stay explicit are here. Check on every chart update:
+#   helm show values cnpg/cloudnative-pg --version <Version>
+#   helm template cloudnative-pg cnpg/cloudnative-pg --version <Version> -n cnpg-system -f values-operator.yaml
+# Image: deliberately chart default (tag = appVersion of the chart).
+
+# One operator is enough in the single-node lab. If it fails briefly, the
+# databases keep running; only failover and changes wait for it.
+replicaCount: 1
+
+# CRDs come with the chart (Argo CD with ServerSideApply).
+crds:
+  create: true
+
+# Webhooks: Fail = invalid cluster objects are rejected, instead of being created
+# silently without defaults/validation.
+webhook:
+  mutating:
+    create: true
+    failurePolicy: Fail
+  validating:
+    create: true
+    failurePolicy: Fail
+
+# Operator watches all namespaces (db-lab now, gitea in stage 8c).
+config:
+  clusterWide: true
+
+# No Prometheus operator in the lab.
+monitoring:
+  podMonitorEnabled: false
+  grafanaDashboard:
+    create: false
+
+# Small, but with limit (VM: 8 GiB for everything).
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 64Mi  # lab-limit: cnpg-system/cloudnative-pg/manager
+
+# Security defaults of the chart, explicit (PSA restricted).
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+  capabilities:
+    drop:
+      - "ALL"
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault

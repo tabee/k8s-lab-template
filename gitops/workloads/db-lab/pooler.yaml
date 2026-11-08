@@ -1,0 +1,31 @@
+---
+# PgBouncer in front of the primary (rw). Apps connect to
+# pg-lab-pooler-rw.db-lab.svc:5432 instead of directly with pg-lab-rw; on a
+# failover the pooler itself points to the new primary.
+# Session mode: safe for every app (prepared statements, SET, LISTEN).
+# Transaction mode later only if an app explicitly tolerates it.
+apiVersion: postgresql.cnpg.io/v1
+kind: Pooler
+metadata:
+  name: pg-lab-pooler-rw
+  namespace: db-lab
+spec:
+  cluster:
+    name: pg-lab
+  instances: 2
+  type: rw
+  pgbouncer:
+    poolMode: session
+    parameters:
+      max_client_conn: "100"
+      default_pool_size: "10"
+  template:
+    spec:
+      containers:
+        - name: pgbouncer
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 96Mi  # lab-limit: db-lab/pg-lab-pooler-rw/pgbouncer

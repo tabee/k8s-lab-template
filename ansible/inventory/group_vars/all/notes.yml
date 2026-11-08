@@ -1,0 +1,33 @@
+---
+# Values for the sidequest notes: role "notes_sites" (playbook argocd.yml,
+# runs on localhost). The list of notebooks is NOT here, but
+# in gitops/sites.yaml (one list for Argo CD and Ansible). No secrets:
+# deploy keys and passwords are created by the role in the folders below.
+# Secrets stay with Ansible for now (stage 7): the role creates key and
+# password itself. Pattern for later: docs/learning-path/stage-7-ksops.md.
+# Runbook: docs/how-to/notes-sites.md
+
+# The list (relative to the playbooks in ansible/).
+notes_sites_file: "{{ playbook_dir }}/../gitops/sites.yaml"
+# Namespace = prefix + name. Must match gitops/apps/notes.yaml.
+notes_namespace_prefix: notes-
+# AppProject: source only this repo, target only notes-*, nothing cluster-wide.
+notes_project: notes
+notes_psa_level: restricted
+notes_psa_version: latest
+# Must match secrets.repo/secrets.auth in gitops/charts/notes-site/values.yaml .
+notes_repo_secret_name: notes-repo
+notes_auth_secret_name: notes-auth
+# Must match secrets.oidc and site.auth in gitops/charts/notes-site/values.yaml (tests compare).
+# notes_auth_default: login of a site without the field auth in gitops/sites.yaml (sso or basic).
+notes_oidc_secret_name: notes-oidc
+notes_auth_default: sso
+# Per site: deploy key <dir>/notes-<name>-deploy (+ .pub) and password
+# <dir>/notes-<name>.passwort (mode 0600). Never overwritten. File name kept German on purpose (existing files).
+notes_deploy_key_dir: ~/.ssh
+notes_password_dir: ~/.config/k8s-lab
+notes_password_length: 32
+# Session cookie key of the login proxy per sso site: <dir>/notes-<name>.cookie (mode 0600), never
+# overwritten. 32 characters = 32 bytes, the length oauth2-proxy accepts.
+notes_cookie_dir: ~/.config/k8s-lab
+notes_cookie_length: 32

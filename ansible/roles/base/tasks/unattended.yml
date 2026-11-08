@@ -1,0 +1,24 @@
+---
+# Automatic security updates. The origins (only -security) stay at the
+# Ubuntu default in 50unattended-upgrades; we only set local options.
+- name: Enable periodic apt runs
+  ansible.builtin.template:
+    src: 20auto-upgrades.j2
+    dest: /etc/apt/apt.conf.d/20auto-upgrades
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Local unattended-upgrades options
+  ansible.builtin.template:
+    src: 52unattended-upgrades-local.j2
+    dest: /etc/apt/apt.conf.d/52unattended-upgrades-local
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Unattended-upgrades service active
+  ansible.builtin.systemd_service:
+    name: unattended-upgrades
+    enabled: true
+    state: started

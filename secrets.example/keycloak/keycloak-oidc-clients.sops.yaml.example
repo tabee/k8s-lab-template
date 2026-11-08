@@ -1,0 +1,18 @@
+# Template for keycloak-oidc-clients.sops.yaml: structure without real values.
+# Client secrets of the realm clients gitea and synapse. The realm job puts
+# them into the realm file in memory ($(env:GITEA_CLIENT_SECRET) and
+# $(env:SYNAPSE_CLIENT_SECRET)). The same values are in
+# secrets/gitea/gitea-oidc.sops.yaml and secrets/matrix/matrix-oidc.sops.yaml.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: keycloak-oidc-clients
+  namespace: keycloak
+  labels:
+    app.kubernetes.io/managed-by: argocd
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+type: Opaque
+stringData:
+  GITEA_CLIENT_SECRET: "@file:keycloak-gitea-client-secret"
+  SYNAPSE_CLIENT_SECRET: "@file:keycloak-synapse-client-secret"

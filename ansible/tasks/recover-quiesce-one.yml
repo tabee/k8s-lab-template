@@ -1,0 +1,81 @@
+---
+# Make sure NO pod mounts the file PVC of target.claim: scale the owning
+# Deployment to zero, wait until the pods are gone and check the claim itself,
+# not only the label of the Deployment. A pod that is still running (or
+# Terminating) keeps the PVC in Terminating (finalizer pvc-protection), and the
+# restore would run into its timeout. Used by the pause (after the app has
+# been synced once) and again by the restore (defence in depth: whatever
+# started a pod in between is found and named here). The Deployment may not
+# exist yet (never synced): that is fine, the claim check still runs.
+- name: Scale the workload to zero when the Deployment exists
+  kubernetes.core.k8s_scale:
+    api_version: apps/v1
+    kind: Deployment
+    namespace: "{{ target.namespace }}"
+    name: "{{ target.deploy }}"
+    replicas: 0
+    wait: true
+    wait_timeout: 180
+  register: recover_scaled
+  failed_when: >-
+    recover_scaled is failed
+    and 'not found' not in (recover_scaled.msg | default('') | lower)
+
+- name: Wait until no pod mounts the claim {{ target.claim }}
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: "{{ target.namespace }}"
+  register: recover_ns_pods
+  retries: "{{ recover_pod_retries | default(36) }}"
+  delay: "{{ recover_poll | default(5) }}"
+  until: >-
+    (recover_ns_pods.resources | default([])
+     | rejectattr('status.phase', 'in', ['Succeeded', 'Failed'])
+     | selectattr('spec.volumes', 'defined')
+     | map(attribute='spec.volumes') | flatten
+     | selectattr('persistentVolumeClaim', 'defined')
+     | map(attribute='persistentVolumeClaim.claimName')
+     | select('equalto', target.claim) | list | length) == 0
+  ignore_errors: true
+
+- name: Name the pods that still mount the claim
+  ansible.builtin.set_fact:
+    recover_claim_pods: >-
+      {%- set found = namespace(names=[]) -%}
+      {%- for p in recover_ns_pods.resources | default([]) -%}
+      {%- if p.status.phase | default('') not in ['Succeeded', 'Failed'] -%}
+      {%- for v in p.spec.volumes | default([]) -%}
+      {%- if (v.persistentVolumeClaim | default({})).claimName | default('') == target.claim -%}
+      {%- set found.names = found.names + [p.metadata.name ~ ' (' ~ p.status.phase | default('unknown')
+          ~ (', Terminating' if p.metadata.deletionTimestamp is defined else '') ~ ')'] -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {{ found.names | unique | list }}
+
+- name: Stop when a pod still mounts the claim
+  when: recover_claim_pods | length > 0
+  ansible.builtin.fail:
+    msg: >-
+      {{ target.namespace }}/{{ target.claim }} is still mounted by
+      {{ recover_claim_pods | join(', ') }}. Deleting the PVC would hang in
+      Terminating (pvc-protection). The Deployment {{ target.deploy }} was
+      scaled to 0, so the pod belongs to something else or Argo CD scaled it
+      up again. Look: kubectl -n {{ target.namespace }} get pod -o wide, and
+      kubectl -n argocd get applications.argoproj.io {{ target.app }}
+      -o jsonpath='{.spec.syncPolicy.automated}' (must be empty while the
+      restore runs: cd ansible && ansible-playbook recover-files.yml --tags pause).
+
+- name: Wait until the workload pods are gone
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: "{{ target.namespace }}"
+    label_selectors:
+      - "{{ target.label }}"
+  register: recover_pods
+  retries: "{{ recover_pod_retries | default(36) }}"
+  delay: "{{ recover_poll | default(5) }}"
+  until: recover_pods.resources | default([]) | length == 0

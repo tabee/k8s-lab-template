@@ -1,0 +1,36 @@
+---
+# Namespaces of the Gitea Actions runner (issue #115, ADR 0030).
+#   gitea-runner       the runner process (gitea-runner daemon). It polls Gitea and starts job pods.
+#   gitea-runner-jobs  one pod per job. Code from every push runs here: no service account token,
+#                      no privileged container, no API server, a hard quota (resourcequota.yaml).
+# Both PSA restricted. Delete=false: removing the app keeps the namespaces and the secret
+# (app secrets-gitea-runner).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gitea-runner
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+    argocd.argoproj.io/sync-wave: "-1"
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gitea-runner-jobs
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+    argocd.argoproj.io/sync-wave: "-1"
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest

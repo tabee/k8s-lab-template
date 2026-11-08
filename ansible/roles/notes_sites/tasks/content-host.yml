@@ -1,0 +1,20 @@
+---
+# Content trust is per site, never inherited from the Argo CD code source.
+- name: Read pinned content host keys
+  ansible.builtin.set_fact:
+    notes_sites_known_hosts: "{{ notes_site.repo_known_hosts | default([]) }}"
+    notes_sites_ssh_host: "{{ notes_site.repo | ansible.builtin.urlsplit('hostname') }}"
+    notes_sites_ssh_port: "{{ (notes_site.repo | ansible.builtin.urlsplit('port')) | default(22, true) | int }}"
+
+- name: Require public keys for the exact content SSH endpoint
+  ansible.builtin.assert:
+    that:
+      - notes_sites_known_hosts is sequence and notes_sites_known_hosts is not string and notes_sites_known_hosts is not mapping
+      - notes_sites_known_hosts | length > 0
+      - notes_sites_known_hosts | reject('string') | list | length == 0
+      - notes_sites_known_hosts | reject('match', notes_sites_host_key_pattern) | list | length == 0
+    fail_msg: "Set repo_known_hosts for {{ notes_site.repo }} in gitops/sites.yaml; verify content host fingerprints out of band."
+    quiet: true
+  vars:
+    notes_sites_host_token: "{{ notes_sites_ssh_host if notes_sites_ssh_port | int == 22 else '[' ~ notes_sites_ssh_host ~ ']:' ~ notes_sites_ssh_port }}"
+    notes_sites_host_key_pattern: "{{ '^' ~ (notes_sites_host_token | regex_escape) ~ ' (ssh-ed25519|ecdsa-sha2-nistp256|ssh-rsa) [A-Za-z0-9+/]+={0,3}$' }}"

@@ -1,0 +1,53 @@
+---
+# Bucket, versioning, lifecycle, policy and user via the rustfs admin API.
+# The helper reads the keys itself from the env files; Ansible never sees
+# them, the output contains none.
+
+- name: Check whether rustfs.env exists (in the --check run perhaps not yet)
+  ansible.builtin.stat:
+    path: "{{ backup_s3_root_env }}"
+  register: backup_s3_root_env_stat
+
+- name: Reconcile bucket, policy and user
+  ansible.builtin.command:
+    argv: >-
+      {{ [ansible_playbook_python, role_path ~ '/files/rustfs-s3.py', 'ensure',
+          '--endpoint', 'http://127.0.0.1:' ~ backup_s3_port,
+          '--root-env', backup_s3_root_env, '--user-env', backup_s3_user_env,
+          '--bucket', backup_s3_bucket, '--policy', backup_s3_policy_name,
+          '--policy-json', backup_s3_policy | to_json,
+          '--versioning', 'on' if backup_s3_versioning else 'off',
+          '--noncurrent-days', backup_s3_noncurrent_days | string]
+         + (['--check'] if ansible_check_mode else []) }}
+  register: backup_s3_ensure
+  check_mode: false
+  changed_when: (backup_s3_ensure.stdout | from_json).changed
+  failed_when: backup_s3_ensure.rc != 0 or not (backup_s3_ensure.stdout | from_json).ok
+  when: backup_s3_root_env_stat.stat.exists
+
+- name: Show S3 state
+  ansible.builtin.debug:
+    msg: "{{ (backup_s3_ensure.stdout | from_json).actions + [(backup_s3_ensure.stdout | from_json).message] }}"
+  when: backup_s3_root_env_stat.stat.exists
+
+- name: Reconcile K8up bucket, policy and user (stage 8c)
+  ansible.builtin.command:
+    argv: >-
+      {{ [ansible_playbook_python, role_path ~ '/files/rustfs-s3.py', 'ensure',
+          '--endpoint', 'http://127.0.0.1:' ~ backup_s3_port,
+          '--root-env', backup_s3_root_env, '--user-env', backup_s3_k8up_user_env,
+          '--bucket', backup_s3_k8up_bucket, '--policy', backup_s3_k8up_policy_name,
+          '--policy-json', backup_s3_k8up_policy | to_json,
+          '--versioning', 'on' if backup_s3_versioning else 'off',
+          '--noncurrent-days', backup_s3_noncurrent_days | string]
+         + (['--check'] if ansible_check_mode else []) }}
+  register: backup_s3_k8up_ensure
+  check_mode: false
+  changed_when: (backup_s3_k8up_ensure.stdout | from_json).changed
+  failed_when: backup_s3_k8up_ensure.rc != 0 or not (backup_s3_k8up_ensure.stdout | from_json).ok
+  when: backup_s3_root_env_stat.stat.exists
+
+- name: Show S3 state K8up
+  ansible.builtin.debug:
+    msg: "{{ (backup_s3_k8up_ensure.stdout | from_json).actions + [(backup_s3_k8up_ensure.stdout | from_json).message] }}"
+  when: backup_s3_root_env_stat.stat.exists

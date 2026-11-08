@@ -1,0 +1,45 @@
+---
+# Role "backup_replica": mirror of the rustfs data to another LAN machine (issue #3), on the owner's PC:
+# config, pinned host key, scripts and systemd user units (mirror every N minutes, daily checksum run).
+# The replica side (authorized_keys) is done by ansible/backup-replica.yml, rootless.
+galaxy_info:
+  author: k8s-lab
+  description: Off-host replica of the rustfs backup data (rsync over a restricted ssh key)
+  license: MIT
+  min_ansible_version: "2.17"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - noble
+dependencies: []
+
+argument_specs:
+  main:
+    short_description: Replica mirror units on the backup host (values from group_vars/all/backup_replica.yml)
+    options:
+      backup_replica_host: { type: str, required: true, description: Host name or IP of the replica }
+      backup_replica_user: { type: str, required: true, description: User on the replica }
+      backup_replica_port: { type: int, required: true, description: ssh port of the replica }
+      backup_replica_from_cidr: { type: str, required: true, description: "LAN for from= in authorized_keys, empty = no from=" }
+      backup_replica_host_key: { type: str, required: true, description: "Pinned ssh host key (type and key); empty aborts" }
+      backup_replica_remote_dir: { type: str, required: true, description: "Directory on the replica (relative to home or absolute)" }
+      backup_replica_install_key: { type: str, required: true, description: Personal key used once for the install }
+      backup_replica_rrsync: { type: str, required: true, description: Path of rrsync on the replica }
+      backup_replica_key: { type: str, required: true, description: Dedicated restricted key of the mirror }
+      backup_replica_known_hosts: { type: str, required: true, description: known_hosts file with the pinned key }
+      backup_replica_config: { type: str, required: true, description: JSON config read by lab-replica.py }
+      backup_replica_source: { type: str, required: true, description: Data dir that is mirrored }
+      backup_replica_exclude: { type: list, elements: str, required: true, description: "Paths below the source that are not copied" }
+      backup_replica_allow_delete: { type: bool, required: true, description: "Mirror follows deletions (and the key may delete)" }
+      backup_replica_script: { type: str, required: true, description: Install path of lab-replica.py }
+      backup_replica_mirror_interval_min: { type: int, required: true, description: Minutes between mirror runs }
+      backup_replica_mirror_boot_delay_min: { type: int, required: true, description: Minutes after boot of the first run }
+      backup_replica_verify_calendar: { type: str, required: true, description: systemd calendar of the checksum run }
+      backup_replica_max_age_min: { type: int, required: true, description: Maximum age of the last mirror in minutes }
+      backup_replica_connect_timeout: { type: int, required: true, description: ssh connect timeout in seconds }
+      backup_replica_io_timeout: { type: int, required: true, description: rsync I/O timeout in seconds }
+      backup_replica_min_free_factor: { type: float, required: true, description: Free space factor on the replica }
+      backup_replica_min_free_mib: { type: int, required: true, description: Minimum free MiB on the replica }
+      backup_replica_unit_prefix: { type: str, required: true, description: Prefix of the unit names }
+      backup_s3_script_dir: { type: str, required: true, description: Folder of the scripts }
+      backup_s3_systemd_user_dir: { type: str, required: true, description: Folder of the user units }

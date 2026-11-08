@@ -1,0 +1,13 @@
+---
+- name: Restart WireGuard
+  ansible.builtin.systemd:
+    name: "wg-quick@{{ wireguard_interface }}"
+    state: restarted
+  # Peer-only changes use syncconf so an Ansible run through the tunnel is not dropped.
+  listen: Restart WireGuard
+
+- name: Reload WireGuard peers
+  ansible.builtin.shell: "wg syncconf {{ wireguard_interface }} <(wg-quick strip {{ wireguard_interface }})"
+  args:
+    executable: /bin/bash
+  changed_when: true

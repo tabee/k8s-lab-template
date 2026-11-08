@@ -1,0 +1,50 @@
+---
+# Empties the backup buckets in rustfs (all versions, open uploads, then the
+# bucket itself). Needed before a NEW cluster with the same serverName
+# starts: CNPG otherwise aborts with "Expected empty archive", because the bucket
+# still holds the WAL of the old cluster. The bucket is created again by backup-host.yml
+# (role backup_s3, task ensure) afterwards with policy and user;
+# the SOPS secrets in the repo stay valid (keys are in the env files).
+#
+# Called by scripts/lab.sh (rebuild, purge). Never by hand without reason:
+#   cd ansible && ansible-playbook lab-backups-empty.yml -e lab_empty_ok=yes
+#   Scope: -e lab_empty_scope=cnpg (Postgres only, default) or all
+# Without lab_empty_ok=yes nothing happens. Needs no sudo.
+
+- name: Empty backup buckets in rustfs
+  hosts: backup_host
+  gather_facts: false
+  vars:
+    lab_empty_ok: "no"
+    lab_empty_scope: cnpg
+    lab_empty_buckets: >-
+      {{ [backup_s3_bucket, backup_s3_k8up_bucket] if lab_empty_scope == 'all' else [backup_s3_bucket] }}
+  tasks:
+    - name: Safeguard against accidental start
+      ansible.builtin.assert:
+        that:
+          - lab_empty_ok == 'yes'
+          - lab_empty_scope in ['cnpg', 'all']
+        fail_msg: "To empty, pass -e lab_empty_ok=yes (and lab_empty_scope=cnpg or all)."
+        quiet: true
+
+    - name: Delete bucket with all versions
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_playbook_python }}"
+          - "{{ playbook_dir }}/roles/backup_s3/files/rustfs-s3.py"
+          - drop-bucket
+          - --endpoint
+          - "http://127.0.0.1:{{ backup_s3_port }}"
+          - --root-env
+          - "{{ backup_s3_root_env }}"
+          - --bucket
+          - "{{ item }}"
+      loop: "{{ lab_empty_buckets }}"
+      register: lab_empty_result
+      changed_when: (lab_empty_result.stdout | from_json).changed
+      failed_when: lab_empty_result.rc != 0 or not (lab_empty_result.stdout | from_json).ok
+
+    - name: Show result
+      ansible.builtin.debug:
+        msg: "{{ lab_empty_result.results | map(attribute='stdout') | map('from_json') | map(attribute='message') | list }}"

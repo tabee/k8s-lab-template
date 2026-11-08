@@ -1,0 +1,39 @@
+---
+# Template for all K8up pods in the namespace matrix. Without it the job
+# pods would have no container securityContext and PSA restricted would
+# reject them. The container name here is irrelevant: K8up overwrites it.
+# Reference: podConfigRef in k8up-schedule.yaml and in verify-matrix.yml.
+apiVersion: k8up.io/v1
+kind: PodConfig
+metadata:
+  name: k8up-restricted
+  namespace: matrix
+  annotations:
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+spec:
+  template:
+    spec:
+      terminationGracePeriodSeconds: 30
+      # Synapse writes the media store and the signing key as uid/gid 991.
+      # restic has to read those files and write them back with the same owner.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 991
+        runAsGroup: 991
+        fsGroup: 991
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: k8up
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - "ALL"
+          resources:
+            requests:
+              cpu: 20m
+              memory: 64Mi
+            limits:
+              memory: 512Mi  # lab-limit: matrix/backup-*/* matrix/restore-*/* matrix/prune-*/* matrix/check-*/*

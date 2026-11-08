@@ -1,0 +1,135 @@
+---
+# Memory budget check (issue #9), read-only. Reads the REAL limits from the cluster, adds them up and fails
+# when the sum of the memory limits of all work pods plus the reserve is more than the VM memory, when a
+# container has no limit, or when the node reports memory pressure. Also writes the `kubectl top` table into
+# the log, so every acceptance run documents what the pods really use.
+# Usage: ansible-playbook verify-budget.yml   (phase of lab.sh acceptance)
+# The arithmetic lives in scripts/memory-budget.py (one place, tested in tests/memory-budget-tests.sh);
+# the values come from lab.yaml: memory_mib, memory_reserve_mib, disk_gb. Red budget: bash scripts/lab.sh budget.
+
+- name: Check the memory budget of the cluster
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: "{{ argocd_kubeconfig }}"
+  vars:
+    budget_repo: "{{ playbook_dir }}/.."
+    # Namespaces where every Running work pod must carry a LimitRange named lab-memory.
+    budget_limitrange_name: lab-memory
+    budget_limitrange_namespaces: >-
+      {{ ['whoami', 'docs', 'db-lab', 'gitea', 'gitea-runner', 'matrix', 'keycloak'] | intersect(argocd_project_namespaces) }}
+  tasks:
+    - name: Read all pods
+      kubernetes.core.k8s_info:
+        kind: Pod
+      register: budget_pods
+
+    - name: Read the nodes
+      kubernetes.core.k8s_info:
+        kind: Node
+      register: budget_nodes
+
+    - name: Read the LimitRanges
+      kubernetes.core.k8s_info:
+        kind: LimitRange
+      register: budget_limitranges
+
+    - name: Read the live K8up schedules for the enforcing profile
+      kubernetes.core.k8s_info:
+        api_version: k8up.io/v1
+        kind: Schedule
+      register: budget_schedules
+      when: lab.memory_budget_enforce | default(true) | bool
+
+    - name: Read the live K8up PodConfigs for the enforcing profile
+      kubernetes.core.k8s_info:
+        api_version: k8up.io/v1
+        kind: PodConfig
+      register: budget_podconfigs
+      when: lab.memory_budget_enforce | default(true) | bool
+
+    - name: Read the live workload project sync fence for the enforcing profile
+      kubernetes.core.k8s_info:
+        api_version: argoproj.io/v1alpha1
+        kind: AppProject
+        namespace: "{{ argocd_namespace }}"
+        name: "{{ argocd_project }}"
+      register: budget_project
+      when: lab.memory_budget_enforce | default(true) | bool
+
+    - name: Add up the memory limits and compare them with the budget
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_playbook_python }}"
+          - "{{ budget_repo }}/scripts/memory-budget.py"
+          - check
+          - --repo
+          - "{{ budget_repo }}"
+      args:
+        stdin: "{{ budget_input | to_json }}"
+      vars:
+        budget_input:
+          memory_mib: "{{ lab.memory_mib | int }}"
+          reserve_mib: "{{ lab.memory_reserve_mib | int }}"
+          periodic_stagger_enforce: "{{ lab.memory_budget_enforce | default(true) | bool }}"
+          periodic_resources: >-
+            {{ (budget_schedules.resources | default([])) + (budget_podconfigs.resources | default([]))
+               + (budget_project.resources | default([])) }}
+          disk_gb: "{{ lab.disk_gb | int }}"
+          pods: "{{ budget_pods.resources }}"
+          nodes: "{{ budget_nodes.resources }}"
+      register: budget_check
+      changed_when: false
+      failed_when: budget_check.rc not in [0, 1]
+
+    - name: Show the budget
+      ansible.builtin.debug:
+        msg: "{{ budget_check.stdout_lines }}"
+
+    - name: The memory limits fit into the VM
+      ansible.builtin.assert:
+        that:
+          - budget_check.rc == 0 or (not (lab.memory_budget_enforce | default(true) | bool) and budget_hard_red | length == 0)
+        fail_msg: "Memory budget is red (details above): {{ budget_red_lines | default([]) }}"
+        success_msg: "{{ 'Memory budget ok' if budget_check.rc == 0 else 'WARNING (memory_budget_enforce: false): ' ~ (budget_red_lines | join('; ')) }}"
+      vars:
+        budget_red_lines: "{{ budget_check.stdout_lines | default([]) | select('match', '^(OVERBUDGET|NOLIMIT|BADLIMIT|PRESSURE|STAGGER)') | list }}"
+        budget_hard_red: "{{ budget_check.stdout_lines | default([]) | select('match', '^(NOLIMIT|BADLIMIT|PRESSURE|STAGGER)') | list }}"
+
+    - name: Every work namespace has the LimitRange {{ budget_limitrange_name }}
+      ansible.builtin.assert:
+        that:
+          - budget_missing_limitrange | length == 0
+        fail_msg: "Namespaces without the LimitRange {{ budget_limitrange_name }}: {{ budget_missing_limitrange | default([]) }}"
+        success_msg: "LimitRange {{ budget_limitrange_name }} present in {{ budget_limitrange_namespaces | join(', ') }} and in every notes-* namespace"
+      vars:
+        budget_limitrange_have: >-
+          {{ budget_limitranges.resources | selectattr('metadata.name', 'equalto', budget_limitrange_name) | map(attribute='metadata.namespace') | list }}
+        budget_notes_namespaces: >-
+          {{ budget_pods.resources | map(attribute='metadata.namespace') | unique | select('match', '^notes-') | list }}
+        budget_missing_limitrange: >-
+          {{ (budget_limitrange_namespaces + budget_notes_namespaces) | difference(budget_limitrange_have) }}
+
+    - name: Read what the pods really use (kubectl top)
+      ansible.builtin.command:
+        argv: [kubectl, --kubeconfig, "{{ argocd_kubeconfig }}", top, pods, -A, --containers]
+      register: budget_top
+      changed_when: false
+      failed_when: budget_top.rc not in [0, 1]
+
+    - name: Read what the node really uses (kubectl top)
+      ansible.builtin.command:
+        argv: [kubectl, --kubeconfig, "{{ argocd_kubeconfig }}", top, nodes]
+      register: budget_top_node
+      changed_when: false
+      failed_when: budget_top_node.rc not in [0, 1]
+
+    - name: Show the usage table (it is part of the acceptance log)
+      ansible.builtin.debug:
+        msg: "{{ budget_usage_lines }}"
+      vars:
+        budget_usage_lines: >-
+          {{ (budget_top_node.stdout_lines | default([])) + [''] + (budget_top.stdout_lines | default([]))
+          if budget_top.rc == 0 else ['kubectl top is not available (metrics-server not ready)'] }}

@@ -1,0 +1,21 @@
+---
+# Namespace for Synapse, Element Web and the database matrix-db.
+# PSA restricted: Synapse runs as uid 991 (no UID env, so the image does
+# not try to switch user), Element as uid 101, CNPG as uid 26, K8up jobs
+# via PodConfig k8up-restricted as uid 991.
+# Delete=false: removing the app matrix keeps the namespace, the secrets
+# (app secrets-matrix) and the data PVC.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: matrix
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+    argocd.argoproj.io/sync-wave: "-1"
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest

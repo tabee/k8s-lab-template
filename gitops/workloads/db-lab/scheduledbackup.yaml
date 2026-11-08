@@ -1,0 +1,24 @@
+---
+# Daily base backup. ONLY place for the time: spec.schedule.
+# Cron with seconds (6 fields), time zone UTC (operator): 20:00 UTC =
+# 21:00 Zurich winter time (CET), in summer 22:00 (CEST), because UTC has no
+# daylight saving time. In the evening, while your PC (rustfs) is reliably running.
+# immediate: a first backup right after creation. If the S3 secret is still missing
+# at the first sync, this one fails; the next comes in the
+# evening, verify-cnpg.yml makes its own anyway.
+# WAL runs continuously (cluster, isWALArchiver), in between PITR is possible.
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: pg-lab-daily
+  namespace: db-lab
+spec:
+  schedule: "0 0 20 * * *"
+  immediate: true
+  # Backup objects belong to the ScheduledBackup (not to the cluster).
+  backupOwnerReference: self
+  cluster:
+    name: pg-lab
+  method: plugin
+  pluginConfiguration:
+    name: barman-cloud.cloudnative-pg.io

@@ -1,0 +1,13 @@
+---
+# Deliberately insecure pod, only for the server dry run (is never created).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: psa-probe
+  namespace: "{{ argocd_bootstrap_probe_namespace }}"
+spec:
+  containers:
+    - name: probe
+      image: "{{ lab_probe_image }}"
+      securityContext:
+        privileged: true

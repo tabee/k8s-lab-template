@@ -1,0 +1,367 @@
+---
+# Values for the official Gitea chart (stage 8c). Chart, repo and
+# version are only in gitops/apps/gitea.yaml.
+# Deliberately NOT in manifests/: Argo CD renders the path of the
+# repo source as manifests and would otherwise read this file as a (broken)
+# Kubernetes object.
+# Check on every chart update:
+#   helm show values gitea-charts/gitea --version <Version>
+#   helm template gitea gitea-charts/gitea --version <Version> -n gitea -f values-gitea.yaml
+
+# Gitea 1.27.3 (rootless) with digest (index, amd64 + arm64), as of
+# 2026-10-27. The chart appends "-rootless" to the tag itself.
+image:
+  registry: docker.gitea.com
+  repository: gitea
+  tag: "1.27.3"
+  digest: sha256:1c17ecaead42eb3b5391553d8708103a4beb0e86edf5b9ebc1eb269c318845f2
+  rootless: true
+
+# One instance. Recreate instead of RollingUpdate: the repo PVC is
+# ReadWriteOnce, and the queue (LevelDB under /data/queues) may be opened by only one
+# process. An update therefore means: briefly off, then on again.
+replicaCount: 1
+strategy:
+  type: Recreate
+
+# No database and no Valkey from the chart: the database is the
+# CNPG-Cluster gitea-db (manifests/cluster.yaml), Cache/Session/Queue
+# run without Valkey (see gitea.config below). The chart test needs
+# a busybox image and does not run under Argo CD anyway.
+postgresql:
+  enabled: false
+postgresql-ha:
+  enabled: false
+valkey-cluster:
+  enabled: false
+valkey:
+  enabled: false
+test:
+  enabled: false
+
+# PSA restricted (Namespace gitea). The rootless image runs as uid 1000.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  capabilities:
+    drop:
+      - "ALL"
+  seccompProfile:
+    type: RuntimeDefault
+
+# Global runner registration token (issue #115): Gitea creates it at start from this variable (at least
+# 32 characters, Gitea 1.24+). optional: without the secret gitea-runner-token Gitea starts without a global
+# token, the runner simply cannot register yet. The chart puts deployment.env into the init containers too;
+# only the main container reads it. Value: secrets/gitea/gitea-runner-token.sops.yaml.
+deployment:
+  env:
+    - name: GITEA_RUNNER_REGISTRATION_TOKEN
+      valueFrom:
+        secretKeyRef:
+          name: gitea-runner-token
+          key: token
+          optional: true
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    memory: 256Mi  # lab-limit: gitea/gitea/gitea
+initContainers:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
+
+# There is no SSH service (DISABLE_SSH below); the service stays
+# from the chart, but points to no open port.
+service:
+  http:
+    type: ClusterIP
+  ssh:
+    type: ClusterIP
+
+# Access only via Traefik (IngressRoute under extraDeploy, at the very bottom), not
+# via the Ingress object of the chart.
+ingress:
+  enabled: false
+
+# Repos, attachments, app.ini, queue: everything under /data on this PVC
+# (local-path, default StorageClass of k3s). Name gitea-shared-storage
+# is in the restore test (ansible/verify-gitea.yml) and in the docs.
+# keep: even if the app is deleted, the PVC stays.
+# k8up.io/backup "true": K8up backs up ONLY PVCs with this annotation
+# (values.yaml of the app k8up, skipWithoutAnnotation).
+persistence:
+  enabled: true
+  create: true
+  claimName: gitea-shared-storage
+  size: 5Gi
+  accessModes:
+    - ReadWriteOnce
+  annotations:
+    helm.sh/resource-policy: keep
+    k8up.io/backup: "true"
+
+# Single sign-on with Keycloak (ADR-0019). The authentication source "keycloak" is
+# added (or updated, so the step is idempotent) with `gitea admin auth
+# add-oauth` / `update-oauth` in an init container AFTER the chart's own init
+# containers. Deliberately NOT the chart value gitea.oauth: the chart script
+# validates the discovery document and fails hard while Keycloak is down; Gitea would
+# then crash-loop and even the local break-glass admin would be gone exactly when Keycloak
+# is broken. This container waits at most 180 s for Keycloak, then logs a
+# warning and lets Gitea start anyway (the source that is already in the database
+# keeps working, a missing one is added on the next pod start).
+# key and secret come from the secret gitea-oidc (secrets/gitea/gitea-oidc.sops.yaml).
+# The discovery document is read over the Service (no egress to the internet, no Traefik);
+# Keycloak puts the public address into the authorization endpoint, so the browser
+# goes to https://sso.<lab domain>. Only members of the realm group lab-users may log
+# in. There is NO admin group mapping: nobody becomes Gitea admin through Keycloak.
+# The local admin (gitea.admin above) stays as break-glass. The realm name lab is a
+# copy of gitops/charts/keycloak/values.yaml, the image a copy of the image block above
+# (tests/keycloak-tests.sh compares both).
+postExtraInitContainers:
+  - name: configure-oidc
+    image: docker.gitea.com/gitea:1.27.3-rootless@sha256:1c17ecaead42eb3b5391553d8708103a4beb0e86edf5b9ebc1eb269c318845f2
+    imagePullPolicy: IfNotPresent
+    command: ["/bin/bash", "-c"]
+    args:
+      - |
+        set -u
+        URL=http://keycloak.keycloak.svc:8080/realms/lab/.well-known/openid-configuration
+        i=0
+        until curl -fsS -m 3 -o /dev/null "${URL}"; do
+          i=$((i + 1))
+          [ "${i}" -ge 36 ] && break
+          sleep 5
+        done
+        args=(--name keycloak --provider openidConnect --key "${OIDC_KEY}" --secret "${OIDC_SECRET}"
+          --auto-discover-url "${URL}" --scopes "openid,profile,email,groups"
+          --required-claim-name groups --required-claim-value lab-users --group-claim-name groups)
+        list=$(gitea admin auth list --vertical-bars 2>&1) || { echo "WARNING: auth list failed, SSO source not touched"; exit 0; }
+        id=$(echo "${list}" | awk -F'|' '{n = $2; gsub(/[ \t]/, "", n)} n == "keycloak" {gsub(/[ \t]/, "", $1); print $1}')
+        if [ -z "${id}" ]; then
+          echo "No oauth configuration named keycloak. Installing it now..."
+          gitea admin auth add-oauth "${args[@]}" && echo "...installed." || echo "WARNING: Keycloak not reachable, SSO source not installed (restart the gitea pod once Keycloak is up)"
+        else
+          echo "Existing oauth configuration keycloak: ${id}. Running update to sync settings..."
+          gitea admin auth update-oauth --id "${id}" "${args[@]}" && echo "...sync done." || echo "WARNING: Keycloak not reachable, SSO source left as it is"
+        fi
+        exit 0
+    env:
+      - {name: GITEA_APP_INI, value: /data/gitea/conf/app.ini}
+      - {name: GITEA_CUSTOM, value: /data/gitea}
+      - {name: GITEA_WORK_DIR, value: /data}
+      - {name: GITEA_TEMP, value: /tmp/gitea}
+      - {name: HOME, value: /data/gitea/git}
+      - name: OIDC_KEY
+        valueFrom: {secretKeyRef: {name: gitea-oidc, key: key}}
+      - name: OIDC_SECRET
+        valueFrom: {secretKeyRef: {name: gitea-oidc, key: secret}}
+    securityContext:
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      runAsNonRoot: true
+      runAsUser: 1000
+      runAsGroup: 1000
+      capabilities:
+        drop: ["ALL"]
+      seccompProfile:
+        type: RuntimeDefault
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        memory: 256Mi
+    volumeMounts:
+      - {name: data, mountPath: /data}
+      - {name: temp, mountPath: /tmp}
+
+gitea:
+  # First admin from the SOPS secret gitea-admin (keys username and
+  # password, secrets/gitea/). initialOnlyNoReset: the password is only
+  # set on creation; whoever changes it later in the UI
+  # does not get it reset on the next start.
+  admin:
+    existingSecret: gitea-admin
+    username: ""
+    password: ""
+    # Mailer is off, the address is only a required field.
+    email: "gitea-admin@lab.example"
+    passwordMode: initialOnlyNoReset
+
+  metrics:
+    enabled: false
+
+  # Database user and password from the secret gitea-db-owner (the same one
+  # with which CNPG creates the owner, manifests/cluster.yaml). The chart
+  # writes GITEA__DATABASE__* into app.ini at start.
+  additionalConfigFromEnvs:
+    - name: GITEA__DATABASE__USER
+      valueFrom:
+        secretKeyRef:
+          name: gitea-db-owner
+          key: username
+    - name: GITEA__DATABASE__PASSWD
+      valueFrom:
+        secretKeyRef:
+          name: gitea-db-owner
+          key: password
+
+  config:
+    APP_NAME: "Gitea Lab"
+    server:
+      # ONLY place for the hostname of Gitea. ROOT_URL derives it via the
+      # ini reference %(DOMAIN)s (Gitea reads app.ini with go-ini; checked with
+      # image 1.27.3: AppURL https://<DOMAIN>/). Certificate and
+      # IngressRoute (extraDeploy below) read it via Helm template, Ansible
+      # (verify-gitea.yml, role lab_hosts) reads it from here.
+      # Renaming = change only this line (docs/learning-path/stage-8c-gitea.md).
+      DOMAIN: git.lab.example
+      ROOT_URL: "https://%(DOMAIN)s/"
+      # Gitea talks HTTP internally on 3000, TLS is done by Traefik.
+      PROTOCOL: http
+      HTTP_PORT: 3000
+      # HTTPS only: fewer open ports, no second way through Traefik
+      # (TCP route), access by token/password over HTTPS is enough in the lab.
+      DISABLE_SSH: true
+      START_SSH_SERVER: false
+      SSH_PORT: 22
+      SSH_LISTEN_PORT: 2222
+      OFFLINE_MODE: true
+      # LFS on: the production forge serves LFS objects, and scripts/gitea-import.sh restores them
+      # (ADR 0015). The objects live on the PVC like the repos (backed up by K8up).
+      LFS_START_SERVER: true
+    database:
+      DB_TYPE: postgres
+      # COPY: service of the pooler (manifests/pooler.yaml, metadata.name)
+      # and database name (manifests/cluster.yaml, bootstrap.initdb).
+      # ansible/verify-gitea.yml compares both.
+      HOST: gitea-db-pooler-rw.gitea.svc:5432
+      NAME: gitea
+      # CNPG/PgBouncer speak TLS; "require" encrypts, but does not check
+      # the cluster's own CA (it only lives in the namespace).
+      SSL_MODE: require
+    # Without Valkey, justified in docs/learning-path/stage-8c-gitea.md:
+    #   cache memory: one instance, simply empty after a restart.
+    #   session db: logins survive a restart (Recreate).
+    #   queue level: LevelDB on the PVC, open tasks survive
+    #     a restart, no further service.
+    cache:
+      ADAPTER: memory
+    session:
+      PROVIDER: db
+      COOKIE_SECURE: true
+    queue:
+      TYPE: level
+    indexer:
+      ISSUE_INDEXER_TYPE: db
+      REPO_INDEXER_ENABLED: false
+    service:
+      # Self-registration stays off. ALLOW_ONLY_EXTERNAL_REGISTRATION lets the
+      # first login through Keycloak create the account (oauth2_client below);
+      # the registration form itself stays closed.
+      DISABLE_REGISTRATION: true
+      ALLOW_ONLY_EXTERNAL_REGISTRATION: true
+      REQUIRE_SIGNIN_VIEW: true
+      DEFAULT_KEEP_EMAIL_PRIVATE: true
+    # Accounts that come from Keycloak: created on first login with the
+    # Keycloak user name. ACCOUNT_LINKING auto: a Keycloak user whose
+    # preferred_username (else e-mail) matches an existing local account is
+    # attached to it on the first login (no second account, no username
+    # conflict). This is what makes the accounts of a gitea-import usable
+    # with Keycloak. The realm is closed (no self-registration, users are
+    # created by the admin), so a matching name is trusted.
+    oauth2_client:
+      ENABLE_AUTO_REGISTRATION: true
+      USERNAME: preferred_username
+      ACCOUNT_LINKING: auto
+      UPDATE_AVATAR: false
+    security:
+      INSTALL_LOCK: true
+    # Gitea Actions (issue #115, ADR 0030): the runner of the app gitea-runner runs the workflows of
+    # .gitea/workflows as job pods. DEFAULT_ACTIONS_URL self: a "uses:" never quietly fetches code from github.com
+    # (the workflows here use none).
+    actions:
+      ENABLED: true
+      DEFAULT_ACTIONS_URL: self
+    mailer:
+      ENABLED: false
+    cron.update_checker:
+      ENABLED: false
+    log:
+      LEVEL: Info
+
+# Certificate and IngressRoute (formerly manifests/certificate.yaml and
+# ingressroute.yaml): here, so that the hostname appears only once
+# (gitea.config.server.DOMAIN above). The chart renders extraDeploy with tpl:
+# {{ ... }} is replaced on rendering. Everything else is unchanged:
+# same names, same secret gitea-tls, same annotation.
+# The lab CA (ClusterIssuer lab-ca) issues the certificate, cert-manager
+# renews it itself: ECDSA P-256, 90 days lifetime, renewal 30 days before.
+# Traefik: HTTPS only (entrypoint websecure), also for git clone/push (SSH is
+# off). The service gitea-http comes from the chart and has the port name http.
+# Test vom Host:
+#   curl --cacert ~/.config/k8s-lab/lab-ca.crt https://<DOMAIN>/
+# Access in the browser: role lab_hosts enters the name into /etc/hosts.
+extraDeploy:
+  - apiVersion: cert-manager.io/v1
+    kind: Certificate
+    metadata:
+      name: gitea
+      namespace: "{{ .Release.Namespace }}"
+      annotations:
+        # The CRD comes from the app cert-manager. Until then retry (apps/gitea.yaml).
+        argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+    spec:
+      secretName: gitea-tls
+      dnsNames:
+        - "{{ .Values.gitea.config.server.DOMAIN }}"
+      duration: 2160h
+      renewBefore: 720h
+      privateKey:
+        algorithm: ECDSA
+        size: 256
+        rotationPolicy: Always
+      usages:
+        - digital signature
+        - server auth
+      issuerRef:
+        group: cert-manager.io
+        kind: ClusterIssuer
+        name: lab-ca
+  - apiVersion: traefik.io/v1alpha1
+    kind: IngressRoute
+    metadata:
+      name: gitea
+      namespace: "{{ .Release.Namespace }}"
+      annotations:
+        # The CRD comes only from the app traefik. Until then retry (apps/gitea.yaml).
+        argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+    spec:
+      entryPoints:
+        - websecure
+      routes:
+        - kind: Rule
+          match: "Host(`{{ .Values.gitea.config.server.DOMAIN }}`)"
+          services:
+            # Same namespace (allowCrossNamespace is off).
+            - name: '{{ include "gitea.fullname" . }}-http'
+              port: http
+      tls:
+        secretName: gitea-tls

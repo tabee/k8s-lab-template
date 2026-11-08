@@ -1,0 +1,14 @@
+# {{ ansible_managed }}
+# Issue #3: daily freshness and checksum check of the replica (oneshot, from the timer).
+# Source: ansible/roles/backup_replica/templates/replica-verify.service.j2
+# Values: ansible/inventory/group_vars/all/backup_replica.yml (backup_replica_*).
+
+[Unit]
+Description=Checksum check of the replica
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/flock -w 600 %t/{{ backup_replica_unit_prefix }}.lock {{ ansible_playbook_python }} {{ backup_replica_script }} verify --config {{ backup_replica_config }}
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=7200

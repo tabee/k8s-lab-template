@@ -1,0 +1,365 @@
+---
+# Check stage 7 (KSOPS: SOPS secrets that Argo CD decrypts itself),
+# read only: k8s_info in the cluster, git and files in the repo.
+# Usage: ansible-playbook verify-ksops.yml
+# Prerequisite: argocd.yml has run, the state is pushed.
+# Secrets: of the age secret only metadata (metadata_only), of the CA secret only
+# labels and annotations. Values are never read or shown.
+# Break-glass (issue 11): see the last section; only PUBLIC key lines of the cluster
+# key file are read (grep for the '# public key:' comment), never the private part.
+
+- name: Check stage 7 KSOPS
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: "{{ argocd_kubeconfig }}"
+  vars:
+    verify_retries: 30
+    verify_delay: 10
+    verify_repo: "{{ playbook_dir }}/.."
+    # Mirror of gitops/apps/secrets-*.yaml and secrets/ (Ansible does not read gitops/).
+    verify_secret_apps:
+      - "{{ lab_ca_secret_app }}"
+          # Stage 8b: S3 access for CNPG (gitops/apps/secrets-db-lab.yaml).
+      - secrets-db-lab
+      # Stage 8c: Gitea, K8up (gitops/apps/secrets-gitea.yaml).
+      - secrets-gitea
+      # Gitea Actions runner registration (gitops/apps/secrets-gitea-runner.yaml, issue #115).
+      - secrets-gitea-runner
+      # Keycloak (gitops/apps/secrets-keycloak.yaml).
+      - secrets-keycloak
+    verify_issuer: lab-ca
+    # Recipients of .sops.yaml in file order (first = online key, last = break-glass when there are two or more).
+    verify_rules: "{{ (lookup('ansible.builtin.file', argocd_sops_config_path) | from_yaml).creation_rules | default([]) }}"
+    verify_recipients: "{{ verify_recipients_json | from_json }}"
+    verify_recipients_json: >-
+      {%- set r = [] -%}
+      {%- for rule in verify_rules -%}
+      {%- set a = rule.age | default([]) -%}
+      {%- for x in ([a] if a is string else a) -%}
+      {%- for y in x.split(',') if y | trim | length > 0 -%}
+      {%- set _ = r.append(y | trim) -%}
+      {%- endfor -%}
+      {%- endfor -%}
+      {%- endfor -%}
+      {{ r | to_json }}
+  tasks:
+    # ---------- Repo-Server ----------
+    - name: Read deployment argocd-repo-server
+      kubernetes.core.k8s_info:
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ argocd_namespace }}"
+        name: argocd-repo-server
+      register: verify_rs
+
+    - name: Repo server has KSOPS (pinned image) and the age key
+      ansible.builtin.assert:
+        that:
+          - verify_rs_init | length == 1
+          - (verify_rs_init | first).image == argocd_ksops_image
+          - "'@sha256:' in argocd_ksops_image"
+          - verify_rs_mounts | selectattr('mountPath', 'equalto', '/usr/local/bin/ksops') | list | length == 1
+          - verify_rs_env | selectattr('name', 'equalto', 'SOPS_AGE_KEY_FILE') | map(attribute='value') | list == ['/sops-age/keys.txt']
+          - argocd_sops_age_secret_name in verify_rs_vols | selectattr('secret', 'defined') | map(attribute='secret.secretName') | list
+        fail_msg: >-
+          Repo server without KSOPS init container with {{ argocd_ksops_image }},
+          without mount /usr/local/bin/ksops, without SOPS_AGE_KEY_FILE or without
+          volume from secret {{ argocd_sops_age_secret_name }}. Fix: ansible-playbook argocd.yml
+        success_msg: "KSOPS-Image {{ (verify_rs_init | first).image | default('-') }}"
+      vars:
+        verify_rs_spec: "{{ (verify_rs.resources | first).spec.template.spec }}"
+        verify_rs_init: "{{ verify_rs_spec.initContainers | default([]) | selectattr('name', 'equalto', 'install-ksops') | list }}"
+        verify_rs_main: "{{ verify_rs_spec.containers | selectattr('name', 'equalto', 'repo-server') | first }}"
+        verify_rs_mounts: "{{ verify_rs_main.volumeMounts | default([]) }}"
+        verify_rs_env: "{{ verify_rs_main.env | default([]) }}"
+        verify_rs_vols: "{{ verify_rs_spec.volumes | default([]) }}"
+
+    - name: Read repo server pods
+      kubernetes.core.k8s_info:
+        kind: Pod
+        namespace: "{{ argocd_namespace }}"
+        label_selectors:
+          - app.kubernetes.io/name=argocd-repo-server
+        field_selectors:
+          - status.phase=Running
+      register: verify_rs_pods
+      until:
+        - verify_rs_pods.resources | length > 0
+        - verify_rs_cs | flatten | rejectattr('ready') | list | length == 0
+      retries: "{{ verify_retries }}"
+      delay: "{{ verify_delay }}"
+      vars:
+        verify_rs_cs: "{{ verify_rs_pods.resources | map(attribute='status.containerStatuses', default=[]) | list }}"
+
+    - name: KSOPS init container ran through cleanly
+      ansible.builtin.assert:
+        that: verify_rs_ksops_ok | length == verify_rs_pods.resources | length
+        fail_msg: "Init-Container install-ksops not finished with Completed in every repo server pod"
+        quiet: true
+      vars:
+        verify_rs_ksops_ok: >-
+          {{ verify_rs_pods.resources | map(attribute='status.initContainerStatuses', default=[]) | flatten
+             | selectattr('name', 'equalto', 'install-ksops')
+             | selectattr('state.terminated.reason', 'defined')
+             | selectattr('state.terminated.reason', 'equalto', 'Completed') | list }}
+
+    - name: Read ConfigMap argocd-cm
+      kubernetes.core.k8s_info:
+        kind: ConfigMap
+        namespace: "{{ argocd_namespace }}"
+        name: argocd-cm
+      register: verify_cm
+
+    - name: Kustomize may run KSOPS (alpha plugins and exec)
+      ansible.builtin.assert:
+        that:
+          - "'--enable-alpha-plugins' in verify_opts.split()"
+          - "'--enable-exec' in verify_opts.split()"
+        fail_msg: "argocd-cm kustomize.buildOptions = '{{ verify_opts }}': missing --enable-alpha-plugins and/or --enable-exec"
+        quiet: true
+      vars:
+        verify_opts: "{{ (verify_cm.resources | first).data['kustomize.buildOptions'] | default('') }}"
+
+    # ---------- age secret (metadata only) ----------
+    - name: Read age secret (metadata only)
+      kubernetes.core.k8s_info:
+        kind: Secret
+        namespace: "{{ argocd_namespace }}"
+        name: "{{ argocd_sops_age_secret_name }}"
+        metadata_only: true
+      register: verify_age
+
+    - name: Age secret exists and belongs to Ansible (not Argo CD)
+      ansible.builtin.assert:
+        that:
+          - verify_age.resources | length == 1
+          - verify_age_labels['app.kubernetes.io/managed-by'] | default('') == 'ansible'
+          - "'argocd.argoproj.io/tracking-id' not in verify_age_annotations"
+        fail_msg: >-
+          Secret {{ argocd_namespace }}/{{ argocd_sops_age_secret_name }} is missing or does not belong to Ansible.
+          Fix: ansible-playbook argocd.yml
+        quiet: true
+      vars:
+        verify_age_meta: "{{ (verify_age.resources | first | default({})).metadata | default({}) }}"
+        verify_age_labels: "{{ verify_age_meta.labels | default({}) }}"
+        verify_age_annotations: "{{ verify_age_meta.annotations | default({}) }}"
+
+    # ---------- Secret-Apps ----------
+    - name: Read secret applications
+      kubernetes.core.k8s_info:
+        api_version: argoproj.io/v1alpha1
+        kind: Application
+        namespace: "{{ argocd_namespace }}"
+        name: "{{ item }}"
+      register: verify_apps
+      until: >-
+        verify_apps.resources | length == 1 and
+        (verify_apps.resources | first).status.sync.status | default('') == 'Synced' and
+        (verify_apps.resources | first).status.health.status | default('') == 'Healthy'
+      retries: "{{ verify_retries }}"
+      delay: "{{ verify_delay }}"
+      failed_when: false
+      loop: "{{ verify_secret_apps }}"
+
+    - name: Secret applications are Synced and Healthy (KSOPS decrypts)
+      ansible.builtin.assert:
+        that:
+          - item.resources | default([]) | length == 1
+          - (item.resources | first).status.sync.status | default('') == 'Synced'
+          - (item.resources | first).status.health.status | default('') == 'Healthy'
+        fail_msg: >-
+          Application {{ item.item }}: Sync={{ (item.resources | first | default({})).status.sync.status | default('-') }},
+          Messages: {{ (item.resources | first | default({})).status.conditions | default([]) | map(attribute='message') | join(' | ') | truncate(400) }}.
+          Often: wrong age key (docs/learning-path/stage-7-ksops.md, Fehlerbilder).
+        quiet: true
+      loop: "{{ verify_apps.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    # ---------- Migrated secret (metadata only) ----------
+    - name: Read CA secret (metadata only)
+      kubernetes.core.k8s_info:
+        kind: Secret
+        namespace: "{{ lab_ca_namespace }}"
+        name: "{{ lab_ca_secret_name }}"
+        metadata_only: true
+      register: verify_ca
+
+    - name: CA secret comes from Argo CD and is never deleted
+      ansible.builtin.assert:
+        that:
+          - verify_ca.resources | length == 1
+          - verify_ca_ann['argocd.argoproj.io/tracking-id'] | default('') is match(lab_ca_secret_app ~ ':')
+          - verify_ca_meta.labels['app.kubernetes.io/managed-by'] | default('') == 'argocd'
+          - "'Prune=false' in verify_ca_opts"
+          - "'Delete=false' in verify_ca_opts"
+          - "'kubectl.kubernetes.io/last-applied-configuration' not in verify_ca_ann"
+        fail_msg: >-
+          CA-Secret {{ lab_ca_namespace }}/{{ lab_ca_secret_name }}: Tracking
+          '{{ verify_ca_ann['argocd.argoproj.io/tracking-id'] | default('-') }}', Sync options
+          '{{ verify_ca_opts | join(',') }}'. Expected app {{ lab_ca_secret_app }}, Prune=false,Delete=false and no
+          last-applied annotation (ServerSideApply in the app).
+        quiet: true
+      vars:
+        verify_ca_meta: "{{ (verify_ca.resources | first | default({})).metadata | default({}) }}"
+        verify_ca_ann: "{{ verify_ca_meta.annotations | default({}) }}"
+        verify_ca_opts: "{{ (verify_ca_ann['argocd.argoproj.io/sync-options'] | default('')).split(',') | map('trim') | list }}"
+
+    - name: Read ClusterIssuer
+      kubernetes.core.k8s_info:
+        api_version: cert-manager.io/v1
+        kind: ClusterIssuer
+        name: "{{ verify_issuer }}"
+      register: verify_ci
+
+    - name: ClusterIssuer is Ready (reads the CA secret)
+      ansible.builtin.assert:
+        that: >-
+          (verify_ci.resources | first).status.conditions | default([])
+          | selectattr('type', 'equalto', 'Ready') | selectattr('status', 'equalto', 'True') | list | length == 1
+        fail_msg: "ClusterIssuer {{ verify_issuer }} not Ready"
+        quiet: true
+
+    # ---------- PSA proof ----------
+    # KSOPS runs in the Argo CD repo server; the CA secret it delivers lands in the CA namespace.
+    - name: PSA proof for the Argo CD and the CA namespace
+      ansible.builtin.include_tasks: tasks/psa-probe.yml
+      vars:
+        verify_psa_namespaces:
+          - "{{ argocd_namespace }}"
+          - "{{ lab_ca_namespace }}"
+
+    # ---------- Repo (static) ----------
+    - name: List SOPS files in the repo (tracked and new, without ignored)
+      ansible.builtin.command:
+        argv: [git, -C, "{{ verify_repo }}", ls-files, --cached, --others, --exclude-standard, --, "*.sops.yaml", ":(exclude,glob)**/.sops.yaml"]
+      register: verify_sops_files
+      changed_when: false
+      check_mode: false
+
+    - name: SOPS files live only under secrets/ (separable for a public copy)
+      ansible.builtin.assert:
+        that:
+          - verify_sops_files.stdout_lines | length > 0
+          - verify_sops_files.stdout_lines | reject('match', '^secrets/') | list | length == 0
+        fail_msg: >-
+          No SOPS files found or some outside secrets/:
+          {{ verify_sops_files.stdout_lines | reject('match', '^secrets/') | join(', ') }}
+        quiet: true
+
+    # Encrypted files are harmless to read; values are not printed.
+    - name: Read SOPS files
+      ansible.builtin.slurp:
+        src: "{{ verify_repo }}/{{ item }}"
+      register: verify_sops_raw
+      loop: "{{ verify_sops_files.stdout_lines }}"
+      no_log: true
+
+    - name: Every SOPS file is encrypted and uses the recipients from .sops.yaml
+      ansible.builtin.assert:
+        that:
+          - verify_doc.sops is defined
+          - verify_doc.sops.mac | default('') is match('ENC\\[AES256_GCM,')
+          - verify_values | length > 0
+          # Empty placeholder values carry no secret; sops leaves "" unencrypted (e.g. optional ACME token).
+          - verify_values | reject('equalto', '') | reject('match', 'ENC\\[AES256_GCM,') | list | length == 0
+          - verify_file_recipients | sort == verify_recipients | sort
+        fail_msg: >-
+          {{ item.item }}: not fully encrypted or wrong recipients
+          (file: {{ verify_file_recipients | join(', ') }}; .sops.yaml: {{ verify_recipients | join(', ') }}).
+          Fix: sops updatekeys {{ item.item }} (docs/learning-path/stage-7-ksops.md)
+        success_msg: "{{ item.item }}: {{ verify_values | length }} values encrypted"
+      loop: "{{ verify_sops_raw.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      vars:
+        verify_doc: "{{ item.content | b64decode | from_yaml }}"
+        verify_values: "{{ ((verify_doc.data | default({})) | combine(verify_doc.stringData | default({}))).values() | list }}"
+        verify_file_recipients: "{{ verify_doc.sops.age | default([]) | map(attribute='recipient') | list }}"
+
+    # Pattern deliberately written so that this file itself does not match.
+    - name: Search the repo for private keys in plain text
+      ansible.builtin.command:
+        argv:
+          - git
+          - -C
+          - "{{ verify_repo }}"
+          - grep
+          - --untracked
+          - -I
+          - -l
+          - -E
+          - "AGE-SECRET-KEY-1[0-9A-Z]{20}|-----BEGIN [A-Z ]*PRIVATE KEY-----"
+      register: verify_leak
+      changed_when: false
+      check_mode: false
+      failed_when: verify_leak.rc > 1
+
+    - name: No private key in plain text in the repo
+      ansible.builtin.assert:
+        that: verify_leak.rc == 1
+        fail_msg: "Private key in plain text in: {{ verify_leak.stdout_lines | join(', ') }}. Do not commit, treat the key as compromised."
+        quiet: true
+
+    # ---------- Break-glass recipient (issue 11, optional) ----------
+    # With one recipient there is no break-glass key (not set up yet): only a note.
+    # With two or more, the LAST recipient is the offline break-glass key. Files must
+    # have exactly the recipients of .sops.yaml (checked above for every file).
+    - name: Break-glass recipient is not set up (one recipient only)
+      ansible.builtin.debug:
+        msg: >-
+          .sops.yaml has one recipient: no break-glass key yet (optional,
+          bash scripts/lab.sh init --break-glass).
+      when: verify_recipients | unique | length == 1
+
+    - name: Public key lines of the cluster key file (grep prints only comment lines)
+      kubernetes.core.k8s_exec:
+        namespace: "{{ argocd_namespace }}"
+        pod: "{{ verify_rs_pods.resources | map(attribute='metadata.name') | sort | first }}"
+        container: repo-server
+        command: 'grep -F "# public key: age1" /sops-age/keys.txt'
+      register: verify_bg_pub
+      # ignore_errors, not failed_when: false: on ansible-core 2.19+ failed_when resets failed and msg of the result.
+      ignore_errors: true
+      changed_when: false
+      when: verify_recipients | unique | length > 1
+
+    - name: Number of private key lines in the cluster key file (count only, no values)
+      kubernetes.core.k8s_exec:
+        namespace: "{{ argocd_namespace }}"
+        pod: "{{ verify_rs_pods.resources | map(attribute='metadata.name') | sort | first }}"
+        container: repo-server
+        command: 'grep -c "^AGE-SECRET-KEY-1" /sops-age/keys.txt'
+      register: verify_bg_count
+      # ignore_errors, not failed_when: false: on ansible-core 2.19+ failed_when resets failed and msg of the result.
+      ignore_errors: true
+      changed_when: false
+      when: verify_recipients | unique | length > 1
+
+    - name: Cluster secret holds only the online key, not the break-glass key
+      ansible.builtin.assert:
+        that:
+          - verify_bg_cluster_pubs | length == 1
+          - verify_bg_cluster_pubs | first == verify_recipients | first
+          - verify_recipients | last not in verify_bg_cluster_pubs
+          - verify_bg_count.stdout | default('') | trim == '1'
+        fail_msg: >-
+          Cluster key file (argocd/{{ argocd_sops_age_secret_name }}): public keys {{ verify_bg_cluster_pubs | map('truncate', 15, true, '...') | join(', ') }},
+          private key lines {{ verify_bg_count.stdout | default('?') | trim }}. Expected exactly one key and it must be the
+          first recipient of .sops.yaml ({{ (verify_recipients | first)[:12] }}...), never the last one
+          (break-glass, {{ (verify_recipients | last)[:12] }}...). The file must carry the age-keygen comment
+          '# public key: ...' so it can be compared. Fix: use a separate online key in argocd_sops_age_key_path, run argocd.yml.
+        success_msg: "cluster secret holds only the online key (public part {{ (verify_recipients | first)[:12] }}...)"
+      when: verify_recipients | unique | length > 1
+      vars:
+        verify_bg_cluster_pubs: >-
+          {{ verify_bg_pub.stdout_lines | default([]) | select('match', '^# public key: age1')
+             | map('regex_search', 'age1[0-9a-z]+') | list }}
+
+    - name: More than two recipients (rotation in progress)
+      ansible.builtin.debug:
+        msg: ".sops.yaml has {{ verify_recipients | length }} recipients: finish the rotation (docs/learning-path/stage-7-ksops.md), drop the old key."
+      when: verify_recipients | unique | length > 2

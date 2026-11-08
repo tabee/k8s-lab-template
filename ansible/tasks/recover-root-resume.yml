@@ -1,0 +1,29 @@
+---
+# Put auto-sync of root back, with exactly the value from Git
+# (argocd_root_automated, the same variable the argocd_bootstrap role uses).
+# Run it after the children are resumed. Idempotent: a root that already has
+# this value is not touched.
+- name: Read the root application
+  kubernetes.core.k8s_info:
+    api_version: argoproj.io/v1alpha1
+    kind: Application
+    namespace: "{{ argocd_namespace }}"
+    name: "{{ argocd_root_app_name }}"
+  register: recover_root
+
+- name: Turn auto-sync of root back on
+  when:
+    - recover_root.resources | default([]) | length == 1
+    - (recover_root.resources[0].spec.syncPolicy.automated | default({})) != argocd_root_automated
+  kubernetes.core.k8s:
+    state: patched
+    merge_type: merge
+    definition:
+      apiVersion: argoproj.io/v1alpha1
+      kind: Application
+      metadata:
+        name: "{{ argocd_root_app_name }}"
+        namespace: "{{ argocd_namespace }}"
+      spec:
+        syncPolicy:
+          automated: "{{ argocd_root_automated }}"

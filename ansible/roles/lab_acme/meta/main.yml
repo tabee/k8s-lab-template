@@ -1,0 +1,39 @@
+---
+# Role "lab_acme": optional public probe (issue #7). Second ClusterIssuer lab-acme
+# (ACME DNS-01) and a probe certificate for a name outside the lab domain, only if
+# lab.local.yaml sets acme_solver, acme_zone, acme_probe_name and acme_email.
+# Without these values the role is a SKIP without change.
+galaxy_info:
+  author: k8s-lab
+  description: Create ClusterIssuer lab-acme (DNS-01) and probe certificate (localhost, k8s API)
+  license: MIT
+  min_ansible_version: "2.17"
+  platforms:
+    - name: GenericLinux
+      versions:
+        - all
+dependencies: []
+
+# Required variables; values come from inventory/group_vars/all/lab_acme.yml.
+# The kubeconfig is set by the playbook (module_defaults in public.yml).
+argument_specs:
+  main:
+    short_description: Public probe (ACME DNS-01), runs on localhost
+    options:
+      lab_acme_active: { type: bool, required: true, description: All four acme_* values set }
+      lab_acme_solver: { type: str, required: true, description: "DNS provider (cloudflare or digitalocean), empty if off" }
+      lab_acme_zone: { type: str, required: true, description: Zone at the DNS provider }
+      lab_acme_probe_name: { type: str, required: true, description: "Name of the probe, outside the lab domain" }
+      lab_acme_email: { type: str, required: true, description: ACME-Kontakt }
+      lab_acme_server: { type: str, required: true, description: ACME directory URL }
+      lab_acme_solvers: { type: dict, required: true, description: Solver per provider }
+      lab_acme_issuer: { type: str, required: true, description: Name des ClusterIssuers }
+      lab_acme_account_secret: { type: str, required: true, description: Secret for the ACME account key }
+      lab_acme_token_secret: { type: str, required: true, description: Secret with the API token (comes from SOPS) }
+      lab_acme_token_key: { type: str, required: true, description: Key in the token secret }
+      lab_acme_namespace: { type: str, required: true, description: Namespace of cert-manager }
+      lab_acme_probe_namespace: { type: str, required: true, description: Namespace of the probe certificate and route }
+      lab_acme_probe_name_obj: { type: str, required: true, description: Name of the probe Certificate and IngressRoute }
+      lab_acme_probe_secret: { type: str, required: true, description: Secret des Probe-Zertifikats }
+      lab_acme_wait_retries: { type: int, required: true, description: Attempts while waiting }
+      lab_acme_wait_delay: { type: int, required: true, description: Seconds between the attempts }

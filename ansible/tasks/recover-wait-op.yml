@@ -1,0 +1,33 @@
+---
+# Wait until the Argo CD application target.app has no sync operation that is
+# still running. An operation that was started before auto-sync was switched
+# off keeps running afterwards: it applies the Deployment, and the pod mounts
+# the empty PVC although the pause already scaled "nothing" to zero. Included
+# by recover-pause-one.yml (before and after the one-off sync). The timing
+# variables exist for the tests only; the defaults wait up to 30 minutes
+# (Argo CD retries a failing sync for a few minutes by itself).
+- name: Wait until no sync operation of the app is running
+  kubernetes.core.k8s_info:
+    api_version: argoproj.io/v1alpha1
+    kind: Application
+    namespace: argocd
+    name: "{{ target.app }}"
+  register: recover_op
+  retries: "{{ recover_op_retries | default(180) }}"
+  delay: "{{ recover_op_delay | default(10) }}"
+  until: >-
+    recover_op.resources | default([]) | length == 1
+    and recover_op.resources[0].operation is not defined
+    and (recover_op.resources[0].status.operationState.phase | default('Succeeded'))
+        not in ['Running', 'Terminating']
+  ignore_errors: true
+
+- name: Say which application still has a running operation
+  when: recover_op is failed
+  ansible.builtin.fail:
+    msg: >-
+      The Argo CD application {{ target.app }} still has a running sync
+      operation. Look at it: kubectl -n argocd get applications.argoproj.io
+      {{ target.app }} -o jsonpath='{.status.operationState.phase} {.status.operationState.message}'.
+      Let it finish or stop it (Argo CD UI: Terminate), then run the pause
+      again: cd ansible && ansible-playbook recover-files.yml --tags pause

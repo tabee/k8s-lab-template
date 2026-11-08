@@ -1,0 +1,36 @@
+---
+# Notes sites (sidequest notes): one entry per notebook. The ONLY
+# list, two readers:
+# - Argo CD: the ApplicationSet gitops/apps/notes.yaml makes per entry the
+#   Application notes-<name> (Chart gitops/charts/notes-site) im Namespace
+#   notes-<name>.
+# - Ansible (argocd.yml, Rolle notes_sites): namespace, deploy key, password.
+# Every entry starts with "- name:" at the far left (blocks count this way).
+# Felder:
+#   name     Required. Short name: a-z, 0-9, hyphen, max. 20 characters.
+#   repo     Required. ssh:// content URL, independent of the k8s-lab source.
+#   repo_egress_cidrs  IPv4 CIDRs for this content host (required for a different
+#            host/port); the chart derives the SSH port from repo, default 22.
+#   repo_known_hosts  Required. Pinned public SSH keys for the content URL; verify
+#            fingerprints out of band (never inherit keys from the code source).
+#   host     Required. Address, e.g. notes.lab.example.
+#   branch   Optional, Standard main.
+#   user     Optional, user name for login, default = name.
+#   title    Optional, only for repos without zensical.toml (default = name).
+#   private_filter  Optional, default false. true: notes with
+#            "share: private" in the front matter do not appear.
+# Example (append entry, remove "[]" below, commit, push, once
+# ansible-playbook argocd.yml, enter deploy key in your Git server):
+#
+# - name: notes
+#   repo: ssh://git@git.example.org/YOUR-NAME/notes.git
+#   repo_egress_cidrs: ["203.0.113.10/32"]
+#   repo_known_hosts: ["git.example.org ssh-ed25519 REPLACE_WITH_VERIFIED_PUBLIC_HOST_KEY"]
+#   host: notes.lab.example
+#   user: YOUR-NAME
+#   private_filter: false
+#
+# The public version delivers the list empty. The knowledge graph plugin is
+# off there (docs/tutorials/lab-for-friends.md); notes sites build without graph.
+# Runbook: docs/how-to/notes-sites.md
+[]

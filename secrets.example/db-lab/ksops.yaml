@@ -1,0 +1,17 @@
+---
+# KSOPS generator: decrypts the listed files when rendering
+# (repo-server, age key from stage 7).
+# You create backup-s3-creds.sops.yaml yourself (values never in the bundle):
+#   ansible/scripts/sops-secret.sh from-env db-lab backup-s3-creds ~/.config/k8s-lab/s3-cnpg-k3s-lab.env
+# (stufe8b-block-b.sh does that, path from backup_s3_user_env).
+apiVersion: viaduct.ai/v1
+kind: ksops
+metadata:
+  name: secrets-db-lab
+  annotations:
+    config.kubernetes.io/function: |
+      exec:
+        path: ksops
+files:
+  # S3 access for Barman (bucket cnpg-k3s-lab, stage 8a).
+  - ./backup-s3-creds.sops.yaml

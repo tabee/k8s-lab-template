@@ -1,0 +1,33 @@
+---
+# Cleans up the traces of the lab on the owner's PC (part of scripts/lab.sh purge):
+# the block managed by Ansible in /etc/hosts (role lab_hosts) and the
+# local kubeconfig. Needs sudo (only for /etc/hosts). Without lab_purge_ok=yes
+# nothing happens. Stays: rustfs, all keys and secret files, the
+# lab CA, notes passwords (that is the tool shed, not the house).
+#   cd ansible && ansible-playbook purge-host.yml -K -e lab_purge_ok=yes
+# Block and kubeconfig come back with 'bash scripts/lab.sh up'.
+
+- name: Remove lab traces on the PC
+  hosts: backup_host
+  gather_facts: false
+  vars:
+    lab_purge_ok: "no"
+  tasks:
+    - name: Safeguard against accidental start
+      ansible.builtin.assert:
+        that: lab_purge_ok == 'yes'
+        fail_msg: "To clean up, pass -e lab_purge_ok=yes."
+        quiet: true
+
+    - name: Remove Ansible block in /etc/hosts
+      ansible.builtin.blockinfile:
+        path: "{{ lab_hosts_file }}"
+        marker: "{{ lab_hosts_marker }}"
+        state: absent
+      become: true
+
+    - name: Remove kubeconfig of the lab VM (lives under ~/.kube)
+      ansible.builtin.file:
+        path: "{{ lab_values.kubeconfig }}"
+        state: absent
+      when: lab_values.kubeconfig is match(lookup('ansible.builtin.env', 'HOME') ~ '/.kube/.*[.]kubeconfig$')

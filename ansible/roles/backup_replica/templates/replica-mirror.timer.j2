@@ -1,0 +1,15 @@
+# {{ ansible_managed }}
+# Issue #3: cadence of the replica mirror (systemd --user, linger).
+# Source: ansible/roles/backup_replica/templates/replica-mirror.timer.j2
+# Values: ansible/inventory/group_vars/all/backup_replica.yml (backup_replica_mirror_*).
+
+[Unit]
+Description=Replica mirror every {{ backup_replica_mirror_interval_min }} min
+
+[Timer]
+OnBootSec={{ backup_replica_mirror_boot_delay_min }}min
+OnUnitActiveSec={{ backup_replica_mirror_interval_min }}min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

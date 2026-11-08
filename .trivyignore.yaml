@@ -1,0 +1,23 @@
+# Exceptions for trivy (scripts/security-scan.sh, check "trivy"). One entry per finding, bound to ONE file, with reason
+# and date. A real finding is never listed here: fix it (or rotate the secret) instead.
+misconfigurations:
+  # False positive. 2026-11-03. The ConfigMap holds the names of the Synapse settings, the values are the placeholders
+  # __OIDC_CLIENT_SECRET__ etc. that the init container replaces with the content of the SOPS secrets at pod start.
+  # No secret is stored in the ConfigMap (tests/matrix-tests.sh checks that the rendered file has no real value).
+  - id: KSV-0109
+    paths:
+      - gitops/charts/matrix/templates/configmap-homeserver.yaml
+    statement: placeholders only, values come from the SOPS secrets at pod start
+  # False positive. 2026-11-08. The key "passwd" is the /etc/passwd file of the job pods (root and uid 1000, password
+  # field "x", no hash). No secret is stored in the ConfigMap; the runner token lives in a SOPS secret.
+  - id: KSV-0109
+    paths:
+      - gitops/workloads/gitea-runner/jobs-configmap.yaml
+    statement: passwd key is the job pod's /etc/passwd without any hash, not a secret
+  # Accepted. 2026-11-08. The Kubernetes mode of the Gitea runner (act) runs every step via pods/exec in the job pod;
+  # without it no job runs (upstream example gitea/runner 5.4.1). The Role is bound to the job namespace only
+  # (PSA restricted, quota, no API access and no service account token in the job pods), never cluster-wide.
+  - id: KSV-0053
+    paths:
+      - gitops/workloads/gitea-runner/rbac.yaml
+    statement: runner needs pods/exec to run job steps; namespace-scoped to the restricted job namespace

@@ -1,0 +1,23 @@
+---
+# Stage 8a: backup target rustfs (S3) on the owner's PC (group backup_host, local).
+# Runbook: docs/learning-path/stage-8a-backup-target.md. Usage in the directory ansible/:
+#   ansible-playbook backup-host.yml -K --check --diff
+#   ansible-playbook backup-host.yml -K
+# -K asks once for the sudo password (only for ufw, one-time linger and the
+# file /etc/hosts, see play 2).
+# Afterwards: ansible-playbook verify-backup-s3.yml -K
+
+- name: Set up backup target rustfs
+  hosts: backup_host
+  gather_facts: true
+  gather_subset: [min]
+  roles:
+    - role: backup_s3
+
+# Names of the lab services in /etc/hosts (browser). Source of the names: the repo
+# (docs/learning-path/stage-8c-gitea.md, section "Namen in /etc/hosts").
+- name: Enter lab names in /etc/hosts
+  hosts: backup_host
+  gather_facts: false
+  roles:
+    - role: lab_hosts

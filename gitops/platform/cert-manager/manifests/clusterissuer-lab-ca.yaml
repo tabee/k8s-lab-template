@@ -1,0 +1,20 @@
+---
+# ClusterIssuer lab-ca: signs with the lab CA (Lab Root CA).
+# The CA secret comes encrypted from secrets/cert-manager since stage 7
+# (Application secrets-cert-manager, KSOPS; docs/learning-path/stage-7-ksops.md).
+# For a ClusterIssuer cert-manager looks for the secret in its own namespace
+# (cert-manager, --cluster-resource-namespace).
+# secretName must match lab_ca_secret_name in
+# ansible/inventory/group_vars/all/lab_ca.yml (verify-certmanager.yml checks this).
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: lab-ca
+  annotations:
+    # Wave 1: first CRDs and webhook from the chart (wave 0) and their health.
+    argocd.argoproj.io/sync-wave: "1"
+    # On the very first sync the CRD does not exist yet: skip the dry run.
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+spec:
+  ca:
+    secretName: lab-ca

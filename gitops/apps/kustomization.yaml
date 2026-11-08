@@ -1,0 +1,26 @@
+---
+# Lists the application files of the root app. Argo CD builds this folder with Kustomize, which makes it
+# possible to pin every git source to one commit while a rebuild runs (ADR 0023, scripts/pin-revision.py).
+# Every *.yaml here must be listed (tests/consistency-tests.sh checks it). Without a pin the output is unchanged.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - argocd-ingress.yaml
+  - cert-manager.yaml
+  - cnpg.yaml
+  - db-lab.yaml
+  - docs.yaml
+  - gitea.yaml
+  - gitea-runner.yaml
+  - k8up.yaml
+  - keycloak.yaml
+  - matrix.yaml
+  - notes.yaml
+  - secrets-cert-manager.yaml
+  - secrets-db-lab.yaml
+  - secrets-gitea.yaml
+  - secrets-gitea-runner.yaml
+  - secrets-keycloak.yaml
+  - secrets-matrix.yaml
+  - traefik.yaml
+  - whoami.yaml

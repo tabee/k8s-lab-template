@@ -1,0 +1,33 @@
+---
+# Takes the pin off the root application (issue 71): the root app follows argocd_repo_revision again and
+# the Kustomize patches that pinned the child applications are removed. Idempotent: a root that is not
+# pinned is not touched. Only argocd-release-pin.yml uses it: a run of argocd.yml without
+# argocd_pin_revision leaves an existing pin alone on purpose (fail closed, release is explicit).
+- name: Read the root application
+  kubernetes.core.k8s_info:
+    api_version: argoproj.io/v1alpha1
+    kind: Application
+    namespace: "{{ argocd_namespace }}"
+    name: "{{ argocd_root_app_name }}"
+  register: unpin_root
+
+- name: Point the root application at the branch again and drop the patches
+  when:
+    - unpin_root.resources | default([]) | length == 1
+    - >-
+      (unpin_root.resources[0].spec.source.targetRevision | default('')) != argocd_repo_revision
+      or (unpin_root.resources[0].spec.source.kustomize | default({})).patches is defined
+  kubernetes.core.k8s:
+    state: patched
+    merge_type: merge
+    definition:
+      apiVersion: argoproj.io/v1alpha1
+      kind: Application
+      metadata:
+        name: "{{ argocd_root_app_name }}"
+        namespace: "{{ argocd_namespace }}"
+      spec:
+        source:
+          targetRevision: "{{ argocd_repo_revision }}"
+          # null deletes the key in a JSON merge patch
+          kustomize: null

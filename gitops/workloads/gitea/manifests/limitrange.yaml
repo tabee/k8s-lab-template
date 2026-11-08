@@ -1,0 +1,19 @@
+---
+# Identical copy in every work namespace (whoami, docs, db-lab, gitea, notes-*). tests/memory-budget-tests.sh
+# fails when a copy differs. Docs: docs/reference/memory-budget.md
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: lab-memory
+spec:
+  limits:
+    - type: Container
+      # A container WITHOUT its own limit gets this one, never "unbounded" (issue #9). The memory budget
+      # check (ansible/verify-budget.yml) still fails such a container: the limit belongs in git.
+      default:
+        memory: 256Mi
+      defaultRequest:
+        memory: 64Mi
+      # No single container may ask for more than this. Memory only: no CPU default, no CPU limit.
+      max:
+        memory: 1Gi

@@ -1,0 +1,12 @@
+---
+# Image pins that more than one playbook or role needs (issue #10).
+# The probe image is defined HERE and nowhere else. Roles and verify playbooks
+# use {{ lab_probe_image }}. tests/pins-tests.sh fails when the literal tag shows
+# up anywhere else, and when a docs page names a different pin.
+# Pin = tag AND digest (multi-arch index digest). The tag is only for humans;
+# the container runtime pulls by digest. To bump: change tag and digest together,
+# then run `bash tests/pins-tests.sh` (it lists every place that has to follow).
+
+# Throw-away pods: PSA dry-run probes (privileged pod that must be rejected),
+# the CoreDNS pod-to-pod check, the cert-manager and notes probes.
+lab_probe_image: docker.io/library/busybox:1.37@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec

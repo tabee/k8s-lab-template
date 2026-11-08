@@ -1,0 +1,24 @@
+---
+# Namespace for Gitea and its database gitea-db (stage 8c).
+# PSA restricted: Gitea (rootless, uid 1000), CNPG (uid 26) and the
+# K8up-Jobs (PodConfig k8up-restricted) run without root, without
+# capabilities, with seccomp RuntimeDefault.
+# Delete=false: if the app gitea is removed, the namespace stays and with
+# it the secrets (app secrets-gitea) and the repo PVC (resource-policy
+# keep from the chart). Gone only by hand:
+#   kubectl delete namespace gitea
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gitea
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+    # Before everything else in this app.
+    argocd.argoproj.io/sync-wave: "-1"
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest

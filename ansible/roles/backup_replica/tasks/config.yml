@@ -1,0 +1,24 @@
+---
+# Config and script on the owner's PC (no secret, no pin needed: lab.sh replica hostkey runs before the pin exists).
+
+- name: Directories for config, scripts and user units
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - "{{ backup_replica_config | dirname }}"
+    - "{{ backup_replica_script | dirname }}"
+    - "{{ backup_s3_systemd_user_dir }}"
+
+- name: Config of the mirror (no secret in it, only paths)
+  ansible.builtin.template:
+    src: replica.json.j2
+    dest: "{{ backup_replica_config }}"
+    mode: "0644"
+
+- name: Script lab-replica.py (from the repo, the same file the tests run)
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../scripts/lab-replica.py"
+    dest: "{{ backup_replica_script }}"
+    mode: "0755"

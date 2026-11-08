@@ -1,0 +1,42 @@
+---
+# Child application of the root app (app of apps): Argo CD UI via Traefik.
+# Argo CD synct gitops/workloads/argocd (Certificate, IngressRoute,
+# NetworkPolicy) into its own namespace argocd. Argo CD itself
+# (Helm, server.insecure) stays with Ansible (argocd.yml).
+# repoURL, targetRevision and project must match
+# ansible/inventory/group_vars/all/argocd.yml.
+# Project argocd-ui (argocd_ui_project): may only
+# create Certificate, IngressRoute and NetworkPolicy, nothing else.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: argocd-ingress
+  namespace: argocd
+  # Deleting this file cleans up Certificate, IngressRoute and NetworkPolicy
+  # off (Argo CD itself stays; access then via port-forward again).
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: argocd-ui
+  source:
+    repoURL: ssh://git@github.com/YOUR-NAME/k8s-lab.git
+    targetRevision: main
+    path: gitops/workloads/argocd
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    # IngressRoute needs the CRD from the app traefik, Certificate the one from
+    # the app cert-manager: on failure try again. Limit 10 instead of 5
+    # (whoami): on a fresh server both apps must run first, and
+    # after the last failed attempt Argo CD waits for the next commit.
+    # 10 attempts cover about 20 minutes.
+    retry:
+      limit: 10
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 3m

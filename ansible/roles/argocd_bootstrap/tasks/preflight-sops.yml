@@ -1,0 +1,115 @@
+---
+# Preflight stage 7 (KSOPS): check age key and .sops.yaml, without
+# ever showing the private key. All read only.
+# age-keygen -y prints only the public keys (age1...).
+
+- name: Find age-keygen
+  ansible.builtin.command: age-keygen --version
+  register: argocd_bootstrap_agekeygen
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Check age-keygen is installed
+  ansible.builtin.assert:
+    that: argocd_bootstrap_agekeygen.rc | default(1) == 0
+    fail_msg: >-
+      age-keygen is missing (part of age). Installation, see
+      docs/learning-path/stage-7-ksops.md, section "Voraussetzungen".
+    quiet: true
+
+- name: Find age key
+  ansible.builtin.stat:
+    path: "{{ argocd_sops_age_key_path | expanduser }}"
+    get_checksum: false
+  register: argocd_bootstrap_age_stat
+
+- name: Determine own user ID
+  ansible.builtin.command: id -u
+  register: argocd_bootstrap_uid
+  changed_when: false
+  check_mode: false
+
+- name: Age key exists, belongs to me and has mode 0600
+  ansible.builtin.assert:
+    that:
+      - argocd_bootstrap_age_stat.stat.exists
+      - argocd_bootstrap_age_stat.stat.isreg
+      - argocd_bootstrap_age_stat.stat.mode == '0600'
+      - argocd_bootstrap_age_stat.stat.uid | string == argocd_bootstrap_uid.stdout
+    fail_msg: >-
+      {{ argocd_sops_age_key_path }} is missing, is not a file, does not belong to the
+      current user or does not have mode 0600
+      (is: {{ argocd_bootstrap_age_stat.stat.mode | default('missing') }}).
+      Fix with: chmod 600 {{ argocd_sops_age_key_path }}
+    quiet: true
+
+# Only the public keys end up in the output.
+- name: Derive public keys from the age key
+  ansible.builtin.command:
+    argv: [age-keygen, -y, "{{ argocd_sops_age_key_path | expanduser }}"]
+  register: argocd_bootstrap_age_pub
+  changed_when: false
+  check_mode: false
+
+- name: Find SOPS rules
+  ansible.builtin.stat:
+    path: "{{ argocd_sops_config_path }}"
+  register: argocd_bootstrap_sops_cfg
+
+- name: SOPS rules are present
+  ansible.builtin.assert:
+    that: argocd_bootstrap_sops_cfg.stat.exists
+    fail_msg: "{{ argocd_sops_config_path }} is missing (repo root, see docs/learning-path/stage-7-ksops.md)"
+    quiet: true
+
+# Recipients from all creation_rules (age as text with commas or as a list).
+- name: Read the recipients from .sops.yaml
+  ansible.builtin.set_fact:
+    argocd_bootstrap_recipients: "{{ argocd_bootstrap_recipients_json | from_json }}"
+  vars:
+    argocd_bootstrap_sops_rules: "{{ (lookup('ansible.builtin.file', argocd_sops_config_path) | from_yaml).creation_rules | default([]) }}"
+    argocd_bootstrap_recipients_json: >-
+      {%- set r = [] -%}
+      {%- for rule in argocd_bootstrap_sops_rules -%}
+      {%- set a = rule.age | default([]) -%}
+      {%- for x in ([a] if a is string else a) -%}
+      {%- for y in x.split(',') if y | trim | length > 0 -%}
+      {%- set _ = r.append(y | trim) -%}
+      {%- endfor -%}
+      {%- endfor -%}
+      {%- endfor -%}
+      {{ r | to_json }}
+
+- name: Every key from the file is a recipient in .sops.yaml
+  ansible.builtin.assert:
+    that:
+      - argocd_bootstrap_pubs | length > 0
+      - argocd_bootstrap_pubs | difference(argocd_bootstrap_recipients) | length == 0
+    fail_msg: >-
+      {{ argocd_sops_age_key_path }} contains keys that are not
+      recipients in .sops.yaml are: {{ argocd_bootstrap_pubs | difference(argocd_bootstrap_recipients) | join(', ') }}.
+      Recipients in .sops.yaml: {{ argocd_bootstrap_recipients | join(', ') }}.
+      Either enter the recipient in .sops.yaml (then sops updatekeys,
+      see docs/learning-path/stage-7-ksops.md) or point argocd_sops_age_key_path at a file
+      only for this lab. This way no foreign key gets into the cluster.
+    success_msg: "age key matches .sops.yaml: {{ argocd_bootstrap_pubs | join(', ') }}"
+  vars:
+    argocd_bootstrap_pubs: "{{ argocd_bootstrap_age_pub.stdout_lines | map('trim') | select('match', '^age1') | list }}"
+
+# Break-glass (issue 11): with two or more recipients the LAST one is the offline
+# break-glass key. Its private part must never be in the file that becomes the
+# cluster secret. Compared by public key only (age-keygen -y output above).
+- name: Break-glass recipient (last) is not in the cluster key file
+  ansible.builtin.assert:
+    that: (argocd_bootstrap_recipients | last) not in argocd_bootstrap_pubs
+    fail_msg: >-
+      {{ argocd_sops_age_key_path }} holds the key of the LAST recipient in
+      .sops.yaml ({{ (argocd_bootstrap_recipients | last)[:12] }}...), which is the offline break-glass
+      key. It must never go into the cluster. Use a separate online key in
+      that file (rotation: docs/learning-path/stage-7-ksops.md; add the new online key BEFORE the break-glass key).
+    success_msg: "break-glass recipient is not in the cluster key file"
+    quiet: true
+  when: argocd_bootstrap_recipients | unique | length > 1
+  vars:
+    argocd_bootstrap_pubs: "{{ argocd_bootstrap_age_pub.stdout_lines | map('trim') | select('match', '^age1') | list }}"

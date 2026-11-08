@@ -1,0 +1,35 @@
+---
+# TLS certificate for argocd.lab.example from the lab CA (ClusterIssuer
+# lab-ca). cert-manager creates the secret argocd-ingress-tls here in the namespace
+# and renews it itself; the IngressRoute points to it via tls.secretName.
+# Deliberately not argocd-server-tls: Argo CD itself reads that name
+# (own TLS), which is off with server.insecure.
+# ECDSA P-256 like the CA, 90 days lifetime, renewal 30 days before
+# (same as whoami).
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: argocd-ingress
+  namespace: argocd
+  annotations:
+    # The CRD comes from the app cert-manager. Until then the sync fails
+    # and Argo CD tries again (retry in apps/argocd-ingress.yaml).
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+spec:
+  secretName: argocd-ingress-tls
+  dnsNames:
+    - argocd.lab.example
+  duration: 2160h
+  renewBefore: 720h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    # A new key on every renewal.
+    rotationPolicy: Always
+  usages:
+    - digital signature
+    - server auth
+  issuerRef:
+    group: cert-manager.io
+    kind: ClusterIssuer
+    name: lab-ca

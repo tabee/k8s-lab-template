@@ -1,0 +1,16 @@
+# {{ ansible_managed }}
+# Issue #8: one run of the alert checks (oneshot, from the timer). Exit 1 = a check fails (the unit is then
+# "failed" on purpose: systemctl --user --failed shows it, the alert itself went out through the sinks).
+# Source: ansible/roles/backup_alert/templates/alert.service.j2
+# Values: ansible/inventory/group_vars/all/alert.yml (backup_alert_*).
+
+[Unit]
+Description=Alert checks for backups, replica and edge
+
+[Service]
+Type=oneshot
+# Desktop notifications need the session bus of the owner.
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus
+ExecStart={{ ansible_playbook_python }} {{ backup_alert_script }} run --config {{ backup_alert_config }}
+Nice=10
+TimeoutStartSec=300

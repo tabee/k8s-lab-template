@@ -1,0 +1,341 @@
+---
+# Check one notes site (verify_site = entry from gitops/sites.yaml).
+# auth sso (default): login via Keycloak (oauth2-proxy). Without a session the site answers 302
+# to Keycloak; the part with a real login runs only when a lab-users account is given
+# (-e verify_notes_sso_user=NAME and the password in the environment variable NOTES_SSO_PASSWORD).
+# auth basic: Traefik basic auth (401 without, 200 with password from the file).
+
+- name: "Set values for {{ verify_site.name }}"
+  ansible.builtin.set_fact:
+    verify_ns_name: "{{ notes_namespace_prefix }}{{ verify_site.name }}"
+    verify_host: "{{ verify_site.host }}"
+    verify_user: "{{ verify_site.user | default(verify_site.name) }}"
+    verify_auth_mode: "{{ verify_site.auth | default(notes_auth_default) }}"
+    verify_pages: ["/", "{{ verify_notes_graph_path }}", "{{ verify_notes_graph_path }}graph.json", "/agents/"]
+    verify_dump_dir: "{{ lookup('ansible.builtin.env', 'XDG_RUNTIME_DIR') | default('/tmp', true) }}/verify-notes-{{ verify_site.name }}"
+    verify_sso_host: "sso.{{ lab.domain }}"
+    verify_pw_file: "{{ notes_password_dir | expanduser }}/{{ notes_namespace_prefix }}{{ verify_site.name }}.passwort"
+    verify_curl:
+      - curl
+      - --silent
+      - --show-error
+      - --max-time
+      - "10"
+      - --cacert
+      - "{{ lab_ca_cert_path | expanduser }}"
+      - --resolve
+      - "{{ verify_site.host }}:443:{{ verify_lb_ip }}"
+
+# ---------- Namespace ----------
+- name: "Read namespace: {{ verify_ns_name }}"
+  kubernetes.core.k8s_info:
+    kind: Namespace
+    name: "{{ verify_ns_name }}"
+  register: verify_ns
+
+- name: "Namespace enforces PSA restricted: {{ verify_ns_name }}"
+  ansible.builtin.assert:
+    that:
+      - verify_ns.resources | length == 1
+      - verify_ns_labels['pod-security.kubernetes.io/enforce'] | default('') == 'restricted'
+      - verify_ns_labels['pod-security.kubernetes.io/audit'] | default('') == 'restricted'
+      - verify_ns_labels['pod-security.kubernetes.io/warn'] | default('') == 'restricted'
+    fail_msg: "Namespace {{ verify_ns_name }} is missing or does not have enforce/audit/warn=restricted (argocd.yml run?)"
+    quiet: true
+  vars:
+    verify_ns_labels: "{{ (verify_ns.resources | first).metadata.labels | default({}) if verify_ns.resources else {} }}"
+
+# ---------- Argo CD ----------
+- name: "Read application: notes-{{ verify_site.name }}"
+  kubernetes.core.k8s_info:
+    api_version: argoproj.io/v1alpha1
+    kind: Application
+    namespace: "{{ argocd_namespace }}"
+    name: "notes-{{ verify_site.name }}"
+  register: verify_app
+  until: >-
+    verify_app.resources | length == 1 and
+    (verify_app.resources | first).status.sync.status | default('') == 'Synced' and
+    (verify_app.resources | first).status.health.status | default('') == 'Healthy'
+  retries: "{{ verify_retries }}"
+  delay: "{{ verify_delay }}"
+
+- name: "Application is Synced, Healthy and in project notes: notes-{{ verify_site.name }}"
+  ansible.builtin.assert:
+    that:
+      - verify_app_obj.spec.project == notes_project
+      - verify_app_obj.spec.destination.namespace == verify_ns_name
+    fail_msg: "Application notes-{{ verify_site.name }}: wrong project or target"
+    success_msg: "Revision {{ verify_app_obj.status.sync.revision | default('-') }}"
+  vars:
+    verify_app_obj: "{{ verify_app.resources | first }}"
+
+# ---------- Pod, Certificate, NetworkPolicy ----------
+# The login proxy (auth sso): runs, is ready, stateless (no volume).
+- name: "Read login proxy pod in {{ verify_ns_name }}"
+  kubernetes.core.k8s_info:
+    kind: Pod
+    namespace: "{{ verify_ns_name }}"
+    label_selectors:
+      - app.kubernetes.io/name=notes-oauth2-proxy
+    field_selectors:
+      - status.phase=Running
+  register: verify_proxy_pods
+  until:
+    - verify_proxy_pods.resources | length == 1
+    - verify_proxy_cs | select('equalto', []) | list | length == 0
+    - verify_proxy_cs | flatten | rejectattr('ready') | list | length == 0
+  retries: "{{ verify_retries }}"
+  delay: "{{ verify_delay }}"
+  vars:
+    verify_proxy_cs: "{{ verify_proxy_pods.resources | map(attribute='status.containerStatuses', default=[]) | list }}"
+  when: verify_auth_mode != 'basic'
+
+- name: "Login proxy has no volume of its own and no service account token: {{ verify_ns_name }}"
+  ansible.builtin.assert:
+    that:
+      - (verify_proxy_pods.resources | first).spec.volumes | default([]) | rejectattr('name', 'match', '^kube-api-access-') | list | length == 0
+    fail_msg: "The login proxy must be stateless (no volume): nothing to back up."
+    quiet: true
+  when: verify_auth_mode != 'basic'
+
+- name: "Read pod in {{ verify_ns_name }}"
+  kubernetes.core.k8s_info:
+    kind: Pod
+    namespace: "{{ verify_ns_name }}"
+    label_selectors:
+      - app.kubernetes.io/name=notes
+    field_selectors:
+      - status.phase=Running
+  register: verify_pods
+  until:
+    - verify_pods.resources | length == 1
+    - verify_pods_cs | select('equalto', []) | list | length == 0
+    - verify_pods_cs | flatten | rejectattr('ready') | list | length == 0
+  retries: "{{ verify_retries }}"
+  delay: "{{ verify_delay }}"
+  vars:
+    verify_pods_cs: "{{ verify_pods.resources | map(attribute='status.containerStatuses', default=[]) | list }}"
+
+- name: "Read Certificate in {{ verify_ns_name }}"
+  kubernetes.core.k8s_info:
+    api_version: cert-manager.io/v1
+    kind: Certificate
+    namespace: "{{ verify_ns_name }}"
+    name: "{{ verify_notes_cert }}"
+  register: verify_cert
+  until: >-
+    verify_cert.resources | length == 1 and
+    ((verify_cert.resources | first).status.conditions | default([])
+      | selectattr('type', 'equalto', 'Ready') | selectattr('status', 'equalto', 'True') | list | length) == 1
+  retries: "{{ verify_retries }}"
+  delay: "{{ verify_delay }}"
+
+- name: "Certificate is from lab-ca and for {{ verify_host }}"
+  ansible.builtin.assert:
+    that:
+      - verify_host in (verify_cert.resources | first).spec.dnsNames
+      - (verify_cert.resources | first).spec.issuerRef.kind == 'ClusterIssuer'
+      - (verify_cert.resources | first).spec.issuerRef.name == 'lab-ca'
+    fail_msg: "Certificate {{ verify_notes_cert }}: name or issuer wrong"
+    success_msg: "Valid until {{ (verify_cert.resources | first).status.notAfter | default('-') }}"
+
+- name: "Read NetworkPolicies in {{ verify_ns_name }}"
+  kubernetes.core.k8s_info:
+    api_version: networking.k8s.io/v1
+    kind: NetworkPolicy
+    namespace: "{{ verify_ns_name }}"
+  register: verify_netpols
+
+- name: The namespace has exactly the own NetworkPolicies (basic two, sso plus proxy ingress and egress)
+  ansible.builtin.assert:
+    that: verify_netpols.resources | map(attribute='metadata.name') | sort | list == verify_netpols_expected | sort
+    fail_msg: >-
+      Expected {{ verify_netpols_expected | sort }},
+      found: {{ verify_netpols.resources | map(attribute='metadata.name') | sort | list }}
+    quiet: true
+  vars:
+    verify_netpols_expected: >-
+      {{ [verify_notes_netpol, verify_notes_netpol_egress]
+         + ([verify_notes_netpol_proxy, verify_notes_netpol_proxy_egress] if verify_auth_mode != 'basic' else []) }}
+
+# ---------- From outside ----------
+# Without -k: the chain must be valid against the lab CA.
+- name: "Query start page without login: {{ verify_host }}"  # noqa: command-instead-of-module
+  ansible.builtin.command:
+    argv: "{{ verify_curl + ['--output', '/dev/null', '--write-out', '%{http_code} %{redirect_url}', 'https://' ~ verify_host ~ '/'] }}"
+  register: verify_noauth
+  changed_when: false
+  check_mode: false
+  until: verify_noauth.rc == 0
+  retries: "{{ verify_retries }}"
+  delay: "{{ verify_delay }}"
+
+- name: Without password comes 401 (basic)
+  ansible.builtin.assert:
+    that: verify_noauth.stdout.split(' ')[0] == '401'
+    fail_msg: "Expected 401 without password, got {{ verify_noauth.stdout }} (Middleware basic-auth?)"
+    quiet: true
+  when: verify_auth_mode == 'basic'
+
+# sso: the redirect goes to the login of the realm at Keycloak, with the client notes and PKCE.
+- name: Without login comes 302 to Keycloak (sso)
+  ansible.builtin.assert:
+    that:
+      - verify_noauth.stdout.split(' ')[0] == '302'
+      - verify_noauth.stdout.split(' ')[1] is match('^https://' ~ (verify_sso_host | regex_escape) ~ '/realms/lab/protocol/openid-connect/auth[?]')
+      - "'client_id=notes' in verify_noauth.stdout"
+      - "'code_challenge_method=S256' in verify_noauth.stdout"
+    fail_msg: "Expected 302 to https://{{ verify_sso_host }}/realms/lab/..., got {{ verify_noauth.stdout.split(' ')[0] }} (login proxy, Keycloak client notes?)"
+    quiet: true
+  when: verify_auth_mode != 'basic'
+
+# The proxy endpoints are open on purpose (login/logout), but /oauth2/auth without session says 401.
+- name: "Query /oauth2/auth without login: {{ verify_host }}"  # noqa: command-instead-of-module
+  ansible.builtin.command:
+    argv: "{{ verify_curl + ['--output', '/dev/null', '--write-out', '%{http_code}', 'https://' ~ verify_host ~ '/oauth2/auth'] }}"
+  register: verify_oauth_auth
+  changed_when: false
+  check_mode: false
+  when: verify_auth_mode != 'basic'
+
+- name: Without login /oauth2/auth says 401
+  ansible.builtin.assert:
+    that: verify_oauth_auth.stdout == '401'
+    fail_msg: "Expected 401 at /oauth2/auth without login, got {{ verify_oauth_auth.stdout }}"
+    quiet: true
+  when: verify_auth_mode != 'basic'
+
+- name: "Find password file: {{ verify_pw_file | basename }}"
+  ansible.builtin.stat:
+    path: "{{ verify_pw_file }}"
+  register: verify_pw_stat
+  when: verify_auth_mode == 'basic'
+
+- name: Password file is there and readable only by you
+  ansible.builtin.assert:
+    that:
+      - verify_pw_stat.stat.exists
+      - verify_pw_stat.stat.mode == '0600'
+    fail_msg: "{{ verify_pw_file }} is missing or does not have mode 0600 (argocd.yml run?)"
+    quiet: true
+  when: verify_auth_mode == 'basic'
+
+# basic: user:password via stdin (curl --config -), never in argv or output.
+# 200 only after the first build (503 before).
+- name: "Query pages with password: {{ verify_host }}"  # noqa: command-instead-of-module
+  ansible.builtin.command:
+    argv: "{{ verify_curl + ['--config', '-', '--include', 'https://' ~ verify_host ~ item] }}"
+    stdin: 'user = "{{ verify_user }}:{{ lookup(''ansible.builtin.file'', verify_pw_file) }}"'
+  loop: "{{ verify_pages }}"
+  register: verify_auth
+  changed_when: false
+  check_mode: false
+  no_log: true
+  until: verify_auth.rc == 0 and verify_auth.stdout is search('^HTTP/\\S+ (200|404)', multiline=true)
+  retries: "{{ verify_retries }}"
+  delay: "{{ verify_delay }}"
+  when: verify_auth_mode == 'basic'
+
+# sso: real login with a lab-users account (opt-in). The helper logs in through Keycloak, fetches
+# the pages with the session, logs out and checks that the session is really over. Password only
+# via the environment (NOTES_SSO_PASSWORD), nothing secret is printed.
+- name: SSO login check skipped, no account given
+  ansible.builtin.debug:
+    msg:
+      - "{{ verify_host }}: the redirect to Keycloak is checked; the login with an account is skipped."
+      - "Run it with a lab-users account: NOTES_SSO_PASSWORD=... ansible-playbook verify-notes.yml -e verify_notes_sso_user=NAME"
+  when:
+    - verify_auth_mode != 'basic'
+    - verify_notes_sso_user | default('') | length == 0
+
+- name: "Log in via Keycloak, fetch pages, log out: {{ verify_host }}"  # noqa: command-instead-of-module
+  ansible.builtin.command:
+    argv: >-
+      {{ ['python3', playbook_dir ~ '/files/oidc-login-check.py',
+          '--site-url', 'https://' ~ verify_host ~ '/', '--sso-host', verify_sso_host,
+          '--user', verify_notes_sso_user, '--cacert', lab_ca_cert_path | expanduser,
+          '--resolve', verify_host ~ '=' ~ verify_lb_ip, '--resolve', verify_sso_host ~ '=' ~ verify_lb_ip,
+          '--dump-dir', verify_dump_dir]
+         + (('--get ' ~ (verify_pages | join(' --get '))) | split(' ')) }}
+  environment:
+    NOTES_SSO_PASSWORD: "{{ lookup('ansible.builtin.env', 'NOTES_SSO_PASSWORD') }}"
+  register: verify_sso_login
+  changed_when: false
+  check_mode: false
+  no_log: true
+  until: verify_sso_login.rc == 0
+  retries: "{{ verify_retries }}"
+  delay: "{{ verify_delay }}"
+  when:
+    - verify_auth_mode != 'basic'
+    - verify_notes_sso_user | default('') | length > 0
+
+- name: "Read the fetched pages: {{ verify_host }}"
+  ansible.builtin.set_fact:
+    verify_texts: >-
+      {{ query('ansible.builtin.file',
+      verify_dump_dir ~ '/0.http', verify_dump_dir ~ '/1.http',
+      verify_dump_dir ~ '/2.http', verify_dump_dir ~ '/3.http') }}
+  when: verify_auth_mode != 'basic' and verify_notes_sso_user | default('') | length > 0
+
+- name: "Remove the fetched pages again: {{ verify_host }}"
+  ansible.builtin.file:
+    path: "{{ verify_dump_dir }}"
+    state: absent
+  when: verify_auth_mode != 'basic' and verify_notes_sso_user | default('') | length > 0
+
+- name: Read the pages from the password login
+  ansible.builtin.set_fact:
+    verify_texts: "{{ verify_auth.results | map(attribute='stdout') | list }}"
+  when: verify_auth_mode == 'basic'
+
+- name: With login 200, graph with pages and titles, AGENTS.md missing
+  ansible.builtin.assert:
+    that:
+      - verify_start is search('^HTTP/\\S+ 200', multiline=true)
+      - ('rel="canonical" href="https://' ~ verify_host ~ '/"') in verify_start
+      - verify_start is search('^cache-control:[ ]*no-cache\\s*$', multiline=true, ignorecase=true)
+      - verify_start is search('^strict-transport-security:[ ]*max-age=[1-9]', multiline=true, ignorecase=true)
+      - verify_page is search('^HTTP/\\S+ 200', multiline=true)
+      - "'id=\"zensical-graph\"' in verify_page"
+      - verify_graph.nodes | length > 1
+      - verify_graph.links | length > 0
+      - verify_graph.nodes | rejectattr('title', 'defined') | list | length == 0
+      - verify_graph.nodes | map(attribute='path') | select('search', '(?i)(^|/)agents\\.md$') | list | length == 0
+      - verify_texts[3] is search('^HTTP/\\S+ 404', multiline=true)
+    fail_msg: >-
+      Site {{ verify_host }}: start page, knowledge graph or AGENTS.md exclusion is wrong
+      (Builder-Log: kubectl -n {{ verify_ns_name }} logs deploy/notes -c builder)
+    success_msg: "{{ verify_host }}: Graph {{ verify_graph.nodes | length }} pages, {{ verify_graph.links | length }} links"
+  vars:
+    verify_start: "{{ verify_texts[0] }}"
+    verify_page: "{{ verify_texts[1] }}"
+    verify_graph: "{{ verify_texts[2] | regex_replace('(?s)^.*?\\r?\\n\\r?\\n(?=[{\\[])', '') | from_json }}"
+  when: verify_texts is defined
+
+# ---------- PSA proof ----------
+- name: "Send PSA probe as server-side dry run: {{ verify_ns_name }}"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Pod
+      metadata:
+        name: psa-probe
+        namespace: "{{ verify_ns_name }}"
+      spec:
+        containers:
+          - name: probe
+            image: "{{ lab_probe_image }}"
+            securityContext:
+              privileged: true
+  check_mode: true
+  register: verify_psa_probe
+  ignore_errors: true  # the assert reads failed and msg; failed_when: false resets them (ansible-core 2.19+)
+
+- name: "PSA rejects insecure pods: {{ verify_ns_name }}"
+  ansible.builtin.assert:
+    that: verify_psa_probe.msg | default('') is search('violates PodSecurity')
+    fail_msg: "Namespace {{ verify_ns_name }}: test pod was NOT rejected by PSA"
+    quiet: true

@@ -1,0 +1,68 @@
+---
+# Static checks and offline test suites, no cluster and no secrets (issue #10, docs: docs/how-to/ci-lint.md).
+# The rules live in scripts/ci-lint.sh (yamllint, shellcheck, ansible-lint), the suites are all of
+# tests/*-tests.sh (scripts/ci-tests.sh; a suite whose tool is missing prints SKIP), the tool versions in
+# ci/requirements-lint.txt (installed with --require-hashes), the Ansible collections in
+# ansible/requirements.yml (exact versions). Nothing is downloaded unpinned.
+#
+# The container image is the same python image as egress_probe_image (ansible/inventory/group_vars/all/egress.yml);
+# tests/pins-tests.sh fails when the two differ. No actions/checkout: the image has no Node.js, so the first
+# step fetches the history with git, like the gitleaks workflow.
+"on":
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    # act_runner would take "sh -e" otherwise; the image ships bash.
+    shell: bash
+
+jobs:
+  lint:
+    name: lint and offline tests
+    runs-on: ubuntu-latest
+    container:
+      image: docker.io/library/python:3.13.17-trixie@sha256:d5a186865324088bd10d1671801b42297a8fe3f8059143fb22b2e2b776ffa6dd
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PIP_NO_CACHE_DIR: "1"
+      ANSIBLE_FORCE_COLOR: "0"
+    steps:
+      - name: Fetch the repository
+        env:
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}.git
+          REPO_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          auth=$(printf 'x-access-token:%s' "$REPO_TOKEN" | base64 | tr -d '\n')
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0=http.extraHeader
+          export GIT_CONFIG_VALUE_0="Authorization: Basic $auth"
+          git init --quiet .
+          git remote add origin "$REPO_URL"
+          git fetch --quiet --depth 1 origin "$GITHUB_SHA"
+          git checkout --quiet --detach FETCH_HEAD
+
+      - name: Install the lint tools (pinned, hashes checked)
+        run: |
+          set -eu
+          python -m venv "$RUNNER_TEMP/lint-venv"
+          "$RUNNER_TEMP/lint-venv/bin/pip" install --quiet --require-hashes -r ci/requirements-lint.txt
+          echo "$RUNNER_TEMP/lint-venv/bin" >> "$GITHUB_PATH"
+
+      - name: Install the Ansible collections (exact versions)
+        run: ansible-galaxy collection install -r ansible/requirements.yml
+
+      - name: yamllint, shellcheck, ansible-lint
+        run: bash scripts/ci-lint.sh
+
+      # always(): a red lint run does not hide the test result (and the other way round).
+      - name: Offline test suites (no cluster, no secrets)
+        if: ${{ always() }}
+        run: bash scripts/ci-tests.sh

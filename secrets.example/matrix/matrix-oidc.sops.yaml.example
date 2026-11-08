@@ -1,0 +1,16 @@
+# Template for matrix-oidc.sops.yaml: structure without real values.
+# OIDC client of Synapse at Keycloak. The entrypoint puts the secret into
+# homeserver.yaml on the emptyDir. Same value as the client synapse in
+# secrets/keycloak/keycloak-oidc-clients.sops.yaml.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: matrix-oidc
+  namespace: matrix
+  labels:
+    app.kubernetes.io/managed-by: argocd
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+type: Opaque
+stringData:
+  client_secret: "@file:keycloak-synapse-client-secret"

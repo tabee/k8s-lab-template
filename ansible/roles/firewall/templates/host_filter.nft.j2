@@ -1,0 +1,113 @@
+#!/usr/sbin/nft -f
+# {{ ansible_managed }}
+# Own table, replaced atomically: create (if new), delete, define
+# anew. All in one transaction; other tables (k3s, kube-proxy,
+# flannel) stay untouched. No "flush ruleset"!
+{% set admin_v4 = firewall_admin_cidrs | reject('search', ':') | list %}
+{% set admin_v6 = firewall_admin_cidrs | select('search', ':') | list %}
+{% set ingress_v4 = firewall_ingress_cidrs | reject('search', ':') | list %}
+{% set ingress_v6 = firewall_ingress_cidrs | select('search', ':') | list %}
+{% set cluster_v4 = firewall_cluster_cidrs | reject('search', ':') | list %}
+{% set cluster_v6 = firewall_cluster_cidrs | select('search', ':') | list %}
+table inet host_filter
+delete table inet host_filter
+
+table inet host_filter {
+  chain input {
+    type filter hook input priority filter; policy drop;
+
+    # Local traffic (connections to the own node IP also run over lo)
+    iif "lo" accept
+
+    ct state invalid drop
+    ct state established,related accept
+
+    # ICMP: error messages (PMTU, unreachable) and limited ping
+    ip protocol icmp icmp type { destination-unreachable, time-exceeded, parameter-problem } accept
+    ip protocol icmp icmp type echo-request limit rate 10/second accept
+    # ICMPv6: IPv6 does not work without neighbor discovery and packet-too-big
+    meta l4proto ipv6-icmp icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert } accept
+    meta l4proto ipv6-icmp icmpv6 type echo-request limit rate 10/second accept
+
+{% if (firewall_wireguard_udp_port | default(0) | int) > 0 %}
+    # WireGuard tunnel (issue #60): UDP listen, authentication is cryptographic
+    udp dport {{ firewall_wireguard_udp_port | int }} ct state new accept
+{% endif %}
+
+    # Admin: SSH and k8s API only from the admin networks
+{% if admin_v4 %}
+    ip saddr { {{ admin_v4 | join(', ') }} } tcp dport { {{ firewall_admin_tcp_ports | join(', ') }} } ct state new accept
+{% endif %}
+{% if admin_v6 %}
+    ip6 saddr { {{ admin_v6 | join(', ') }} } tcp dport { {{ firewall_admin_tcp_ports | join(', ') }} } ct state new accept
+{% endif %}
+
+    # Pods -> host (API via service IP after DNAT, metrics-server -> kubelet)
+    # Only via the CNI interfaces and only from the pod/service network.
+{% if cluster_v4 %}
+    iifname { {{ firewall_cluster_interfaces | map('to_json') | join(', ') }} } ip saddr { {{ cluster_v4 | join(', ') }} } tcp dport { {{ firewall_cluster_tcp_ports | join(', ') }} } accept
+{% endif %}
+{% if cluster_v6 %}
+    iifname { {{ firewall_cluster_interfaces | map('to_json') | join(', ') }} } ip6 saddr { {{ cluster_v6 | join(', ') }} } tcp dport { {{ firewall_cluster_tcp_ports | join(', ') }} } accept
+{% endif %}
+
+    # Ingress (80/443) does NOT pass here, see chain "forward" below.
+
+    # Rest: log limited, then policy drop applies
+    limit rate 5/minute burst 10 packets log prefix "host_filter drop: " level info
+    counter
+  }
+
+  # Everything that runs into the cluster from outside via DNAT (servicelb/hostPort,
+  # NodePort, kube-proxy) never passes "input" but "forward": the DNAT to
+  # the pod IP happens in prerouting, BEFORE any filter. Hence check here, at the
+  # original destination port (before DNAT). Only new connections from outside (not
+  # from the pod network). policy accept: only these blocks, k3s forwarding stays
+  # untouched (pod to pod, pod to outside, replies).
+  chain forward {
+    type filter hook forward priority filter; policy accept;
+{% if firewall_ingress_tcp_ports | length > 0 %}
+    # Ingress (80/443): ingress networks and admin networks (chain ingress_check)
+    ct state new ct status dnat meta l4proto tcp ct original proto-dst { {{ firewall_ingress_tcp_ports | join(', ') }} } iifname != { {{ firewall_cluster_interfaces | map('to_json') | join(', ') }} } jump ingress_check
+{% endif %}
+{% if firewall_dnat_admin_only | bool %}
+    # Every other DNAT target from outside (NodePort 30000-32767, hostPort, admin port
+    # of the UI) only from the admin networks (chain admin_check).
+{% if firewall_ingress_tcp_ports | length > 0 %}
+    ct state new ct status dnat meta l4proto tcp ct original proto-dst != { {{ firewall_ingress_tcp_ports | join(', ') }} } iifname != { {{ firewall_cluster_interfaces | map('to_json') | join(', ') }} } jump admin_check
+{% else %}
+    ct state new ct status dnat meta l4proto tcp iifname != { {{ firewall_cluster_interfaces | map('to_json') | join(', ') }} } jump admin_check
+{% endif %}
+    ct state new ct status dnat meta l4proto { udp, sctp } iifname != { {{ firewall_cluster_interfaces | map('to_json') | join(', ') }} } jump admin_check
+{% endif %}
+  }
+{% if firewall_ingress_tcp_ports | length > 0 %}
+
+  # Allowed senders for 80/443: ingress networks and admin networks (return = accept
+  # by policy), drop all others.
+  chain ingress_check {
+{% if ingress_v4 or admin_v4 %}
+    ip saddr { {{ (ingress_v4 + admin_v4) | unique | join(', ') }} } return
+{% endif %}
+{% if ingress_v6 or admin_v6 %}
+    ip6 saddr { {{ (ingress_v6 + admin_v6) | unique | join(', ') }} } return
+{% endif %}
+    limit rate 5/minute burst 10 packets log prefix "host_filter ingress drop: " level info
+    counter drop
+  }
+{% endif %}
+{% if firewall_dnat_admin_only | bool %}
+
+  # Only admin networks may reach NodePorts, hostPorts and the admin UI.
+  chain admin_check {
+{% if admin_v4 %}
+    ip saddr { {{ admin_v4 | join(', ') }} } return
+{% endif %}
+{% if admin_v6 %}
+    ip6 saddr { {{ admin_v6 | join(', ') }} } return
+{% endif %}
+    limit rate 5/minute burst 10 packets log prefix "host_filter dnat drop: " level info
+    counter drop
+  }
+{% endif %}
+}

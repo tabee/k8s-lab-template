@@ -1,0 +1,17 @@
+# Test fixtures, not live secrets. 2026-11-01.
+# Local import drill: curl basic-auth against 127.0.0.1 with made-up passwords.
+17bb830faa303810fc06aafa4f73ff4938c76d91:scripts/gitea-import-e2e.sh:curl-auth-user:219
+17bb830faa303810fc06aafa4f73ff4938c76d91:scripts/gitea-import-e2e.sh:curl-auth-user:225
+# Planted entropy string in an older public-export test, later split so the
+# current file no longer contains it. The finding stays in history.
+c6dc06721846033bd2cffb7314dccfbfa50b8a68:tests/public-tests.sh:generic-api-key:140
+# lang-allow-begin: the old file name is part of the gitleaks fingerprint
+b8c9a1661fd2cb917e2f92d9595c75281ea2b759:tests/oeffentlich-tests.sh:generic-api-key:114
+# lang-allow-end
+# Test fixture, not a live secret. 2026-11-04.
+# Same planted string as the entry above (32 made-up characters, entropy 5.0): the "entropy string" case of the
+# export-guard test, which the guard must report. Seen in an intermediate commit of the same test file (line 116
+# instead of 114; the file was renamed to tests/public-tests.sh). The finding stays in history.
+# lang-allow-begin: the old file name is part of the gitleaks fingerprint
+9dcc71032e505c2bde8fa564261e28e828f93a27:tests/oeffentlich-tests.sh:generic-api-key:116
+# lang-allow-end

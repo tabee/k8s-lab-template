@@ -1,0 +1,149 @@
+---
+# Synapse. The image defaults to root and then gosu to uid 991 when UID is
+# set or the process is root. Restricted Pod Security forbids gosu, so the
+# pod is already uid 991 and UID is not set. The command is the chart
+# entrypoint, which fills secrets on an emptyDir and creates the admin.
+# Templated by the chart (not a raw manifest) for the checksum annotations: the
+# pod reads homeserver.yaml and the scripts only at start, and Kubernetes does
+# not restart a pod when a mounted ConfigMap changes. A changed rendered
+# ConfigMap changes the annotation, so Argo CD rolls the pod on its own.
+# The namespace is written out (like the other raw manifests) and the YAML stays
+# plain data, so the Ansible playbooks can still read this file with from_yaml.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: synapse
+  namespace: matrix
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: synapse
+  template:
+    metadata:
+      annotations:
+        checksum/config: '{{ include (print $.Template.BasePath "/configmap-homeserver.yaml") . | sha256sum }}'
+        checksum/scripts: '{{ include (print $.Template.BasePath "/configmap-scripts.yaml") . | sha256sum }}'
+      labels:
+        app.kubernetes.io/name: synapse
+        app.kubernetes.io/part-of: matrix
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 991
+        runAsGroup: 991
+        fsGroup: 991
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: synapse
+          image: ghcr.io/element-hq/synapse:v1.164.1@sha256:fa4aa980f279bcf26d4e7ecc2a2c9a701c73f2ebe8841da9bdcf3b2fdf693d75
+          command: ["python", "/bootstrap/entrypoint.py"]
+          ports:
+            - name: http
+              containerPort: 8008
+          env:
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+            - name: HOME
+              value: /tmp
+            - name: DATABASE_HOST
+              value: matrix-db-pooler-rw.matrix.svc
+            - name: DATABASE_USER
+              value: matrix
+            - name: DATABASE_NAME
+              value: matrix
+            - name: MATRIX_ADMIN_USER_FILE
+              value: /secrets/admin/username
+            - name: MATRIX_ADMIN_PASSWORD_FILE
+              value: /secrets/admin/password
+            - name: MATRIX_REGISTRATION_FILE
+              value: /secrets/registration/shared_secret
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 20
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 36
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - "ALL"
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 192Mi  # lab-limit: matrix/synapse/synapse
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+            - name: config
+              mountPath: /config
+            - name: bootstrap
+              mountPath: /bootstrap
+              readOnly: true
+            - name: homeserver
+              mountPath: /config-src
+              readOnly: true
+            - name: db
+              mountPath: /secrets/db
+              readOnly: true
+            - name: admin
+              mountPath: /secrets/admin
+              readOnly: true
+            - name: registration
+              mountPath: /secrets/registration
+              readOnly: true
+            - name: signing
+              mountPath: /secrets/signing
+              readOnly: true
+            - name: oidc
+              mountPath: /secrets/oidc
+              readOnly: true
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: matrix-data
+        - name: tmp
+          emptyDir: {}
+        - name: config
+          emptyDir: {}
+        - name: bootstrap
+          configMap:
+            name: matrix-scripts
+            defaultMode: 0444
+        - name: homeserver
+          configMap:
+            name: matrix-homeserver
+        - name: db
+          secret:
+            secretName: matrix-db-owner
+        - name: admin
+          secret:
+            secretName: matrix-admin
+        - name: registration
+          secret:
+            secretName: matrix-registration
+        - name: signing
+          secret:
+            secretName: matrix-signing-key
+        - name: oidc
+          secret:
+            secretName: matrix-oidc

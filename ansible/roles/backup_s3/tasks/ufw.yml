@@ -1,0 +1,67 @@
+---
+# Port backup_s3_port: first "deny" for everyone (inserted at the top), then every
+# allowed source above it. This way the block also wins against later broad
+# allow rules (e.g. the whole home network), while our sources stand in front.
+# ufw skips existing rules (idempotent).
+
+- name: Check ufw blocks the S3 port for everyone else
+  community.general.ufw:
+    rule: deny
+    direction: in
+    proto: tcp
+    to_port: "{{ backup_s3_port | string }}"
+    insert: 1
+    comment: "{{ backup_s3_ufw_comment }}: nobody else"
+  become: true
+
+- name: Check ufw allows the S3 port from the lab networks
+  community.general.ufw:
+    rule: allow
+    direction: in
+    interface: "{{ item.interface | default('', true) or omit }}"
+    from_ip: "{{ item.cidr }}"
+    proto: tcp
+    to_port: "{{ backup_s3_port | string }}"
+    insert: "{{ omit if item.state | default('present') == 'absent' else 1 }}"
+    comment: "{{ backup_s3_ufw_comment }}: {{ item.name }}"
+    delete: "{{ item.state | default('present') == 'absent' }}"
+  become: true
+  loop: "{{ backup_s3_ufw_rules }}"
+  loop_control:
+    label: "{{ item.name }} {{ item.cidr }} {{ item.interface | default('', true) or 'all interfaces' }} {{ item.state | default('present') }}"
+
+# Legacy rules (e.g. minikube): delete every rule with a source from
+# backup_s3_ufw_purge_cidrs (any port) or with a matching comment.
+# Numbers from back to front (ufw renumbers after every deletion).
+- name: Read ufw rules (look for legacy rules)
+  ansible.builtin.command: /usr/sbin/ufw status numbered
+  become: true
+  register: backup_s3_ufw_numbered
+  changed_when: false
+  check_mode: false
+
+- name: Determine ufw legacy rules
+  ansible.builtin.set_fact:
+    backup_s3_ufw_purge: >-
+      {%- set ns = namespace(r=[]) -%}
+      {%- for l in backup_s3_ufw_numbered.stdout_lines -%}
+      {%-   set m = l | regex_search('^\\[\\s*(\\d+)\\]\\s+(.*)$', '\\1', '\\2') -%}
+      {%-   if m -%}
+      {%-     set parts = m[1].split(' # ') -%}
+      {%-     set rule_comment = parts[1:] | join(' # ') -%}
+      {%-     if (parts[0].split() | select('in', backup_s3_ufw_purge_cidrs) | list)
+               or (rule_comment and rule_comment is search(backup_s3_ufw_purge_comment_regex)) -%}
+      {%-       set ns.r = ns.r + [{'nr': m[0] | int, 'rule': m[1] | trim}] -%}
+      {%-     endif -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{- ns.r | sort(attribute='nr', reverse=true) }}
+
+- name: Delete ufw legacy rules (e.g. minikube network)
+  ansible.builtin.command:
+    argv: [/usr/sbin/ufw, --force, delete, "{{ item.nr | string }}"]
+  become: true
+  changed_when: true
+  loop: "{{ backup_s3_ufw_purge }}"
+  loop_control:
+    label: "[{{ item.nr }}] {{ item.rule }}"

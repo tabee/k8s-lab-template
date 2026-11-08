@@ -1,0 +1,85 @@
+---
+# Docs pod reachable only for Traefik, and only on port 8080 (web server).
+# All other pods: kube-router rejects ("Connection refused"). Outgoing
+# (wave 2, issue 5): DNS, Git (SSH) only to the Git server and HTTPS to the public
+# network, see docs-allow-egress at the end. Kubelet probes from the own node
+# are always let through by k3s (kube-router).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: docs-allow-traefik
+  namespace: docs
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: docs
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: traefik
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: traefik
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+# Egress (wave 2, issue 5): the builder needs DNS, Git over SSH and HTTPS (PyPI, plugin). Everything else
+# is closed: no node, no API server, no S3, no other pod. Pods without these labels are not selected.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: docs-allow-egress
+  namespace: docs
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: docs
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Git server of repo_url: only its own address(es), SSH port (and 443 for the HTTPS clone of the
+    # docs plugin when the server sits in a private range). Written by scripts/repo-egress.py.
+    - to:
+        # lab-egress:repo-cidrs BEGIN
+        - ipBlock:
+            cidr: 203.0.113.10/32
+        # lab-egress:repo-cidrs END
+      ports:
+        - protocol: TCP
+          # lab-egress:repo-port BEGIN
+          port: 22
+          # lab-egress:repo-port END
+        - protocol: TCP
+          port: 443
+    # PyPI, plugin clone, container and chart hosts: HTTPS to the public internet only. Names cannot be
+    # pinned (kube-router has no FQDN rules), so 443 stays open to every public address; private ranges,
+    # link-local and the node network stay closed.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+              - 127.0.0.0/8
+      ports:
+        - protocol: TCP
+          port: 443

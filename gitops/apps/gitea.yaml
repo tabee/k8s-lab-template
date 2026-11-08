@@ -1,0 +1,71 @@
+---
+# Child application of the root app (app of apps), stage 8c: Gitea.
+# Source 1: official Helm chart gitea (deployment, services, PVC,
+#           app.ini as secret) plus certificate and IngressRoute (extraDeploy
+#           in values-gitea.yaml, so that the hostname appears only once).
+#           Without Postgres/Valkey from the chart.
+# Source 2: this repo, provides values-gitea.yaml ($values) and the
+#           manifests under gitops/workloads/gitea/manifests: namespace,
+#           CNPG cluster gitea-db with pooler and backup, K8up schedule,
+#           NetworkPolicies.
+# Version pinned here, the only place (as of 2026-10-27):
+#   gitea 12.7.0 (image version and digest: values-gitea.yaml)
+# Source: https://dl.gitea.com/charts/index.yaml
+# Project lab: the chart repo is in argocd_project_chart_repos
+# (ansible/inventory/group_vars/all/argocd.yml), the namespace gitea in
+# argocd_project_namespaces. The chart only renders namespace objects.
+# Secrets (DB owner, admin, S3, restic) are provided by the app secrets-gitea.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: gitea
+  namespace: argocd
+  # Deleting this file cleans up Gitea, gitea-db and the schedule.
+  # Remaining: namespace (Delete=false), secrets (app secrets-gitea),
+  # Repo-PVC (resource-policy keep), Backups in rustfs.
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: lab
+  sources:
+    - repoURL: https://dl.gitea.com/charts/
+      chart: gitea
+      targetRevision: 12.7.0
+      helm:
+        releaseName: gitea
+        valueFiles:
+          - $values/gitops/workloads/gitea/values-gitea.yaml
+    - repoURL: ssh://git@github.com/YOUR-NAME/k8s-lab.git
+      targetRevision: main
+      ref: values
+      # With path Argo CD additionally renders this source as manifests.
+      path: gitops/workloads/gitea/manifests
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: gitea
+  # Runtime recovery (rebuild --restore) may differ here. Git stays initdb. ADR-0018.
+  ignoreDifferences:
+    - group: postgresql.cnpg.io
+      kind: Cluster
+      jqPathExpressions:
+        - .spec.bootstrap
+        - .spec.externalClusters
+        - .spec.plugins[].parameters.serverName
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - RespectIgnoreDifferences=true
+      # Check CRD objects (cluster, pooler, schedule, ...) only once the
+      # apps cnpg, k8up, cert-manager and traefik have delivered their CRDs.
+      - SkipDryRunOnMissingResource=true
+      - ServerSideApply=true
+    # Until gitea-db runs and the secrets are there, Gitea does not start
+    # (init container waits for the database); retry bridges that.
+    retry:
+      limit: 10
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 3m

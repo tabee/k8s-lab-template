@@ -1,0 +1,121 @@
+---
+# Egress verification (wave 2, issue #5). The policies themselves live in gitops/ (Argo CD reads
+# only Git); this file holds the targets the probes try. Used by verify-egress.yml and by the
+# egress probes inside verify-gitea.yml, verify-cnpg.yml, verify-docs.yml and verify-argocd.yml
+# (tasks/egress-probe.yml), and by verify-matrix.yml.
+
+# Same image as the docs builder (gitops/workloads/docs/deployment.yaml); a test keeps them equal.
+egress_probe_image: docker.io/library/python:3.13.17-trixie@sha256:d5a186865324088bd10d1671801b42297a8fe3f8059143fb22b2e2b776ffa6dd
+
+# Git server of repo_url: host and SSH port. Egress rules name only its address(es) (lab.yaml: repo_egress_cidrs).
+egress_repo_host: "{{ argocd_repo_url | regex_replace('^ssh://([^@/]+@)?([^:/]+)(:[0-9]+)?/.*$', '\\2') }}"
+egress_repo_port: "{{ (argocd_repo_url | regex_replace('^ssh://([^@/]+@)?([^:/]+):?([0-9]*)/.*$', '\\3')) | default('22', true) }}"
+
+# Targets. api = k3s API on the node (the rule is evaluated after DNAT), s3 = S3 of the backup target.
+egress_t_api: "{{ lab.vm_ip }}:6443"
+egress_t_s3: "{{ lab.gateway }}:{{ backup_s3_port }}"
+egress_t_git: "{{ egress_repo_host }}:{{ egress_repo_port }}"
+# Keycloak in the cluster (back channel of the notes login proxies), reached by its Service name.
+egress_t_keycloak: "keycloak.keycloak.svc:8080"
+# Never allowed from a policy namespace: plain HTTP to the internet, SSH on the node.
+egress_t_other:
+  - "1.1.1.1:80"
+  - "{{ lab.vm_ip }}:22"
+
+# Probe sets per area. Fields: name (pod name suffix), namespace, labels (to match a policy), open
+# (must connect), closed (must NOT connect). The control probe runs in a namespace without any policy:
+# it proves that the closed targets are reachable at all, so a "closed" result means something.
+egress_probe_control:
+  - name: control
+    namespace: egress-verify-control
+    create_namespace: true
+    labels: {}
+    open: ["{{ egress_t_api }}", "{{ egress_t_s3 }}"]
+    closed: []
+egress_probe_gitea:
+  - name: gitea-plain
+    namespace: gitea
+    labels: {}
+    open: []
+    closed: "{{ [egress_t_api, egress_t_s3, egress_t_git] + egress_t_other }}"
+  - name: gitea-cnpg
+    namespace: gitea
+    labels: {cnpg.io/cluster: egress-probe}
+    open: ["{{ egress_t_api }}", "{{ egress_t_s3 }}"]
+    closed: "{{ [egress_t_git] + egress_t_other }}"
+  - name: gitea-k8up
+    namespace: gitea
+    labels: {k8upjob: "true"}
+    open: ["{{ egress_t_api }}", "{{ egress_t_s3 }}"]
+    closed: "{{ [egress_t_git] + egress_t_other }}"
+  - name: gitea-pooler
+    namespace: gitea
+    labels: {cnpg.io/poolerName: egress-probe}
+    open: ["{{ egress_t_api }}"]
+    closed: "{{ [egress_t_s3, egress_t_git] + egress_t_other }}"
+egress_probe_matrix:
+  - name: matrix-plain
+    namespace: matrix
+    labels: {}
+    open: []
+    closed: "{{ [egress_t_api, egress_t_s3, egress_t_git] + egress_t_other }}"
+  - name: matrix-cnpg
+    namespace: matrix
+    labels: {cnpg.io/cluster: egress-probe}
+    open: ["{{ egress_t_api }}", "{{ egress_t_s3 }}"]
+    closed: "{{ [egress_t_git] + egress_t_other }}"
+  - name: matrix-k8up
+    namespace: matrix
+    labels: {k8upjob: "true"}
+    open: ["{{ egress_t_api }}", "{{ egress_t_s3 }}"]
+    closed: "{{ [egress_t_git] + egress_t_other }}"
+  - name: matrix-pooler
+    namespace: matrix
+    labels: {cnpg.io/poolerName: egress-probe}
+    open: ["{{ egress_t_api }}"]
+    closed: "{{ [egress_t_s3, egress_t_git] + egress_t_other }}"
+# Keycloak: no K8up and no pooler, so only the plain pod and the CNPG pod are probed.
+egress_probe_keycloak:
+  - name: keycloak-plain
+    namespace: keycloak
+    labels: {}
+    open: []
+    closed: "{{ [egress_t_api, egress_t_s3, egress_t_git] + egress_t_other }}"
+  - name: keycloak-cnpg
+    namespace: keycloak
+    labels: {cnpg.io/cluster: egress-probe}
+    open: ["{{ egress_t_api }}", "{{ egress_t_s3 }}"]
+    closed: "{{ [egress_t_git] + egress_t_other }}"
+egress_probe_dblab:
+  - name: dblab-plain
+    namespace: db-lab
+    labels: {}
+    open: []
+    closed: "{{ [egress_t_api, egress_t_s3, egress_t_git] + egress_t_other }}"
+  - name: dblab-cnpg
+    namespace: db-lab
+    labels: {cnpg.io/cluster: egress-probe}
+    open: ["{{ egress_t_api }}", "{{ egress_t_s3 }}"]
+    closed: "{{ [egress_t_git] + egress_t_other }}"
+  - name: dblab-pooler
+    namespace: db-lab
+    labels: {cnpg.io/poolerName: egress-probe}
+    open: ["{{ egress_t_api }}"]
+    closed: "{{ [egress_t_s3, egress_t_git] + egress_t_other }}"
+  - name: dblab-k8up-label
+    namespace: db-lab
+    labels: {k8upjob: "true"}
+    open: []
+    closed: "{{ [egress_t_api, egress_t_s3] + egress_t_other }}"
+egress_probe_docs:
+  - name: docs
+    namespace: docs
+    labels: {app.kubernetes.io/name: docs}
+    open: ["{{ egress_t_git }}"]
+    closed: "{{ [egress_t_api, egress_t_s3] + egress_t_other }}"
+egress_probe_argocd:
+  - name: argocd-repo-server
+    namespace: argocd
+    labels: {app.kubernetes.io/name: argocd-repo-server, app.kubernetes.io/instance: argocd}
+    open: ["{{ egress_t_git }}"]
+    closed: "{{ [egress_t_api, egress_t_s3] + egress_t_other }}"

@@ -1,0 +1,162 @@
+---
+# Values for stage 4: role "argocd_bootstrap" (playbook argocd.yml, runs on
+# localhost). Lives in group_vars/all because the implicit localhost only
+# sees "all". Each value is defined only here; the role deliberately has no defaults/.
+# No secrets: of the deploy key only the path is here.
+
+# Kubeconfig from stage 2, not maintained twice: the value comes from
+# group_vars/k3s (k3s_kubeconfig_local_path) des first k3s host.
+argocd_kubeconfig: >-
+  {{ hostvars[groups['k3s'] | first]['k3s_kubeconfig_local_path'] | expanduser }}
+
+# Namespace for Argo CD, with its own PSA labels (no exception).
+argocd_namespace: argocd
+argocd_psa_level: restricted
+argocd_psa_version: latest
+
+# Official Helm chart, pinned exactly (as of 2026-10-23):
+# Chart 10.11.1 = Argo CD v3.5.6. Argo CD 3.5 is tested against k8s 1.33-1.36.
+# Source: https://argoproj.github.io/argo-helm/index.yaml
+argocd_chart_repo_name: argo
+argocd_chart_repo_url: https://argoproj.github.io/argo-helm
+argocd_chart_name: argo-cd
+argocd_chart_version: 10.11.1
+argocd_release_name: argocd
+# Maximum wait time for helm --wait (Go duration).
+argocd_helm_timeout: 10m0s
+
+# Git repo that Argo CD reads (pull model). Read-only deploy key.
+# Value from infra/envs/local/lab.yaml (+ lab.local.yaml), key repo_url.
+argocd_repo_url: "{{ lab.repo_url }}"
+# Branch that Argo CD reads (root app, secret docs-repo for the docs builder).
+# Also set as targetRevision in gitops/apps/*.yaml and as revision
+# in the ApplicationSet (Argo does not read Ansible variables); verify-argocd.yml
+# checks that all apps from this repo use exactly this branch.
+argocd_repo_revision: main
+# Commit that the root app and every child application read while a bootstrap or rebuild runs
+# (issue 71). Empty = no pin, the apps follow argocd_repo_revision. lab.sh sets it with -e from the
+# commit it verified; do not set it here. Release: ansible/argocd-release-pin.yml (lab.sh trust release).
+argocd_pin_revision: ""
+# Private deploy key on the control machine (mode 0600, never in Git).
+# Stays with Ansible (stage 7): without this key Argo CD does not read the repo,
+# so no encrypted secret from it either (chicken and egg).
+argocd_repo_ssh_key_path: ~/.ssh/argocd-k8s-lab
+# Name des Repo-Secrets im Namespace argocd.
+argocd_repo_secret_name: repo-k8s-lab
+# Public host keys of the Git server, one line per entry. Value from
+# lab.yaml (+ lab.local.yaml), key repo_known_hosts. Fetch and enter:
+#   bash scripts/lab.sh customize --fetch-host-keys
+# Empty = the playbook aborts in the preflight (no blind trust).
+argocd_repo_known_hosts: "{{ lab.repo_known_hosts }}"
+# Repo with the SOPS files (apps secrets-*). lab.yaml key secrets_repo_url; empty or
+# missing = repo_url. Same host and port as repo_url (ADR 0022). Only when it differs
+# from argocd_repo_url does Ansible create a second repo secret with its own
+# read-only deploy key (a key can only be a deploy key of ONE repo on most servers).
+argocd_secrets_repo_url: "{{ lab.secrets_repo_url | default(lab.repo_url, true) }}"
+argocd_secrets_repo_separate: "{{ argocd_secrets_repo_url != argocd_repo_url }}"
+argocd_secrets_repo_ssh_key_path: ~/.ssh/argocd-k8s-lab-secrets
+argocd_secrets_repo_secret_name: repo-k8s-lab-secrets
+# All Git repos the projects lab and platform may read (code + secrets, without duplicates).
+argocd_git_repos: "{{ [argocd_repo_url, argocd_secrets_repo_url] | unique }}"
+
+# AppProjects and root application (app of apps).
+# Project lab: workloads. Cluster-wide only namespaces. The namespace argocd
+# is NOT part of it anymore (wave 2): an application in project lab may not create
+# Argo CD objects (Application, AppProject, Secret) in the namespace argocd.
+# Add new workload namespaces here.
+argocd_project: lab
+argocd_project_namespaces:
+  - whoami
+  # Docs site; the namespace is created by the role docs_site (group_vars/all/docs.yml).
+  - "{{ docs_namespace }}"
+  # Stage 8b: practice database pg-lab (CNPG). Mirror of
+  # gitops/workloads/db-lab/namespace.yaml, compared by verify-cnpg.yml.
+  - db-lab
+  # Stage 8c: Gitea with its own CNPG cluster gitea-db. Mirror of
+  # gitops/workloads/gitea/manifests/namespace.yaml, compared by verify-gitea.yml.
+  - gitea
+  # Gitea Actions runner and its job pods (issue #115). Mirror of
+  # gitops/workloads/gitea-runner/namespace.yaml, compared by tests/gitea-runner-tests.sh.
+  - gitea-runner
+  - gitea-runner-jobs
+  # Matrix (Synapse + Element Web). Mirror of
+  # gitops/workloads/matrix/manifests/namespace.yaml, compared by verify-matrix.yml.
+  - matrix
+  # Keycloak (single sign-on) with its own CNPG cluster keycloak-db. Mirror of
+  # gitops/workloads/keycloak/manifests/namespace.yaml, compared by verify-keycloak.yml.
+  - keycloak
+# Helm repos from which the project lab may read charts (in addition to the
+# Git repo). Must match exactly the repoURL of the chart source in gitops/apps/gitea.yaml.
+# Only charts that render no cluster-wide objects except namespace.
+argocd_project_chart_repos:
+  # Stage 8c: Gitea chart (without Postgres/Valkey dependencies).
+  - https://dl.gitea.com/charts/
+# Project platform: platform services (stage 5 Traefik, stage 6 cert-manager).
+# May additionally read from the chart sources and create the cluster-wide kinds
+# that "helm template" yields for the charts, plus namespace
+# (CreateNamespace for traefik) and the ClusterIssuers from
+# gitops/platform/cert-manager/manifests. Chart versions are only in gitops/apps/.
+argocd_platform_project: platform
+argocd_platform_namespaces:
+  - traefik
+  # cert-manager; the namespace is created by the role lab_ca (group_vars/all/lab_ca.yml).
+  - "{{ lab_ca_namespace }}"
+  # Stage 8b: CNPG operator + Barman Cloud plugin (gitops/apps/cnpg.yaml,
+  # namespace via CreateNamespace with PSA labels).
+  - cnpg-system
+  # Stage 8c: K8up operator (gitops/apps/k8up.yaml, namespace via
+  # CreateNamespace with PSA labels).
+  - k8up
+# Must match exactly the repoURL of the chart sources in gitops/apps/traefik.yaml,
+# gitops/apps/cert-manager.yaml, gitops/apps/cnpg.yaml and gitops/apps/k8up.yaml.
+argocd_platform_chart_repos:
+  - https://traefik.github.io/charts
+  - oci://quay.io/jetstack/charts/cert-manager
+  # Stage 8b: cloudnative-pg and plugin-barman-cloud.
+  - https://cloudnative-pg.github.io/charts
+  # Stage 8c: K8up (Operator, CRDs).
+  - https://k8up-io.github.io/k8up
+argocd_platform_cluster_resources:
+  - { group: "", kind: Namespace }
+  - { group: apiextensions.k8s.io, kind: CustomResourceDefinition }
+  - { group: rbac.authorization.k8s.io, kind: ClusterRole }
+  - { group: rbac.authorization.k8s.io, kind: ClusterRoleBinding }
+  - { group: networking.k8s.io, kind: IngressClass }
+  # cert-manager: webhook configurations from the chart, ClusterIssuer from Git.
+  - { group: admissionregistration.k8s.io, kind: ValidatingWebhookConfiguration }
+  - { group: admissionregistration.k8s.io, kind: MutatingWebhookConfiguration }
+  - { group: cert-manager.io, kind: ClusterIssuer }
+  # Policy "lab-ca only issues names under the lab domain" (docs/concepts/certificates.md).
+  - { group: admissionregistration.k8s.io, kind: ValidatingAdmissionPolicy }
+  - { group: admissionregistration.k8s.io, kind: ValidatingAdmissionPolicyBinding }
+argocd_destination_server: https://kubernetes.default.svc
+argocd_root_app_name: root
+argocd_root_app_path: gitops/apps
+# Auto-sync of the root Application. The only definition: the role creates
+# root with it, and recover-files.yml (rebuild --restore) turns it off while
+# Gitea and Matrix are paused and puts exactly this value back afterwards.
+# Without that pause, root's self-heal reverts the paused child apps.
+argocd_root_automated:
+  prune: true
+  selfHeal: true
+# Project root (wave 2): only for the root Application. It may create exactly
+# Application and ApplicationSet objects in the namespace argocd, nothing else,
+# nothing cluster-wide. Whoever pushes to the repo can therefore add or change
+# child Applications, but cannot reach Secrets, AppProjects or RBAC through root.
+argocd_root_project: root
+argocd_root_project_resources:
+  - { group: argoproj.io, kind: Application }
+  - { group: argoproj.io, kind: ApplicationSet }
+# Project argocd-ui (wave 2): only for the Application argocd-ingress
+# (gitops/apps/argocd-ingress.yaml). It writes into the namespace argocd and
+# may only create the kinds listed here (UI certificate, route, NetworkPolicies).
+argocd_ui_project: argocd-ui
+argocd_ui_namespaces:
+  - "{{ argocd_namespace }}"
+argocd_ui_resources:
+  - { group: cert-manager.io, kind: Certificate }
+  - { group: traefik.io, kind: IngressRoute }
+  - { group: networking.k8s.io, kind: NetworkPolicy }
+# The built-in project "default" accepts every repo and every destination.
+# Wave 2 closes it: no source, no destination, no resource kind.
+argocd_default_project: default

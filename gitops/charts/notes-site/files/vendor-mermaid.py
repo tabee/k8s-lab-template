@@ -1,0 +1,1 @@
+../../../../docs/vendor-mermaid.py

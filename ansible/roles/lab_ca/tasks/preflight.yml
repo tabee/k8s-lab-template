@@ -1,0 +1,14 @@
+---
+# Preflight: only the target folder for the public certificate.
+# Since stage 7 the role no longer reads a secret file (KSOPS, Argo CD).
+
+- name: Find target folder for the public CA certificate
+  ansible.builtin.stat:
+    path: "{{ lab_ca_cert_path | expanduser | dirname }}"
+  register: lab_ca_cert_dir
+
+- name: Target folder for the public CA certificate exists
+  ansible.builtin.assert:
+    that: lab_ca_cert_dir.stat.isdir | default(false)
+    fail_msg: "Folder {{ lab_ca_cert_path | dirname }} is missing"
+    quiet: true

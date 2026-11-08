@@ -1,0 +1,124 @@
+---
+# Values for the role "k3s" (group k3s).
+# Each value is defined only here; the role deliberately has no defaults/.
+
+# Pinned version, channel "stable" from https://update.k3s.io/v1-release/channels
+# (as of 2026-10-21). On an update adjust all three values (version + hashes)
+# together; hashes from sha256sum-<arch>.txt of the GitHub release.
+k3s_version: v1.36.5+k3s1
+k3s_binary_sha256:
+  amd64: d73847bcd3c5fccef0115b372e2f9a91f3032dc84bbf71518a4617565294d313
+  arm64: 135e34cb9e8a1cfae3cb55577789e93501efe7edc080a8b2630458a85b07721e
+# install.sh from the same Git tag (not get.k3s.io, which changes).
+k3s_install_script_sha256: 46177d4c99440b4c0311b67233823a8e8a2fc09693f6c89af1a7161e152fbfad
+
+k3s_release_url: "https://github.com/k3s-io/k3s/releases/download/{{ k3s_version | urlencode }}"
+k3s_install_script_url: "https://raw.githubusercontent.com/k3s-io/k3s/{{ k3s_version | urlencode }}/install.sh"
+
+# Name for cluster/context/user in the local kubeconfig (here: k3s-lab).
+k3s_context_name: "{{ inventory_hostname }}"
+# Address under which kubectl reaches the API.
+k3s_api_endpoint: "{{ ansible_host }}"
+# Target on the control machine, deliberately outside the repo.
+k3s_kubeconfig_local_path: "~/.kube/{{ k3s_context_name }}.kubeconfig"
+
+# k3s default networks, set explicitly (also needed for the host firewall).
+k3s_cluster_cidr: 10.42.0.0/16
+k3s_service_cidr: 10.43.0.0/16
+
+# Waiting for node Ready: attempts x pause (seconds).
+k3s_ready_retries: 30
+k3s_ready_delay: 10
+
+# Server data directory of k3s (default, only as a base for paths).
+k3s_server_data_dir: /var/lib/rancher/k3s/server
+# Files for Pod Security Admission and API audit (paths as in the
+# k3s hardening guide, https://docs.k3s.io/security/hardening-guide).
+k3s_psa_config_path: "{{ k3s_server_data_dir }}/psa.yaml"
+k3s_audit_policy_path: "{{ k3s_server_data_dir }}/audit.yaml"
+k3s_audit_log_path: "{{ k3s_server_data_dir }}/logs/audit.log"
+# PSA default for all namespaces without their own label.
+k3s_psa_level: restricted
+k3s_psa_version: latest
+# kube-system needs privileged pods (CoreDNS, local-path, metrics).
+k3s_psa_exempt_namespaces:
+  - kube-system
+
+# Content of /etc/rancher/k3s/config.yaml (key = CLI flags without "--").
+# Built-in Traefik is off (own Traefik via Argo CD, stage 5).
+# ServiceLB is on: LoadBalancer for Traefik. local-path stays active.
+k3s_server_config:
+  node-name: "{{ inventory_hostname }}"
+  write-kubeconfig-mode: "0600"
+  tls-san:
+    - "{{ ansible_host }}"
+    - "{{ host_fqdn }}"
+  disable:
+    - traefik
+  secrets-encryption: true
+  # XSalsa20-Poly1305 instead of AES-CBC. Existing secrets stay until
+  # manual rotation AES-CBC (docs/learning-path/stage-3-hardening.md).
+  secrets-encryption-provider: secretbox
+  protect-kernel-defaults: true
+  cluster-cidr: "{{ k3s_cluster_cidr }}"
+  service-cidr: "{{ k3s_service_cidr }}"
+  kube-apiserver-arg:
+    - "admission-control-config-file={{ k3s_psa_config_path }}"
+    - "audit-policy-file={{ k3s_audit_policy_path }}"
+    - "audit-log-path={{ k3s_audit_log_path }}"
+    # Rotation: 30 days, 10 files, 100 MB each (values from the guide)
+    - audit-log-maxage=30
+    - audit-log-maxbackup=10
+    - audit-log-maxsize=100
+    # Do not artificially extend short-lived ServiceAccount tokens
+    - service-account-extend-token-expiration=false
+  kube-controller-manager-arg:
+    # CIS 1.3.1: clean up terminated pods
+    - terminated-pod-gc-threshold=100
+  kubelet-arg:
+    # CIS 4.2.5: close open exec/port-forward streams after 5 min
+    - streaming-connection-idle-timeout=5m
+    # CIS 4.2.13: fork bomb protection per pod
+    - pod-max-pids=4096
+    # CIS 4.2.12: only strong TLS ciphers for the kubelet
+    - "tls-cipher-suites=TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384"
+
+# ---------- Role "firewall" (nftables, table inet host_filter) ----------
+# SSH, k8s API, NodePorts/hostPorts and the admin interface only from these networks.
+# Source: lab.yaml (edge_admin_cidrs, in profile edge edge_profile_admin), resolved
+# in group_vars/all/lab.yml. Default = vm_cidr (libvirt NAT incl. host .1).
+firewall_admin_cidrs: "{{ lab_edge_admin_cidrs }}"
+# 22 = sshd, 6443 = k3s API (default ports).
+firewall_admin_tcp_ports:
+  - 22
+  - 6443
+# Pods and services may reach the host (k3s docs "Inbound Rules").
+firewall_cluster_cidrs:
+  - "{{ k3s_cluster_cidr }}"
+  - "{{ k3s_service_cidr }}"
+# Flannel: bridge of the pods and VXLAN interface.
+firewall_cluster_interfaces:
+  - cni0
+  - flannel.1
+# 6443: pods -> API (after DNAT of 10.43.0.1:443), 10250: metrics-server -> kubelet.
+firewall_cluster_tcp_ports:
+  - 6443
+  - 10250
+# Ingress via servicelb: hostPort -> DNAT -> chain "forward" (not input).
+# Only from firewall_ingress_cidrs (plus admin networks); on the service additionally
+# loadBalancerSourceRanges (gitops/platform/traefik/values.yaml, written from
+# lab.yaml by "lab.sh customize").
+# Every other DNAT target from outside (NodePort 30000-32767, hostPort, admin port
+# traefik_admin_port) is open only from the admin networks (chain admin_check).
+firewall_ingress_tcp_ports:
+  - 80
+  - 443
+firewall_ingress_cidrs: "{{ lab_edge_ingress_cidrs }}"
+# true: NodePorts and hostPorts (everything except the ingress ports) only from the admin networks.
+# Emergency exit for an unknown, legitimate flow: false (then only 80/443 are filtered).
+firewall_dnat_admin_only: true
+# Dead man's switch: without confirmation after this many seconds the rules are gone.
+firewall_rollback_seconds: 120
+
+# WireGuard listen port on the node (0 = no rule). Same number as lab.wireguard_port when the tunnel is on.
+firewall_wireguard_udp_port: "{{ lab.wireguard_port | default(0) }}"

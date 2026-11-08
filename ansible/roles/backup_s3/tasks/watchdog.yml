@@ -1,0 +1,49 @@
+---
+# Waits for the route at start and checks the external path (watchdog).
+# Scripts and systemd user units; the timer runs thanks to linger even without
+# login. The quadlet file (quadlet.yml) calls rustfs-wait-net.sh,
+# so the scripts come before it.
+
+- name: Directories for scripts and user units
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - "{{ backup_s3_script_dir }}"
+    - "{{ backup_s3_systemd_user_dir }}"
+
+- name: Scripts (waiting for the route, watchdog)
+  ansible.builtin.copy:
+    src: "{{ item }}"
+    dest: "{{ backup_s3_script_dir }}/{{ item }}"
+    mode: "0755"
+  loop:
+    - rustfs-wait-net.sh
+    - rustfs-watchdog.sh
+
+- name: Write watchdog service
+  ansible.builtin.template:
+    src: rustfs-watchdog.service.j2
+    dest: "{{ backup_s3_systemd_user_dir }}/rustfs-watchdog.service"
+    mode: "0644"
+  notify: Reload watchdog
+
+- name: Write watchdog timer
+  ansible.builtin.template:
+    src: rustfs-watchdog.timer.j2
+    dest: "{{ backup_s3_systemd_user_dir }}/rustfs-watchdog.timer"
+    mode: "0644"
+  notify: Reload watchdog
+
+- name: Load watchdog now if the units are new
+  ansible.builtin.meta: flush_handlers
+
+- name: Watchdog timer runs and starts at boot
+  ansible.builtin.systemd_service:
+    name: rustfs-watchdog.timer
+    scope: user
+    enabled: true
+    state: started
+  # In the --check run before the first installation the unit does not exist yet.
+  ignore_errors: "{{ ansible_check_mode }}"

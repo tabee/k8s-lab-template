@@ -1,0 +1,125 @@
+# Positive list for scripts/security/check-public-tree.py: every host name, e-mail domain and URL host that may
+# appear in the PUBLIC repository. Anything with a real top-level domain that is not listed here fails the check.
+# One fnmatch pattern per line (lower case, "*" matches across dots). "example.org" does NOT cover "*.example.org".
+# Rule: only generic, public names belong here. A private name must never be added to make the check green:
+# remove it from the text (or replace it in scripts/public/replacements.tsv) instead.
+
+# Reserved for documentation and tests (RFC 2606, RFC 6761) and neutral lab placeholders
+example
+*.example
+example.org
+*.example.org
+example.com
+*.example.com
+example.net
+*.example.net
+example.ch
+*.example.ch
+*.test
+*.invalid
+localhost
+*.localhost
+*.local
+*.home
+*.svc
+*.svc.cluster.local
+lab.dev
+*.lab.dev
+evil.com
+*.evil.com
+
+# Kubernetes API groups and projects used in manifests
+*.k8s.io
+k8s.io
+*.kubernetes.io
+kubernetes.io
+*.argoproj.io
+argoproj.io
+*.cnpg.io
+cnpg.io
+*.k8up.io
+k8up.io
+cert-manager.io
+*.cert-manager.io
+*.traefik.io
+traefik.io
+*.cattle.io
+cattle.io
+helm.sh
+*.helm.sh
+*.github.io
+github.io
+k3s.io
+*.k3s.io
+*.opentofu.org
+opentofu.org
+*.gitea.com
+gitea.com
+zensical.org
+
+# Registries, downloads, hosting
+github.com
+# The age file format magic header, used by the offline emergency-kit test.
+age-encryption.org
+# Official Python release metadata and content-addressed package wheels.
+pypi.org
+files.pythonhosted.org
+# Public git forges named by source_trust: auto (ADR 0023)
+gitlab.com
+codeberg.org
+bitbucket.org
+*.github.com
+*.githubusercontent.com
+githubusercontent.com
+docker.io
+*.docker.io
+ghcr.io
+quay.io
+unpkg.com
+registry.npmjs.org
+npmjs.org
+*.amazonaws.com
+amazonaws.com
+*.ubuntu.com
+ubuntu.com
+*.letsencrypt.org
+letsencrypt.org
+openssh.com
+*.openssh.com
+libssh.org
+gnu.org
+*.gnu.org
+fsf.org
+keepachangelog.com
+podman.io
+*.podman.io
+passt.top
+*.passt.top
+cloudnative-pg.io
+*.cloudnative-pg.io
+viaduct.ai
+
+# Official legal sources linked from the documentation (Swiss Fedlex, EU Publications Office and EUR-Lex)
+www.fedlex.admin.ch
+fedlex.admin.ch
+eur-lex.europa.eu
+publications.europa.eu
+
+# Public IPv4 addresses that may appear (probes and test fixtures), one per line
+ip:1.1.1.1
+ip:1.2.3.4
+# GitHub's published address ranges (https://api.github.com/meta, git and web): the default of github_egress_cidrs and test fixtures; public, no personal data
+ip:140.82.112.0
+ip:140.82.112.4
+ip:140.82.121.3
+ip:140.82.96.0
+ip:143.55.64.0
+ip:185.199.108.0
+ip:192.30.252.0
+ip:192.30.255.5
+ip:20.201.28.151
+
+# Public heartbeat provider named as an example in the alert docs, config comment and lab-alert.py help; no personal data
+healthchecks.io
+# Official Argo CD documentation (versioned on Read the Docs), linked from docs/reference
+argo-cd.readthedocs.io

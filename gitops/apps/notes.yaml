@@ -1,0 +1,67 @@
+---
+# Child of the root app: an ApplicationSet. It reads gitops/sites.yaml (Git
+# generator "files", a list = one parameter set per entry) and makes
+# one application notes-<name> per notebook from the chart
+# gitops/charts/notes-site. repoURL, revision/targetRevision must match
+# ansible/inventory/group_vars/all/argocd.yml (verify-argocd.yml).
+# Project notes (created by Ansible): may only go to notes-*.
+# Entry removed = application gone, its objects too (finalizer).
+# Namespace and secrets stay, they belong to Ansible.
+# Runbook: docs/how-to/notes-sites.md
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: notes
+  namespace: argocd
+spec:
+  goTemplate: true
+  generators:
+    - git:
+        repoURL: ssh://git@github.com/YOUR-NAME/k8s-lab.git
+        revision: main
+        files:
+          - path: gitops/sites.yaml
+  template:
+    metadata:
+      name: 'notes-{{ .name }}'
+      namespace: argocd
+      labels:
+        app.kubernetes.io/part-of: notes
+      finalizers:
+        - resources-finalizer.argocd.argoproj.io
+    spec:
+      project: notes
+      source:
+        repoURL: ssh://git@github.com/YOUR-NAME/k8s-lab.git
+        targetRevision: main
+        path: gitops/charts/notes-site
+        helm:
+          releaseName: notes
+          # toJson: values safely as YAML (special characters in the title).
+          values: |
+            site:
+              name: {{ .name | toJson }}
+              host: {{ .host | toJson }}
+              repo: {{ .repo | toJson }}
+              repoEgressCidrs: {{ dig "repo_egress_cidrs" (list) . | toJson }}
+              branch: {{ .branch | default "main" | toJson }}
+              title: {{ .title | default .name | toJson }}
+              privateFilter: {{ .private_filter | default false | toJson }}
+              {{- if .auth }}
+              auth: {{ .auth | toJson }}
+              {{- end }}
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: 'notes-{{ .name }}'
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        # Fresh server: namespace (Ansible), CRDs (traefik, cert-manager)
+        # are missing at first. Try again with backoff (like docs).
+        retry:
+          limit: 10
+          backoff:
+            duration: 10s
+            factor: 2
+            maxDuration: 3m

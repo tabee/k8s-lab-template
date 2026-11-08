@@ -1,0 +1,38 @@
+---
+# Child application of the root app (app of apps): Argo CD syncs
+# gitops/workloads/docs (docs site https://docs.lab.example) into the cluster.
+# repoURL, targetRevision and project must match
+# ansible/inventory/group_vars/all/argocd.yml.
+# Namespace docs and the repo secret are created by Ansible (role docs_site), not
+# this app. Runbook: docs/how-to/docs-site.md
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: docs
+  namespace: argocd
+  # Deleting this file also cleans up the docs objects in the cluster
+  # (namespace and secret stay, they belong to Ansible).
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: lab
+  source:
+    repoURL: ssh://git@github.com/YOUR-NAME/k8s-lab.git
+    targetRevision: main
+    path: gitops/workloads/docs
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: docs
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    # On a fresh server the namespace (Ansible, role
+    # docs_site), the CRDs (apps traefik, cert-manager) and the project target are missing at first:
+    # on failure try again with backoff (same as argocd-ingress).
+    retry:
+      limit: 10
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 3m

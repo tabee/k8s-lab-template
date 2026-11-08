@@ -1,0 +1,34 @@
+---
+# PSA proof (server dry run, nothing is created): the API server must reject a privileged pod in every
+# namespace of verify_psa_namespaces. Include from a play that sets module_defaults for kubernetes.core.k8s
+# with the kubeconfig. A missing namespace or an unlabelled one is red, too.
+# ignore_errors, not failed_when: false: the assert reads failed and msg of the result, and on ansible-core
+# 2.19+ failed_when resets both. The "...ignoring" line in the output is expected.
+- name: Send PSA probe via server dry run
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Pod
+      metadata:
+        name: psa-probe
+        namespace: "{{ item }}"
+      spec:
+        containers:
+          - name: probe
+            image: "{{ lab_probe_image }}"
+            securityContext:
+              privileged: true
+  check_mode: true
+  register: verify_psa_probe
+  ignore_errors: true
+  loop: "{{ verify_psa_namespaces }}"
+
+- name: PSA rejects insecure pods in the namespaces
+  ansible.builtin.assert:
+    that: item.failed | default(false) and item.msg | default('') is search('violates PodSecurity')
+    fail_msg: "Namespace {{ item.item }}: test pod was NOT rejected by PSA ({{ item.msg | default('no error') | truncate(200) }})"
+    quiet: true
+  loop: "{{ verify_psa_probe.results }}"
+  loop_control:
+    label: "{{ item.item }}"

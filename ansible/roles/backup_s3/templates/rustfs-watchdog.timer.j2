@@ -1,0 +1,16 @@
+# {{ ansible_managed }}
+# Stage 8a: cadence of the rustfs watchdog (systemd --user, linger).
+# Source: ansible/roles/backup_s3/templates/rustfs-watchdog.timer.j2,
+# Values: ansible/inventory/group_vars/all/backup_s3.yml (backup_s3_watchdog_*).
+
+[Unit]
+Description=rustfs watchdog every {{ backup_s3_watchdog_interval }} s
+
+[Timer]
+# First check after the grace period, then at a fixed interval after the last run.
+OnBootSec={{ backup_s3_watchdog_grace }}s
+OnUnitActiveSec={{ backup_s3_watchdog_interval }}s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

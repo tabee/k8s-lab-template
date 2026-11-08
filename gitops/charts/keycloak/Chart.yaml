@@ -1,0 +1,13 @@
+---
+# Local chart for the realm of the lab Keycloak. Only the realm definition
+# (realm, groups, client scope, clients) is templated here, because the
+# redirect URIs follow the lab domain. Everything else is a raw manifest
+# under gitops/workloads/keycloak/manifests so image pins, the certificate and
+# the LimitRange stay visible to the existing checks. Not published to a
+# chart registry.
+# Runbook: docs/how-to/keycloak.md, decision: ADR-0019
+apiVersion: v2
+name: keycloak
+description: Realm "lab" of the lab Keycloak (OIDC for Gitea and Synapse)
+type: application
+version: 0.1.0

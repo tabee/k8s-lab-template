@@ -1,0 +1,66 @@
+---
+# Database for Gitea: own CNPG cluster gitea-db (stage 8c).
+# Own cluster instead of a database in pg-lab: pg-lab is the
+# playground (failover drill, disaster rebuild), Gitea should notice nothing
+# of it. And restore/PITR always works only for a whole cluster.
+#
+# 2 instances (primary + 1 replica): failover in ~30 s, small enough for
+# the VM (8 GiB). 3 would be more protection, but on one node no real
+# gain (if the node fails, all are gone).
+#
+# Image: same version and same digest as pg-lab, deliberately as an
+# own copy: this way each cluster can be updated individually (first
+# practice on pg-lab, then gitea-db).
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: gitea-db
+  namespace: gitea
+spec:
+  instances: 2
+  # yamllint disable-line rule:line-length
+  imageName: ghcr.io/cloudnative-pg/postgresql:18.6-minimal-trixie@sha256:64abc98a4387361afd6821a3a99f975763bbd87bbdde9449e75ad6002528a318
+  # No superuser login from outside; Gitea only needs its owner.
+  enableSuperuserAccess: false
+  bootstrap:
+    initdb:
+      # ONLY place for database and user name. Block B reads the
+      # owner from here and creates the secret gitea-db-owner with it;
+      # values-gitea.yaml takes the user from this secret.
+      database: gitea
+      owner: gitea
+      # Password from KSOPS (secrets/gitea/gitea-db-owner.sops.yaml), not
+      # created by the operator: this way it stays after a rebuild from the
+      # backup (bootstrap.recovery with the same secret) equal.
+      secret:
+        name: gitea-db-owner
+  storage:
+    size: 2Gi
+  affinity:
+    # One node in the lab: only "prefer to spread", do not enforce.
+    podAntiAffinityType: preferred
+  resources:
+    requests:
+      cpu: 50m
+      memory: 256Mi
+    limits:
+      memory: 256Mi  # lab-limit: gitea/gitea-db/postgres
+  postgresql:
+    parameters:
+      shared_buffers: 64MB
+      max_connections: "50"
+  # WAL archive and base backups via the Barman cloud plugin (objectstore.yaml).
+  plugins:
+    - name: barman-cloud.cloudnative-pg.io
+      # Default value of the CRD (plugins[].enabled), set explicitly: otherwise
+      # it is in the cluster, not in Git, and Argo CD (lists of CRDs
+      # are compared as a whole) permanently shows OutOfSync.
+      # See docs/how-to/troubleshooting.md, Fehlerbild Argo-OutOfSync.
+      enabled: true
+      isWALArchiver: true
+      parameters:
+        barmanObjectName: gitea-db
+        # Folder in the bucket: s3://cnpg-k3s-lab/gitea/gitea-db. After a
+        # disaster rebuild take a new name (e.g. gitea-db-2),
+        # otherwise the plugin refuses to archive (folder not empty).
+        serverName: gitea-db

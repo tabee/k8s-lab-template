@@ -1,0 +1,55 @@
+---
+# Collect names, delete legacy entries, write block. All idempotent.
+# Reading only in the repo (certificates, values, notebooks), only the hosts
+# file is written (sudo).
+
+- name: Find certificate files of the services (gitops/workloads/*/certificate.yaml)
+  ansible.builtin.find:
+    paths: "{{ lab_hosts_workloads_dir }}"
+    patterns: "{{ lab_hosts_cert_file }}"
+    recurse: true
+  register: lab_hosts_certs
+
+- name: Read Gitea name from the values (gitea.config.server.DOMAIN)
+  ansible.builtin.set_fact:
+    lab_hosts_gitea_name: "{{ (lookup('ansible.builtin.file', lab_hosts_gitea_values_file) | from_yaml).gitea.config.server.DOMAIN }}"
+
+- name: Collect names from certificates, Gitea values and notebooks
+  ansible.builtin.set_fact:
+    lab_hosts_names: >-
+      {{ ([lab_hosts_gitea_name] | union(lab_hosts_cert_names) | union(lab_hosts_site_names))
+         | select('match', '^[a-z0-9-]+[.]' ~ (lab_hosts_domain | regex_escape) ~ '$') | unique | sort }}
+  vars:
+    lab_hosts_cert_files: "{{ lab_hosts_certs.files | map(attribute='path') | sort }}"
+    lab_hosts_cert_names: >-
+      {{ query('ansible.builtin.file', *lab_hosts_cert_files) | map('from_yaml') | map(attribute='spec.dnsNames') | flatten | list }}
+    lab_hosts_site_names: >-
+      {{ lookup('ansible.builtin.file', lab_hosts_sites_file) | from_yaml | default([], true) | map(attribute='host') | list }}
+
+# A line with at least two names: this way the legacy rule below
+# (exactly one name per line) never hits the own block.
+- name: Check names (at least two, the Gitea name is included)
+  ansible.builtin.assert:
+    that:
+      - lab_hosts_names | length >= 2
+      - lab_hosts_gitea_name in lab_hosts_names
+    fail_msg: "Too few names or Gitea missing: {{ lab_hosts_names }}"
+    success_msg: "{{ lab_hosts_names | length }} names for {{ lab_hosts_ip }}: {{ lab_hosts_names | join(' ') }}"
+
+- name: Delete legacy entries outside the block (minikube, manual lines)
+  ansible.builtin.lineinfile:
+    path: "{{ lab_hosts_file }}"
+    regexp: "{{ item }}"
+    state: absent
+  loop: "{{ lab_hosts_stale_regexps }}"
+  become: true
+
+- name: Write block with the lab names
+  ansible.builtin.blockinfile:
+    path: "{{ lab_hosts_file }}"
+    marker: "{{ lab_hosts_marker }}"
+    block: "{{ lab_hosts_ip }} {{ lab_hosts_names | join(' ') }}"
+    owner: root
+    group: root
+    mode: "0644"
+  become: true

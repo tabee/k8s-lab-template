@@ -1,0 +1,55 @@
+---
+# Protection against wrong names: lab-ca only issues certificates for names under the lab domain.
+# The CA itself carries critical nameConstraints (docs/concepts/certificates.md, section
+# "Namenseinschraenkung der Lab-CA"); but only the clients check those. cert-manager itself
+# also signs names outside. This policy rejects such Certificate objects at the
+# API server before cert-manager sees them. It applies only to Certificates with
+# issuerRef.name lab-ca (matchConditions): nothing else in the cluster is touched.
+# Not covered: a hand-made CertificateRequest (only the client protection applies there).
+# Domain: "bash scripts/lab.sh customize" sets it with all the other occurrences.
+# Switch off without a Git change: kubectl delete validatingadmissionpolicybinding lab-ca-lab-domain-only
+# (Argo CD restores it via selfHeal; permanently: delete both files here).
+# The AppProject platform must allow both kinds (argocd_platform_cluster_resources).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: lab-ca-lab-domain-only
+  annotations:
+    # Like the ClusterIssuer lab-ca: after the chart (wave 0). ValidatingAdmissionPolicy is GA since Kubernetes 1.30.
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["cert-manager.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["certificates"]
+  matchConditions:
+    - name: lab-ca-only
+      expression: "object.spec.issuerRef.name == 'lab-ca'"
+  variables:
+    - name: zone
+      expression: "'lab.example'"
+    - name: names
+      expression: >-
+        (has(object.spec.dnsNames) ? object.spec.dnsNames : []) +
+        ((has(object.spec.commonName) && object.spec.commonName != '') ? [object.spec.commonName] : [])
+  validations:
+    - expression: "variables.names.all(n, n == variables.zone || n.endsWith('.' + variables.zone))"
+      messageExpression: "'lab-ca only issues names under ' + variables.zone + ' (nameConstraints of the lab CA)'"
+    - expression: >-
+        (has(object.spec.ipAddresses) ? size(object.spec.ipAddresses) : 0) +
+        (has(object.spec.uris) ? size(object.spec.uris) : 0) +
+        (has(object.spec.emailAddresses) ? size(object.spec.emailAddresses) : 0) == 0
+      message: "lab-ca issues no certificates for IP addresses, URIs or email addresses"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: lab-ca-lab-domain-only
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  policyName: lab-ca-lab-domain-only
+  validationActions: ["Deny"]

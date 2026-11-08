@@ -1,0 +1,55 @@
+---
+# Sysctl: k3s values (base_sysctl) and hardening (base_sysctl_hardening), each in
+# its own file under /etc/sysctl.d (names in group_vars).
+# The files are called 99-zz-*, so that they are read last at boot
+# (systemd-sysctl: all sysctl.d directories sorted by file name,
+# last value wins). Earlier 80-hardening.conf and 90-k8s.conf: they
+# lost against /usr/lib/sysctl.d/99-protect-links.conf (fifos=1).
+# Each key appears exactly once: the hardening must not set k3s values
+# (protect-kernel-defaults, ip_forward=1) twice.
+# sysctl_set: true sets the values immediately, not only at the next boot.
+# Boot state check: ansible-playbook verify.yml --tags sysctl
+
+- name: Sysctl values and files are unique
+  ansible.builtin.assert:
+    that:
+      - base_sysctl_hardening.keys() | intersect(base_sysctl.keys()) | length == 0
+      - "'net.ipv4.ip_forward' not in base_sysctl_hardening"
+      - "'net.ipv4.conf.all.route_localnet' not in base_sysctl_hardening"
+      - base_sysctl_file != base_sysctl_hardening_file
+      - base_sysctl_file not in base_sysctl_old_files
+      - base_sysctl_hardening_file not in base_sysctl_old_files
+    fail_msg: >-
+      Duplicate keys: {{ base_sysctl_hardening.keys() | intersect(base_sysctl.keys()) }},
+      or file names equal or in base_sysctl_old_files
+    quiet: true
+
+- name: Set sysctl values for Kubernetes
+  ansible.posix.sysctl:
+    name: "{{ item.key }}"
+    value: "{{ item.value }}"
+    sysctl_file: "{{ base_sysctl_file }}"
+    state: present
+    sysctl_set: true
+  loop: "{{ base_sysctl | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}={{ item.value }}"
+
+- name: Set sysctl hardening
+  ansible.posix.sysctl:
+    name: "{{ item.key }}"
+    value: "{{ item.value }}"
+    sysctl_file: "{{ base_sysctl_hardening_file }}"
+    state: present
+    sysctl_set: true
+  loop: "{{ base_sysctl_hardening | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}={{ item.value }}"
+
+# Only after writing the new files (the values then exist twice,
+# never missing). The runtime values do not change because of this.
+- name: Remove earlier sysctl files
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop: "{{ base_sysctl_old_files }}"

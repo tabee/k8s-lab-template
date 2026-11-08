@@ -1,0 +1,82 @@
+---
+# Default values. The values under site are set by the ApplicationSet
+# (gitops/apps/notes.yaml) from the entry in gitops/sites.yaml.
+site:
+  # Short name, namespace is notes-<name>.
+  name: ""
+  # Address (certificate, IngressRoute, site_url).
+  host: ""
+  # Notes repo (SSH, deploy key from the secret, see secrets).
+  repo: ""
+  # Content-host IPv4 CIDRs from gitops/sites.yaml, independent of source: github/gitea.
+  # Required for a different host/port; the SSH port is derived from site.repo.
+  repoEgressCidrs: []
+  branch: main
+  # Title only for repos without their own zensical.toml.
+  title: ""
+  # true: leave out notes with "share: private" in the front matter.
+  privateFilter: false
+  # Login: sso (Keycloak, oauth2-proxy in front of the site) or basic (Traefik
+  # Basic Auth, break-glass without Keycloak). Set by gitops/sites.yaml (field auth).
+  auth: sso
+
+# Single sign-on (auth: sso): one oauth2-proxy per site in the site namespace. The
+# login page is the public Keycloak address, the back channel (token, keys) uses the
+# in-cluster Service. host + realm must match gitops/charts/keycloak (tests/keycloak-tests.sh
+# compares them); client, group and port the Keycloak realm (client "notes", group lab-users).
+sso:
+  host: sso.lab.example
+  realm: lab
+  client: notes
+  group: lab-users
+  keycloakUrl: http://keycloak.keycloak.svc:8080
+  # Session cookie: lifetime = Keycloak session maximum (ssoSessionMaxLifespan 36000 s);
+  # refresh below the access token lifetime (300 s): a logged-out or disabled user, or one
+  # removed from the group, loses access after that time at the latest.
+  cookieExpire: 10h
+  cookieRefresh: 4m
+
+# Interval of the Git polls in seconds = maximum delay after git push.
+pollSeconds: 60
+
+# Same images as the docs site (gitops/workloads/docs/deployment.yaml).
+images:
+  builder: docker.io/library/python:3.13.17-trixie@sha256:d5a186865324088bd10d1671801b42297a8fe3f8059143fb22b2e2b776ffa6dd
+  web: docker.io/joseluisq/static-web-server:2.44.1@sha256:94618e3d17802265a21926217e6f9e7832b311b6fbf5933684001739fafed06a
+  # Only with auth: sso. Pin: docs/reference/versions.md.
+  proxy: quay.io/oauth2-proxy/oauth2-proxy:v7.15.5@sha256:8498b0d0ef0a7b29686414000a08aee467f02d0299c9ed1e006a8f33fc017916
+
+# Secrets are created by Ansible (role notes_sites, same names in
+# ansible/inventory/group_vars/all/notes.yml), not Argo CD: this way
+# key and password never end up in Git.
+secrets:
+  # Type ssh-auth: ssh-privatekey (deploy key, read-only) and known_hosts.
+  repo: notes-repo
+  # Type kubernetes.io/basic-auth: username and password (Traefik BasicAuth). Only with auth: basic.
+  auth: notes-auth
+  # Only with auth: sso: client-secret (same value as in Keycloak) and cookie-secret (32 characters).
+  oidc: notes-oidc
+
+clusterIssuer: lab-ca
+
+# Egress (wave 2, issue 5): the builder may reach the k8s-lab source, the cluster DNS
+# and HTTPS on the public internet. scripts/repo-egress.py writes only the two source
+# blocks below. Content-host access comes separately from site.repoEgressCidrs and
+# the SSH port of site.repo; switching the k8s-lab source cannot replace that allowance.
+egress:
+  repoTo:
+    # lab-egress:repo-cidrs BEGIN
+    - ipBlock:
+        cidr: 203.0.113.10/32
+    # lab-egress:repo-cidrs END
+  # lab-egress:repo-port BEGIN
+  repoPort: 22
+  # lab-egress:repo-port END
+  # HTTPS to the public internet (PyPI, plugin clone): everything except these private ranges.
+  publicExcept:
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+    - 169.254.0.0/16
+    - 100.64.0.0/10
+    - 127.0.0.0/8

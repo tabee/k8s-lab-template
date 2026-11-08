@@ -1,0 +1,28 @@
+---
+# TLS certificate from the lab CA, same as docs (90 days, renewal 30
+# days before, ECDSA P-256, new key on every renewal).
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: notes
+  labels:
+    {{- include "notes.labels" . | nindent 4 }}
+  annotations:
+    {{- include "notes.crdAnnotation" . | nindent 4 }}
+spec:
+  secretName: notes-tls
+  dnsNames:
+    - {{ .Values.site.host | quote }}
+  duration: 2160h
+  renewBefore: 720h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  usages:
+    - digital signature
+    - server auth
+  issuerRef:
+    group: cert-manager.io
+    kind: ClusterIssuer
+    name: {{ .Values.clusterIssuer }}

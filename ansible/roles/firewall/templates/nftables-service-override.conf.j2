@@ -1,0 +1,7 @@
+# {{ ansible_managed }}
+# Ubuntu default: ExecStop=/usr/sbin/nft flush ruleset. That would also delete all
+# k3s rules when stopping or restarting the service.
+# Replaced by: remove only the own table.
+[Service]
+ExecStop=
+ExecStop=-/usr/sbin/nft delete table inet host_filter

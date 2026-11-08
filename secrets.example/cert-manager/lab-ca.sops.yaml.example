@@ -1,0 +1,20 @@
+# Template for lab-ca.sops.yaml: structure without real values.
+# lab.sh init fills the placeholders from files on your machine and encrypts immediately
+# to secrets/cert-manager/lab-ca.sops.yaml. Placeholders: @file:NAME, @env:NAME:KEY, @ca:NAME:KEY
+# (NAME = entry in ansible/inventory/group_vars/all/secrets.yml).
+# A value without @ is fixed text.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: lab-ca
+  namespace: cert-manager
+  labels:
+    app.kubernetes.io/managed-by: argocd
+    app.kubernetes.io/part-of: lab-ca
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+type: kubernetes.io/tls
+stringData:
+  ca.crt: "@ca:lab-ca:ca.crt"
+  tls.crt: "@ca:lab-ca:tls.crt"
+  tls.key: "@ca:lab-ca:tls.key"

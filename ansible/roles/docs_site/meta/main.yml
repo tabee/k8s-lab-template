@@ -1,0 +1,38 @@
+---
+# Role "docs_site": namespace docs (PSA) and repo secret for the builder of the
+# Create docs site. Secret stays with Ansible (docs/learning-path/stage-7-ksops.md).
+galaxy_info:
+  author: k8s-lab
+  description: Create namespace docs and the repo secret of the docs site (localhost, k8s-API)
+  license: MIT
+  min_ansible_version: "2.17"
+  platforms:
+    - name: GenericLinux
+      versions:
+        - all
+dependencies: []
+
+# Required variables; values come from inventory/group_vars/all/docs.yml and
+# (repo, deploy key) from inventory/group_vars/all/argocd.yml.
+# The kubeconfig is set by the playbook (module_defaults in argocd.yml).
+argument_specs:
+  main:
+    short_description: Namespace and repo secret of the docs site (runs on localhost)
+    options:
+      docs_namespace: { type: str, required: true, description: Namespace of the docs site (owned by Ansible) }
+      docs_psa_level:
+        type: str
+        required: true
+        choices: [privileged, baseline, restricted]
+        description: PSA level for the namespace (enforce, audit, warn)
+      docs_psa_version: { type: str, required: true, description: PSA version (latest or v1.x) }
+      docs_repo_secret_name: { type: str, required: true, description: Name des Repo-Secrets im Namespace }
+      argocd_repo_url: { type: str, required: true, description: "Git repo (ssh://), same as Argo CD" }
+      argocd_repo_revision: { type: str, required: true, description: "Branch that the site shows" }
+      argocd_repo_ssh_key_path: { type: str, required: true, description: "Read-only deploy key (mode 0600, checked by argocd_bootstrap)" }
+      argocd_repo_known_hosts:
+        type: list
+        elements: str
+        required: true
+        description: Host keys of the Git server (known_hosts lines)
+      lab_probe_image: { type: str, required: true, description: "Probe image with tag and digest (group_vars/all/images.yml)" }

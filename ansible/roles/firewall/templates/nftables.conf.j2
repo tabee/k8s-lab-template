@@ -1,0 +1,7 @@
+#!/usr/sbin/nft -f
+# {{ ansible_managed }}
+# Deliberately WITHOUT the Ubuntu default (there the first rule is a flush
+# of the whole ruleset). It would also delete the tables of k3s (kube-proxy, flannel)
+# at boot or reload.
+# Every file in /etc/nftables.d manages only its own table.
+include "/etc/nftables.d/*.nft"

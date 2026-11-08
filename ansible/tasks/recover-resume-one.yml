@@ -1,0 +1,11 @@
+---
+- name: Turn Argo CD auto-sync back on
+  kubernetes.core.k8s_json_patch:
+    api_version: argoproj.io/v1alpha1
+    kind: Application
+    namespace: argocd
+    name: "{{ target.app }}"
+    patch:
+      - op: add
+        path: /spec/syncPolicy/automated
+        value: "{{ target.automated }}"

@@ -1,0 +1,29 @@
+---
+# Role backup_s3: rustfs as S3 backup target on the backup host (local).
+# Order: check first, then firewall, only then touch the service.
+# systemctl --user needs XDG_RUNTIME_DIR (also without a desktop session).
+
+- name: Preflight checks (podman, quadlet, ufw active)
+  ansible.builtin.import_tasks: preflight.yml
+
+- name: Firewall (ufw) for the S3 port
+  ansible.builtin.import_tasks: ufw.yml
+
+- name: Directories and key files
+  ansible.builtin.import_tasks: files.yml
+
+- name: Scripts and watchdog (waiting for the route, external check)
+  ansible.builtin.import_tasks: watchdog.yml
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ ansible_facts['user_uid'] }}"
+
+- name: Quadlet, linger and service
+  ansible.builtin.import_tasks: quadlet.yml
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ ansible_facts['user_uid'] }}"
+
+- name: Bucket, policy and user for CNPG and K8up
+  ansible.builtin.import_tasks: s3.yml
+
+- name: Autostart of the VM (power outage)
+  ansible.builtin.import_tasks: vm_autostart.yml

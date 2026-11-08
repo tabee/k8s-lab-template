@@ -1,0 +1,14 @@
+---
+# Issue #8: alerts when a backup or the edge fails. Usage in the directory ansible/:
+#   ansible-playbook backup-alert.yml            (or: bash scripts/lab.sh alert install)
+# Installs lab-alert.py, its config (from group_vars/all/alert.yml) and a systemd user timer on the owner's PC.
+# The Matrix sink stays off until Synapse exists (stage 9): backup_alert_matrix_enabled in group_vars/all/alert.yml.
+# Runbook: docs/how-to/alerts.md. Check afterwards: ansible-playbook verify-alerts.yml
+
+- name: Alerts (owner's PC)
+  hosts: backup_host
+  gather_facts: true
+  gather_subset: [min]
+  roles:
+    - role: backup_alert
+      when: backup_alert_enabled | bool

@@ -1,0 +1,157 @@
+---
+# Only Traefik may reach the pod (port 8080), same as docs. Outgoing (wave 2,
+# Issue 5): see notes-allow-egress below.
+# auth: sso: Traefik reaches the proxy (port 4180) and only the proxy reaches
+# the pod (port 8080); nobody gets past the login on a side path.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: notes-allow-traefik
+  labels:
+    {{- include "notes.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- if include "notes.sso" . }}
+      {{- include "notes.proxySelector" . | nindent 6 }}
+      {{- else }}
+      {{- include "notes.selector" . | nindent 6 }}
+      {{- end }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: traefik
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: traefik
+      ports:
+        - protocol: TCP
+          port: {{ ternary 4180 8080 (not (empty (include "notes.sso" .))) }}
+{{- if include "notes.sso" . }}
+---
+# Only the login proxy of the same site reaches the notes pod.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: notes-allow-proxy
+  labels:
+    {{- include "notes.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "notes.selector" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "notes.proxySelector" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+# Egress of the proxy: DNS, the pod of its own site (upstream) and Keycloak (token, keys,
+# logout; plain HTTP, port 8080). Nothing else: no internet, no other namespace. The matching
+# ingress rule in the namespace keycloak: keycloak-allow-notes-proxy
+# (gitops/workloads/keycloak/manifests/networkpolicy.yaml).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: notes-oauth2-proxy-allow-egress
+  labels:
+    {{- include "notes.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "notes.proxySelector" . | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "notes.selector" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 8080
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: keycloak
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: keycloak
+      ports:
+        - protocol: TCP
+          port: 8080
+{{- end }}
+---
+# Egress (wave 2, issue 5), same as docs-allow-egress: DNS, Git over SSH to the pinned git server, HTTPS to
+# the public internet. No node, no API server, no S3, no other pod.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: notes-allow-egress
+  labels:
+    {{- include "notes.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "notes.selector" . | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- if .Values.site.repoEgressCidrs }}
+    # Content repository only: pinned site-specific addresses and its own SSH port.
+    - to:
+        {{- range .Values.site.repoEgressCidrs }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ include "notes.contentPort" . }}
+    {{- end }}
+    - to:
+        {{- toYaml .Values.egress.repoTo | nindent 8 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.egress.repoPort }}
+        - protocol: TCP
+          port: 443
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              {{- toYaml .Values.egress.publicExcept | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 443

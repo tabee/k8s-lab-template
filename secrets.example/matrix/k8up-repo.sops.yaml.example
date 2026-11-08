@@ -1,0 +1,15 @@
+# Template for k8up-repo.sops.yaml: structure without real values.
+# Same restic password as the Gitea file backups. The repository itself is a
+# different prefix (k8up-k3s-lab/matrix), so prune cannot delete the other one.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: k8up-repo
+  namespace: matrix
+  labels:
+    app.kubernetes.io/managed-by: argocd
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+type: Opaque
+stringData:
+  password: "@file:k8up-repo-pw"

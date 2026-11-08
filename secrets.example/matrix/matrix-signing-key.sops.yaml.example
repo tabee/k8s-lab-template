@@ -1,0 +1,17 @@
+# Template for matrix-signing-key.sops.yaml: structure without real values.
+# Optional. One line, the raw Synapse signing key (ed25519 id base64).
+# A missing or empty file is encrypted as an empty value. The entrypoint
+# then generates the key on the volume at first start. K8up backs that file up.
+# If the secret and the volume both hold a key and they differ, the pod stops.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: matrix-signing-key
+  namespace: matrix
+  labels:
+    app.kubernetes.io/managed-by: argocd
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+type: Opaque
+stringData:
+  signing.key: "@optional:matrix-signing-key"

@@ -1,0 +1,24 @@
+---
+- name: Update apt cache and upgrade system
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: "{{ base_apt_cache_valid_time }}"
+    upgrade: "{{ base_apt_upgrade }}"
+
+- name: Install base packages
+  ansible.builtin.apt:
+    name: "{{ base_packages }}"
+    state: present
+
+- name: Check whether a reboot is needed
+  ansible.builtin.stat:
+    path: /var/run/reboot-required
+  register: base_reboot_required
+
+- name: Reboot after upgrade
+  ansible.builtin.reboot:
+    msg: "Reboot by Ansible (base) after package upgrade"
+    reboot_timeout: 600
+  when:
+    - base_reboot_if_required
+    - base_reboot_required.stat.exists

@@ -1,0 +1,78 @@
+---
+# Docs site: namespace with PSA and repo secret for the builder container.
+# The content of the secret never appears in the output: no_log and diff: false.
+
+# The namespace belongs to Ansible, not Argo CD: the repo secret must exist before the
+# first pod and must survive the deletion of the application
+# (same pattern as cert-manager in the role lab_ca).
+- name: Create namespace with PSA labels
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ docs_namespace }}"
+        labels:
+          pod-security.kubernetes.io/enforce: "{{ docs_psa_level }}"
+          pod-security.kubernetes.io/enforce-version: "{{ docs_psa_version }}"
+          pod-security.kubernetes.io/audit: "{{ docs_psa_level }}"
+          pod-security.kubernetes.io/audit-version: "{{ docs_psa_version }}"
+          pod-security.kubernetes.io/warn: "{{ docs_psa_level }}"
+          pod-security.kubernetes.io/warn-version: "{{ docs_psa_version }}"
+  register: docs_site_namespace_result
+
+# PSA proof as in lab_ca: insecure test pod only via server dry run
+# (check_mode: true, nothing is created).
+- name: Send PSA probe via server dry run
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Pod
+      metadata:
+        name: psa-probe
+        namespace: "{{ docs_namespace }}"
+      spec:
+        containers:
+          - name: probe
+            image: "{{ lab_probe_image }}"
+            securityContext:
+              privileged: true
+  check_mode: true
+  register: docs_site_psa_probe
+  ignore_errors: true  # the assert reads failed and msg; failed_when: false resets them (ansible-core 2.19+)
+  when: not (ansible_check_mode and docs_site_namespace_result is changed)
+
+- name: PSA rejects insecure pods in the namespace
+  ansible.builtin.assert:
+    that: docs_site_psa_probe.msg | default('') is search('violates PodSecurity')
+    fail_msg: "Namespace {{ docs_namespace }}: test pod was NOT rejected by PSA"
+    quiet: true
+  when: not (ansible_check_mode and docs_site_namespace_result is changed)
+
+# The same read-only deploy key as the repo secret of Argo CD
+# (argocd_bootstrap checks file and mode 0600 in the preflight). Plus URL,
+# branch and known_hosts: this way every value is only in group_vars/all/argocd.yml.
+- name: Create repo secret for the builder
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      type: kubernetes.io/ssh-auth
+      metadata:
+        name: "{{ docs_repo_secret_name }}"
+        namespace: "{{ docs_namespace }}"
+        labels:
+          app.kubernetes.io/managed-by: ansible
+          app.kubernetes.io/part-of: docs
+      data:
+        ssh-privatekey: "{{ lookup('ansible.builtin.file', argocd_repo_ssh_key_path | expanduser, rstrip=false) | b64encode }}"
+        known_hosts: "{{ (argocd_repo_known_hosts | join('\n') ~ '\n') | b64encode }}"
+        url: "{{ argocd_repo_url | b64encode }}"
+        revision: "{{ argocd_repo_revision | b64encode }}"
+  no_log: true
+  diff: false
+  # In check mode the namespace is only "simulated" on the first run.
+  when: not (ansible_check_mode and docs_site_namespace_result is changed)

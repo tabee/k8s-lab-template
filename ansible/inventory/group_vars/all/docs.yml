@@ -1,0 +1,17 @@
+---
+# Values for the sidequest docs site: role "docs_site" (playbook argocd.yml,
+# runs on localhost). Every value is defined only here; the role has no
+# defaults/. No secrets. Repo URL, branch, deploy key and known_hosts come
+# from group_vars/all/argocd.yml (same, read-only deploy key as Argo CD).
+# Repo secret stays with Ansible (stage 7): same key as Argo CD, one
+# source (docs/learning-path/stage-7-ksops.md, section "Was bleibt bei Ansible").
+# Runbook: docs/how-to/docs-site.md
+
+# Namespace of the docs site. Owned by Ansible (PSA labels, repo secret); the
+# Application docs (gitops/apps/docs.yaml) does not create it. Also in
+# argocd_project_namespaces (project lab).
+docs_namespace: docs
+docs_psa_level: restricted
+docs_psa_version: latest
+# Must match secretName/secretKeyRef in gitops/workloads/docs/deployment.yaml.
+docs_repo_secret_name: docs-repo

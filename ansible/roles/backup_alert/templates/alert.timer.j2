@@ -1,0 +1,15 @@
+# {{ ansible_managed }}
+# Issue #8: cadence of the alert checks (systemd --user, linger).
+# Source: ansible/roles/backup_alert/templates/alert.timer.j2
+# Values: ansible/inventory/group_vars/all/alert.yml (backup_alert_interval_min, backup_alert_boot_delay_min).
+
+[Unit]
+Description=Alert checks every {{ backup_alert_interval_min }} min
+
+[Timer]
+OnBootSec={{ backup_alert_boot_delay_min }}min
+OnUnitActiveSec={{ backup_alert_interval_min }}min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

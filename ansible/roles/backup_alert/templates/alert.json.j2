@@ -1,0 +1,47 @@
+{{ {
+  "state_file": backup_alert_state_file,
+  "sinks": backup_alert_sinks,
+  "fallback_sinks": backup_alert_fallback_sinks,
+  "repeat_hours": backup_alert_repeat_hours,
+  "maintenance_file": backup_alert_maintenance_file,
+  "maintenance_max_hours": backup_alert_maintenance_max_hours,
+  "http_timeout": backup_alert_http_timeout,
+  "kubectl_bin": backup_alert_kubectl_bin,
+  "kubectl_timeout": backup_alert_kubectl_timeout,
+  "kubeconfig": backup_alert_kubeconfig,
+  "cnpg": {"clusters": backup_alert_cnpg_clusters, "max_age_hours": backup_alert_cnpg_max_age_hours},
+  "k8up": {"namespaces": backup_alert_k8up_namespaces, "max_age_hours": backup_alert_k8up_max_age_hours},
+  "rustfs_url": backup_alert_rustfs_url,
+  "replica": {
+    "enabled": backup_replica_enabled,
+    "argv": [ansible_playbook_python, backup_replica_script, "status", "--json", "--config", backup_replica_config],
+    "timeout": backup_replica_io_timeout
+  },
+  "edge": {
+    "enabled": backup_alert_edge_enabled,
+    "ip": backup_alert_edge_ip,
+    "port": backup_alert_edge_port | int,
+    "host": backup_alert_edge_host,
+    "ca_file": backup_alert_edge_ca_file,
+    "expect": backup_alert_edge_expect
+  },
+  "heartbeat": {
+    "enabled": backup_alert_heartbeat_enabled,
+    "url_file": alert_heartbeat_url_file,
+    "ping_url_key": backup_alert_heartbeat_ping_url_key,
+    "fail_url_key": backup_alert_heartbeat_fail_url_key,
+    "sops_bin": backup_alert_sops_bin,
+    "age_key_file": backup_alert_age_key_file
+  },
+  "matrix": {
+    "enabled": backup_alert_matrix_enabled,
+    "homeserver": backup_alert_matrix_homeserver,
+    "room_id": backup_alert_matrix_room_id,
+    "token_file": alert_matrix_token_file,
+    "token_key": backup_alert_matrix_token_key,
+    "sops_bin": backup_alert_sops_bin,
+    "age_key_file": backup_alert_age_key_file
+  },
+  "desktop": {"bin": backup_alert_desktop_bin},
+  "exec_argv": backup_alert_exec_argv
+} | to_nice_json }}

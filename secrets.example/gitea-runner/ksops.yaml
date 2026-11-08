@@ -1,0 +1,14 @@
+---
+# KSOPS generator: decrypts the listed files when rendering (repo-server, age key from stage 7).
+# The *.sops.yaml file is rendered by "bash scripts/lab.sh init" from the *.example next to it (issue #115).
+apiVersion: viaduct.ai/v1
+kind: ksops
+metadata:
+  name: secrets-gitea-runner
+  annotations:
+    config.kubernetes.io/function: |
+      exec:
+        path: ksops
+files:
+  # Global registration token of the runner (key token), same value as gitea/gitea-runner-token.
+  - ./gitea-runner-registration.sops.yaml

@@ -1,0 +1,55 @@
+---
+# Child application of the root app (app of apps): cert-manager issues
+# TLS certificates from the lab CA (ClusterIssuer lab-ca).
+# Source 1: Helm chart cert-manager from the OCI registry of Jetstack
+#           (recommended by the vendor; version pinned here, the only place).
+# Source 2: this repo, provides values.yaml ($values) and the own
+#           objects under gitops/platform/cert-manager/manifests.
+# Project platform (source of truth: ansible/inventory/group_vars/all/argocd.yml,
+# argocd_platform_*). repoURL (Git and chart), targetRevision and project
+# must match.
+# Namespace cert-manager belongs to Ansible (role lab_ca: PSA labels and
+# CA secret), hence no CreateNamespace and no managedNamespaceMetadata here.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: cert-manager
+  namespace: argocd
+  # Deleting this file cleans up the cert-manager objects. The CRDs
+  # stay (crds.keep -> Delete=false), namespace and CA secret too.
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: platform
+  sources:
+    # OCI source: path "." = chart is in the root directory of the artifact.
+    - repoURL: oci://quay.io/jetstack/charts/cert-manager
+      targetRevision: v1.21.3
+      path: .
+      helm:
+        releaseName: cert-manager
+        valueFiles:
+          - $values/gitops/platform/cert-manager/values.yaml
+    - repoURL: ssh://git@github.com/YOUR-NAME/k8s-lab.git
+      targetRevision: main
+      ref: values
+      # With path Argo CD additionally renders this source as manifests.
+      path: gitops/platform/cert-manager/manifests
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: cert-manager
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      # CRDs are too big for the last-applied annotation of client-side apply.
+      - ServerSideApply=true
+    # Try again if the namespace (Ansible) or traefik is still missing
+    # or the webhook does not answer yet.
+    retry:
+      limit: 5
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 3m

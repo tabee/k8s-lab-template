@@ -1,0 +1,32 @@
+---
+# Disable apport (Ubuntu crash reports) permanently.
+# WHY: apport.service starts at boot AFTER systemd-sysctl and writes
+# fs.suid_dumpable=2 and kernel.core_pattern=|/usr/share/apport/apport.
+# No sysctl.d file helps against that. A server needs no
+# crash reports, and core dumps of setuid programs can contain secrets
+# (hence fs.suid_dumpable=0 in base_sysctl_hardening).
+# HOW: first stop (ExecStop "apport --stop" resets suid_dumpable=0 and
+# core_pattern=core), then disable and mask.
+# Mask instead of purge: ubuntu-server and ubuntu-server-minimal depend
+# on apport, purge would take these metapackages with it. A mask set by
+# hand survives package updates (deb-systemd-helper only lifts
+# its own masks, deb-systemd-invoke does not start a masked unit).
+# Without apport: only mask, this also works for a later installation.
+
+# Without "state" the module only reads the unit status.
+- name: Read status of apport.service
+  ansible.builtin.systemd_service:
+    name: apport.service
+  register: base_apport_unit
+
+- name: Stop and disable apport (resets the core dump values)
+  ansible.builtin.systemd_service:
+    name: apport.service
+    state: stopped
+    enabled: false
+  when: base_apport_unit.status.LoadState | default('not-found') == 'loaded'
+
+- name: Mask apport (never starts again, not even after a package update)
+  ansible.builtin.systemd_service:
+    name: apport.service
+    masked: true

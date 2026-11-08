@@ -1,0 +1,181 @@
+---
+# Docs site in one pod with two containers and a shared emptyDir:
+# - builder: fetches the branch via SSH every 60 s (deploy key from the secret
+#   docs-repo, created by Ansible). On a new commit it builds with docs/build.sh
+#   to /site/next and then swaps /site/next and /site/live atomically
+#   (mv --exchange). Failed build: old version stays online.
+# - web: static-web-server serves /site/live (port 8080, read only).
+# No own image, no registry: images from Docker Hub, pinned.
+# Meets PSA restricted. Runbook: docs/how-to/docs-site.md
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: docs
+  namespace: docs
+  labels:
+    app.kubernetes.io/name: docs
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: docs
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: docs
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        # 65534 (nobody) exists in the Python image; ssh needs an
+        # entry in /etc/passwd.
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        # Empty /site/live, so that the web server starts immediately (it aborts
+        # if its root folder is missing). Not ready until the first build is there.
+        - name: init
+          image: docker.io/library/python:3.13.17-trixie@sha256:d5a186865324088bd10d1671801b42297a8fe3f8059143fb22b2e2b776ffa6dd
+          command: ["mkdir", "-p", "/site/live"]
+          securityContext: &container-security
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 64Mi
+          volumeMounts:
+            - name: site
+              mountPath: /site
+      containers:
+        - name: builder
+          # Pinned (2026-10-22); Debian trixie with git and ssh.
+          image: docker.io/library/python:3.13.17-trixie@sha256:d5a186865324088bd10d1671801b42297a8fe3f8059143fb22b2e2b776ffa6dd
+          command: ["bash", "-c"]
+          args:
+            - |
+              set -u
+              export GIT_SSH_COMMAND="ssh -i /etc/docs-repo/ssh-privatekey -o IdentitiesOnly=yes \
+                -o UserKnownHostsFile=/etc/docs-repo/known_hosts -o StrictHostKeyChecking=yes \
+                -o BatchMode=yes -o ConnectTimeout=20"
+              repo=/tmp/k8s-lab
+              built=""
+              while :; do
+                if { [ -d "$repo/.git" ] || timeout 300 git clone -q --depth 1 --single-branch --branch "$REPO_REVISION" "$REPO_URL" "$repo"; } \
+                  && timeout 300 git -C "$repo" fetch -q --depth 1 origin "$REPO_REVISION" \
+                  && git -C "$repo" reset -q --hard FETCH_HEAD; then
+                  rev=$(git -C "$repo" rev-parse --short=12 HEAD)
+                  if [ "$rev" != "$built" ]; then
+                    echo "$(date -Is) building $rev"
+                    rm -rf /site/next
+                    if timeout 900 bash "$repo/docs/build.sh" /site/next && mv -T --exchange /site/next /site/live; then
+                      rm -rf /site/next
+                      built=$rev
+                      echo "$(date -Is) online: $rev"
+                    else
+                      echo "$(date -Is) ERROR: build $rev failed, old version stays online"
+                    fi
+                  fi
+                else
+                  echo "$(date -Is) ERROR: git fetch failed, trying again later"
+                fi
+                sleep "$POLL_SECONDS"
+              done
+          env:
+            - name: REPO_URL
+              valueFrom:
+                secretKeyRef:
+                  name: docs-repo
+                  key: url
+            - name: REPO_REVISION
+              valueFrom:
+                secretKeyRef:
+                  name: docs-repo
+                  key: revision
+            # Interval of the Git polls = maximum delay after git push.
+            - name: POLL_SECONDS
+              value: "60"
+            # git, pip and tool cache (build.sh) write to /tmp.
+            - name: HOME
+              value: /tmp
+          securityContext: *container-security
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 192Mi  # lab-limit: docs/docs/builder
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: site
+              mountPath: /site
+            - name: repo-key
+              mountPath: /etc/docs-repo
+              readOnly: true
+        - name: web
+          # Pinned (release 2026-10-07); image without shell (scratch).
+          image: docker.io/joseluisq/static-web-server:2.44.1@sha256:94618e3d17802265a21926217e6f9e7832b311b6fbf5933684001739fafed06a
+          env:
+            - name: SERVER_ROOT
+              value: /site/live
+            - name: SERVER_PORT
+              value: "8080"
+            - name: SERVER_HEALTH
+              value: "true"
+            - name: SERVER_LOG_LEVEL
+              value: warn
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          securityContext: *container-security
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 64Mi  # lab-limit: docs/docs/web
+          # Ready only with the first build (404 on / before).
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          volumeMounts:
+            - name: site
+              mountPath: /site
+              readOnly: true
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 1Gi
+        - name: site
+          emptyDir:
+            sizeLimit: 256Mi
+        # Deploy key (read-only) and known_hosts. Group 65534 (fsGroup)
+        # may read; ssh accepts that because the file belongs to root.
+        - name: repo-key
+          secret:
+            secretName: docs-repo
+            defaultMode: 288  # = 0440 octal (r--r-----)
+            items:
+              - key: ssh-privatekey
+                path: ssh-privatekey
+              - key: known_hosts
+                path: known_hosts

@@ -1,0 +1,218 @@
+---
+# One notes site (notes_site = entry from gitops/sites.yaml).
+# Deploy key and password are created once on the control machine and are
+# never overwritten; the secrets in the cluster follow the files.
+
+- name: Validate content host trust independently of the code source
+  ansible.builtin.include_tasks: content-host.yml
+
+- name: "Set values for {{ notes_site.name }}"
+  ansible.builtin.set_fact:
+    notes_sites_ns: "{{ notes_namespace_prefix }}{{ notes_site.name }}"
+    notes_sites_key: "{{ notes_deploy_key_dir | expanduser }}/{{ notes_namespace_prefix }}{{ notes_site.name }}-deploy"
+    notes_sites_pw: "{{ notes_password_dir | expanduser }}/{{ notes_namespace_prefix }}{{ notes_site.name }}.passwort"
+    notes_sites_user: "{{ notes_site.user | default(notes_site.name) }}"
+    notes_sites_auth: "{{ notes_site.auth | default(notes_auth_default) }}"
+    notes_sites_cookie: "{{ notes_cookie_dir | expanduser }}/{{ notes_namespace_prefix }}{{ notes_site.name }}.cookie"
+
+# Namespace belongs to Ansible (like docs): the secrets must exist before the first
+# pod and survive the deletion of the application.
+- name: "Create namespace with PSA labels, {{ notes_sites_ns }}"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ notes_sites_ns }}"
+        labels:
+          app.kubernetes.io/part-of: notes
+          app.kubernetes.io/managed-by: ansible
+          pod-security.kubernetes.io/enforce: "{{ notes_psa_level }}"
+          pod-security.kubernetes.io/enforce-version: "{{ notes_psa_version }}"
+          pod-security.kubernetes.io/audit: "{{ notes_psa_level }}"
+          pod-security.kubernetes.io/audit-version: "{{ notes_psa_version }}"
+          pod-security.kubernetes.io/warn: "{{ notes_psa_level }}"
+          pod-security.kubernetes.io/warn-version: "{{ notes_psa_version }}"
+  register: notes_sites_namespace_result
+
+# PSA proof as in docs_site: insecure test pod only via server dry run.
+- name: "Send PSA probe as server-side dry run: {{ notes_sites_ns }}"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Pod
+      metadata:
+        name: psa-probe
+        namespace: "{{ notes_sites_ns }}"
+      spec:
+        containers:
+          - name: probe
+            image: "{{ lab_probe_image }}"
+            securityContext:
+              privileged: true
+  check_mode: true
+  register: notes_sites_psa_probe
+  ignore_errors: true  # the assert reads failed and msg; failed_when: false resets them (ansible-core 2.19+)
+  when: not (ansible_check_mode and notes_sites_namespace_result is changed)
+
+- name: "PSA rejects insecure pods, {{ notes_sites_ns }}"
+  ansible.builtin.assert:
+    that: notes_sites_psa_probe.msg | default('') is search('violates PodSecurity')
+    fail_msg: "Namespace {{ notes_sites_ns }}: test pod was NOT rejected by PSA"
+    quiet: true
+  when: not (ansible_check_mode and notes_sites_namespace_result is changed)
+
+- name: Folder for deploy key and password (readable only by you)
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0700"
+  loop:
+    - "{{ notes_deploy_key_dir | expanduser }}"
+    - "{{ notes_password_dir | expanduser }}"
+    - "{{ notes_cookie_dir | expanduser }}"
+
+# An existing key, password or cookie key is never replaced (otherwise the key would
+# have to go into Gitea again, or every session would end). Generation is done by
+# scripts/lab-secrets.py (entries <ns>-deploy and <ns>-pw (basic) or <ns>-cookie (sso)
+# from group_vars/all/secrets.yml).
+- name: "Create deploy key and password or cookie key, only what is missing, {{ notes_sites_ns }}"
+  ansible.builtin.include_tasks: "{{ role_path }}/../../tasks/secrets-generate.yml"
+  vars:
+    secret_names:
+      - "{{ notes_sites_ns }}-deploy"
+      - "{{ notes_sites_ns }}-{{ 'pw' if notes_sites_auth == 'basic' else 'cookie' }}"
+
+- name: "Password file has mode 0600, {{ notes_sites_pw | basename }}"
+  ansible.builtin.file:
+    path: "{{ notes_sites_pw }}"
+    mode: "0600"
+  when: not ansible_check_mode and notes_sites_auth == 'basic'
+
+- name: "Cookie key file has mode 0600, {{ notes_sites_cookie | basename }}"
+  ansible.builtin.file:
+    path: "{{ notes_sites_cookie }}"
+    mode: "0600"
+  when: not ansible_check_mode and notes_sites_auth != 'basic'
+
+- name: "Check deploy key: {{ notes_sites_key | basename }}"
+  ansible.builtin.stat:
+    path: "{{ notes_sites_key }}"
+  register: notes_sites_key_stat
+
+# The OIDC client secret is created once by lab.sh init (one client for all sites).
+- name: "Check client secret file: {{ keycloak_notes_client_secret_file | basename }}"
+  ansible.builtin.stat:
+    path: "{{ keycloak_notes_client_secret_file | expanduser }}"
+  register: notes_sites_client_secret_stat
+  when: notes_sites_auth != 'basic'
+
+# In check mode on the first run namespace, key and password do not exist yet.
+- name: "Create secrets for {{ notes_sites_ns }}"
+  when:
+    - notes_sites_key_stat.stat.exists
+    - not (ansible_check_mode and notes_sites_namespace_result is changed)
+  block:
+    # rstrip=false: the key needs the trailing newline.
+    - name: "Repo secret with deploy key and known_hosts: {{ notes_repo_secret_name }}"
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          type: kubernetes.io/ssh-auth
+          metadata:
+            name: "{{ notes_repo_secret_name }}"
+            namespace: "{{ notes_sites_ns }}"
+            labels:
+              app.kubernetes.io/managed-by: ansible
+              app.kubernetes.io/part-of: notes
+          data:
+            ssh-privatekey: "{{ lookup('ansible.builtin.file', notes_sites_key, rstrip=false) | b64encode }}"
+            known_hosts: "{{ (notes_sites_known_hosts | join('\n') ~ '\n') | b64encode }}"
+      no_log: true
+      diff: false
+
+    # auth basic: plaintext in the secret (like every secret only base64); Traefik forms
+    # the hash itself. No htpasswd/passlib needed.
+    - name: "Login secret (user, password), {{ notes_auth_secret_name }}"
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          type: kubernetes.io/basic-auth
+          metadata:
+            name: "{{ notes_auth_secret_name }}"
+            namespace: "{{ notes_sites_ns }}"
+            labels:
+              app.kubernetes.io/managed-by: ansible
+              app.kubernetes.io/part-of: notes
+          data:
+            username: "{{ notes_sites_user | b64encode }}"
+            password: "{{ lookup('ansible.builtin.file', notes_sites_pw) | b64encode }}"
+      no_log: true
+      diff: false
+      when: notes_sites_auth == 'basic'
+
+    # auth sso: client secret (same for all sites, from lab.sh init) and cookie key of the
+    # login proxy. Not via Argo/SOPS: the namespace belongs to Ansible (see above).
+    - name: "OIDC secret (client-secret, cookie-secret), {{ notes_oidc_secret_name }}"
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          type: Opaque
+          metadata:
+            name: "{{ notes_oidc_secret_name }}"
+            namespace: "{{ notes_sites_ns }}"
+            labels:
+              app.kubernetes.io/managed-by: ansible
+              app.kubernetes.io/part-of: notes
+          data:
+            client-secret: "{{ lookup('ansible.builtin.file', keycloak_notes_client_secret_file | expanduser) | trim | b64encode }}"
+            cookie-secret: "{{ lookup('ansible.builtin.file', notes_sites_cookie) | trim | b64encode }}"
+      no_log: true
+      diff: false
+      when:
+        - notes_sites_auth != 'basic'
+        - notes_sites_client_secret_stat.stat.exists
+
+    # Switching a site between sso and basic: the Secret of the other mode is no longer needed
+    # (absent = Ansible removes it, the other way round the Secret above is created).
+    - name: "Remove login secret of the other mode, {{ notes_sites_ns }}"
+      kubernetes.core.k8s:
+        state: absent
+        api_version: v1
+        kind: Secret
+        namespace: "{{ notes_sites_ns }}"
+        name: "{{ notes_auth_secret_name if notes_sites_auth != 'basic' else notes_oidc_secret_name }}"
+
+- name: "Client secret missing for {{ notes_sites_ns }}"
+  ansible.builtin.fail:
+    msg: >-
+      {{ keycloak_notes_client_secret_file }} is missing. Run ./lab.sh init first
+      (creates the secret), then commit the new SOPS files and push, then run this again.
+  when:
+    - notes_sites_auth != 'basic'
+    - not ansible_check_mode
+    - not notes_sites_client_secret_stat.stat.exists
+
+# Only the public key and hints, never the password.
+- name: "Next steps for {{ notes_site.name }}"
+  ansible.builtin.debug:
+    msg:
+      - >-
+        Site https://{{ notes_site.host }}/
+        {{ ('User: ' ~ notes_sites_user) if notes_sites_auth == 'basic'
+        else 'Login: Keycloak (realm lab, group lab-users)' }}
+      - "Enter deploy key in Gitea (once, do NOT tick 'write access'):"
+      - "  {{ notes_site.repo | regex_replace('^ssh://([^@/]+@)?([^:/]+)(:[0-9]+)?/(.*?)(\\.git)?$', 'https://\\2/\\4/settings/keys') }}"
+      - "  Title: {{ notes_sites_ns }}-deploy   Content (one line):"
+      - "  {{ lookup('ansible.builtin.file', notes_sites_key ~ '.pub') if notes_sites_key_stat.stat.exists else '(is generated in the real run)' }}"
+      - >-
+        {{ ('Password to the clipboard: wl-copy < ' ~ notes_sites_pw) if notes_sites_auth == 'basic'
+        else 'Logout: https://' ~ notes_site.host ~ '/oauth2/sign_out' }}

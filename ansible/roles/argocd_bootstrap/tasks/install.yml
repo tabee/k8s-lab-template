@@ -1,0 +1,92 @@
+---
+# Namespace with its own PSA labels (no exception), age key (stage 7),
+# then the Helm chart.
+
+- name: Create namespace with PSA labels
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ argocd_namespace }}"
+        labels:
+          pod-security.kubernetes.io/enforce: "{{ argocd_psa_level }}"
+          pod-security.kubernetes.io/enforce-version: "{{ argocd_psa_version }}"
+          pod-security.kubernetes.io/audit: "{{ argocd_psa_level }}"
+          pod-security.kubernetes.io/audit-version: "{{ argocd_psa_version }}"
+          pod-security.kubernetes.io/warn: "{{ argocd_psa_level }}"
+          pod-security.kubernetes.io/warn-version: "{{ argocd_psa_version }}"
+  register: argocd_bootstrap_namespace
+
+# PSA proof: a deliberately insecure test pod is only sent via server dry run
+# (check_mode: true -> nothing is created). The API server must reject it
+# with "violates PodSecurity"; otherwise restricted does not apply.
+# Skipped in the check run: the very first time the namespace does not exist yet.
+- name: Send PSA probe via server dry run
+  kubernetes.core.k8s:
+    state: present
+    definition: "{{ lookup('ansible.builtin.template', 'psa-probe.yaml.j2') | from_yaml }}"
+  check_mode: true
+  register: argocd_bootstrap_psa_probe
+  ignore_errors: true  # the assert reads failed and msg; failed_when: false resets them (ansible-core 2.19+)
+  when: not ansible_check_mode
+  vars:
+    argocd_bootstrap_probe_namespace: "{{ argocd_namespace }}"
+
+- name: PSA rejects insecure pods
+  ansible.builtin.assert:
+    that:
+      - argocd_bootstrap_psa_probe.msg | default('') is search('violates PodSecurity')
+    fail_msg: >-
+      Namespace {{ argocd_namespace }}: test pod was NOT rejected by PSA.
+      Check labels and k3s admission config (stage 3).
+    quiet: true
+  when: not ansible_check_mode
+
+# Stage 7 (KSOPS): private age key as secret, the repo-server
+# mounts it (values.yaml.j2). Content never in the output: no_log and
+# diff: false. rstrip=false: file 1:1, with all identities (rotation).
+# Comes only from here, never from Git (chicken and egg: without it Argo CD reads
+# no encrypted secret).
+- name: Create age key for KSOPS as secret
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      type: Opaque
+      metadata:
+        name: "{{ argocd_sops_age_secret_name }}"
+        namespace: "{{ argocd_namespace }}"
+        labels:
+          app.kubernetes.io/managed-by: ansible
+          app.kubernetes.io/part-of: ksops
+      data:
+        keys.txt: "{{ lookup('ansible.builtin.file', argocd_sops_age_key_path | expanduser, rstrip=false) | b64encode }}"
+  no_log: true
+  diff: false
+  # In check mode the namespace is only "simulated" on the first run.
+  when: not (ansible_check_mode and argocd_bootstrap_namespace is changed)
+
+# Writes only into the local Helm configuration (~/.config/helm).
+- name: Register Helm repo of Argo
+  kubernetes.core.helm_repository:
+    name: "{{ argocd_chart_repo_name }}"
+    repo_url: "{{ argocd_chart_repo_url }}"
+  register: argocd_bootstrap_helm_repo
+
+# Pinned version; update_repo_cache fetches the index if the version is new.
+- name: Install Argo CD via Helm
+  kubernetes.core.helm:
+    name: "{{ argocd_release_name }}"
+    chart_ref: "{{ argocd_chart_repo_name }}/{{ argocd_chart_name }}"
+    chart_version: "{{ argocd_chart_version }}"
+    release_namespace: "{{ argocd_namespace }}"
+    create_namespace: false
+    update_repo_cache: true
+    release_values: "{{ lookup('ansible.builtin.template', 'values.yaml.j2') | from_yaml }}"
+    wait: true
+    timeout: "{{ argocd_helm_timeout }}"
+  # In check mode the Helm repo is only "simulated" as registered on the first run.
+  when: not (ansible_check_mode and argocd_bootstrap_helm_repo is changed)

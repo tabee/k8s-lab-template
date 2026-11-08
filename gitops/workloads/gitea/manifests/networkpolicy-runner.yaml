@@ -1,0 +1,29 @@
+---
+# Gitea Actions (issue #115): the runner (polls for jobs, sends logs) and the job pods (git fetch with the job
+# token) reach Gitea on port 3000 over the Service gitea-http. Only these two namespaces, nothing else.
+# Their side: gitops/workloads/gitea-runner/networkpolicy.yaml.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gitea-allow-runner
+  namespace: gitea
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: gitea
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gitea-runner
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: gitea-runner
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gitea-runner-jobs
+      ports:
+        - protocol: TCP
+          port: 3000

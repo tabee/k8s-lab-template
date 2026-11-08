@@ -1,0 +1,28 @@
+---
+# One certificate for both public names. The lab CA only signs names under
+# the lab domain, so these hosts follow that domain (lab.sh customize
+# rewrites them). The Matrix server_name is a different value and is not
+# a name on this certificate: phase 2 may set it outside the lab domain.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: matrix
+  namespace: matrix
+spec:
+  secretName: matrix-tls
+  dnsNames:
+    - matrix.lab.example
+    - element.lab.example
+  duration: 2160h
+  renewBefore: 720h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  usages:
+    - digital signature
+    - server auth
+  issuerRef:
+    group: cert-manager.io
+    kind: ClusterIssuer
+    name: lab-ca

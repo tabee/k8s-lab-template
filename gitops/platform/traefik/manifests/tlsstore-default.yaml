@@ -1,0 +1,18 @@
+---
+# Default TLSStore (name "default" in the namespace traefik, see
+# providers.kubernetesCRD.defaultTLSResourcesNamespace in values.yaml).
+# Replaces Traefik's self-signed certificate with one from the lab CA.
+# The secret is created by cert-manager (platform/cert-manager/manifests/
+# certificate-traefik-default.yaml). If it is still missing, Traefik uses
+# its own certificate until then; with sniStrict the default certificate is never served anyway.
+apiVersion: traefik.io/v1alpha1
+kind: TLSStore
+metadata:
+  name: default
+  namespace: traefik
+  annotations:
+    # CRD comes from the chart in the same sync.
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+spec:
+  defaultCertificate:
+    secretName: traefik-default-tls

@@ -1,0 +1,57 @@
+---
+# One round of the plugin Deployment wait (included twice by restore-plugin-ready.yml, loop var
+# restore_pl_round). Round 1 waits at most restore_plugin_pod_grace_min. If the Deployment is still
+# not Available (its pod asked for the TLS secrets before they existed and the kubelet retries
+# the mount with a growing back-off), round 2 deletes the plugin pod once and waits for the rest.
+# The include itself cannot skip round 2 (Ansible includes both rounds before it runs the first), so
+# the whole round is one block that checks the flag when it runs.
+- name: Run one round of the wait, number {{ restore_pl_round }}
+  when: not (restore_pl_dep_done | default(false) | bool)
+  block:
+    - name: Delete the plugin pod once because it is stuck
+      when: restore_pl_round | int == 2
+      block:
+        - name: Say why the plugin pod is deleted
+          ansible.builtin.debug:
+            msg: >-
+              The plugin Deployment is not Available although the Certificates are Ready
+              ({{ restore_plugin.resources | default([]) | map(attribute='status.conditions', default=[]) | flatten
+                  | selectattr('type', 'equalto', 'Progressing') | map(attribute='reason', default='') | first | default('no Progressing condition') }}).
+              The plugin pod is deleted once so that it mounts the TLS secrets now.
+
+        - name: Delete the plugin pod
+          kubernetes.core.k8s:
+            state: absent
+            api_version: v1
+            kind: Pod
+            namespace: "{{ restore_op_ns }}"
+            label_selectors:
+              - "app.kubernetes.io/name={{ restore_plugin_name }}"
+
+    - name: Wait until the barman-cloud plugin Deployment is Available
+      kubernetes.core.k8s_info:
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ restore_op_ns }}"
+        label_selectors:
+          - "app.kubernetes.io/name={{ restore_plugin_name }}"
+      register: restore_plugin
+      retries: "{{ [(([restore_pl_left | int, restore_pl_grace_polls | int] | min) if restore_pl_round | int == 1 else restore_pl_left | int), 1] | max }}"
+      delay: "{{ restore_plugin_delay }}"
+      until: restore_pl_dep_ok | bool
+      failed_when: false
+      vars:
+        restore_pl_dep_ok: >-
+          {{ restore_plugin.resources | default([]) | length == 1
+             and (restore_plugin.resources[0].status.conditions | default([])
+                  | selectattr('type', 'equalto', 'Available')
+                  | selectattr('status', 'equalto', 'True') | list | length == 1) }}
+
+    - name: Count the polls of this round
+      ansible.builtin.set_fact:
+        restore_pl_left: "{{ restore_pl_left | int - (restore_plugin.attempts | default(1) | int) }}"
+        restore_pl_dep_done: >-
+          {{ restore_plugin.resources | default([]) | length == 1
+             and (restore_plugin.resources[0].status.conditions | default([])
+                  | selectattr('type', 'equalto', 'Available')
+                  | selectattr('status', 'equalto', 'True') | list | length == 1) }}

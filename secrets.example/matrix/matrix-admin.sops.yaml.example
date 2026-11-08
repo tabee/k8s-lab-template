@@ -1,0 +1,15 @@
+# Template for matrix-admin.sops.yaml: structure without real values.
+# The entrypoint creates this admin on every start. Registration stays off.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: matrix-admin
+  namespace: matrix
+  labels:
+    app.kubernetes.io/managed-by: argocd
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+type: Opaque
+stringData:
+  username: "@file:matrix-admin-user"
+  password: "@file:matrix-admin-pw"

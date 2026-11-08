@@ -1,0 +1,186 @@
+---
+# Values for the Traefik chart. Chart, repo and version are only in
+# gitops/apps/traefik.yaml.
+# Deviations from the chart default and security-relevant
+# defaults that deliberately stay explicit (a chart update should not change them
+# unnoticed). On every chart update check all keys with
+#   helm show values traefik/traefik --version <Version>
+#   helm template traefik traefik/traefik --version <Version> -n traefik -f values.yaml
+#
+# Image: pinned by digest (issue #10). The chart takes `image.digest` before any
+# tag, so the running image can no longer change when a tag is re-pushed.
+# versionOverride is REQUIRED next to a digest (the chart cannot read the version
+# from a digest). Both values belong to the chart version in gitops/apps/traefik.yaml:
+# on a chart bump change versionOverride and digest TOGETHER
+# (scripts/pins-online.py --check tells you what is off; ansible/verify-traefik.yml
+# compares the running Deployment against these two values).
+image:
+  digest: sha256:1336e85aaed293bd63d005086e0dd013b04078b26aaeb1c18b26a2f928af7e65 # docker.io/traefik:v3.7.16 (multi-arch index)
+versionOverride: v3.7.16
+
+# One pod is enough in the single-node lab. No HPA, no PDB.
+deployment:
+  replicas: 1
+
+# Create IngressClass "traefik" and mark it as default, so that classic
+# Ingress objects without ingressClassName also end up at Traefik.
+ingressClass:
+  enabled: true
+  isDefaultClass: true
+
+core:
+  # No silent fallback to the default TLSOption on conflicts
+  # (GHSA-g55h-rg46-x9c5). Needs Traefik v3.7.11+.
+  strictTLSOptions: true
+
+# Dashboard off: no api@internal, no IngressRoute, nothing to protect.
+# Switch on again later with auth in a stage of its own.
+api:
+  dashboard: false
+
+ingressRoute:
+  dashboard:
+    enabled: false
+
+providers:
+  kubernetesCRD:
+    enabled: true
+    # IngressRoutes may only use services/middlewares in their own namespace.
+    allowCrossNamespace: false
+    allowExternalNameServices: false
+    # Only namespace traefik may define the global TLSOption/TLSStore "default".
+    # Otherwise any team (project lab) could overwrite it.
+    defaultTLSResourcesNamespace: traefik
+    # Collision-free names (recommended for new setups, Traefik v3.7.11+).
+    # Consequence: references read <namespace>_<name>@kubernetescrd (underscore).
+    safeNaming: true
+  kubernetesIngress:
+    enabled: true
+    # Note: allowCrossNamespace exists only for the CRD provider. An Ingress
+    # can only reference services in its own namespace anyway.
+    allowExternalNameServices: false
+  kubernetesGateway:
+    enabled: false
+
+# Gateway API stays off (provider off, no Gateway object).
+gateway:
+  enabled: false
+gatewayClass:
+  enabled: false
+
+global:
+  checkNewVersion: false
+  sendAnonymousUsage: false
+
+log:
+  format: json
+  level: INFO
+
+# Access log as JSON on stdout. Headers are not logged
+# (chart default drop), so that no cookies/tokens end up in the log.
+accessLog:
+  enabled: true
+  format: json
+
+ports:
+  # Port "traefik" (8080, /ping for the probes) stays only in the pod.
+  # aliasHeadersStrategy delete: headers like X_Auth_User or X.Auth.User
+  # (alias of X-Auth-User) are dropped, so that nobody can forge headers set by
+  # Traefik via CGI/PHP/NGINX backends.
+  traefik:
+    expose:
+      default: false
+    http:
+      aliasHeadersStrategy: delete
+  web:
+    # Container port, explicit: gitops/platform/traefik/manifests/networkpolicy.yaml opens the same
+    # ports (scripts/consistency-check.py compares them). Chart default 8000, never below 1024 (non-root).
+    port: 8000
+    # Redirect everything on port 80 permanently to HTTPS.
+    http:
+      aliasHeadersStrategy: delete
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+          permanent: true
+  websecure:
+    port: 8443
+    http:
+      # Security headers for every router on websecure.
+      # Name: <namespace>_<name>@kubernetescrd (safeNaming), object in
+      # manifests/middleware-security-headers.yaml.
+      aliasHeadersStrategy: delete
+      middlewares:
+        - traefik_security-headers@kubernetescrd
+      tls:
+        enabled: true
+  # Admin UI (Argo CD UI, whoami): own port 8444 with the same TLS
+  # options and security headers as websecure. The host firewall lets new
+  # connections to this port (as to every DNAT port except 80/443) pass only from
+  # the admin networks (nftables, chain admin_check). Why a separate port:
+  # Traefik does not see the client IP (externalTrafficPolicy Cluster), so on
+  # port 443 nobody can distinguish between "Gitea for everyone" and "Argo CD admin only".
+  # Port and value stay the only source here: Ansible reads
+  # exposedPort (group_vars/all/traefik.yml). Container port >1024 (non-root).
+  admin:
+    port: 8444
+    exposedPort: 8444
+    protocol: TCP
+    expose:
+      default: true
+    http:
+      aliasHeadersStrategy: delete
+      middlewares:
+        - traefik_security-headers@kubernetescrd
+      tls:
+        enabled: true
+  # Metrics stay internal (no service port).
+  metrics:
+    expose:
+      default: false
+    http:
+      aliasHeadersStrategy: delete
+
+service:
+  enabled: true
+  spec:
+    type: LoadBalancer
+    # Cluster instead of Local: Local needs NodePorts (svclb then forwards to the
+    # NodePort). The host firewall also blocks NodePorts (admin networks only,
+    # chain admin_check), but Traefik does not need them. Price: Traefik does
+    # not see the real client IP, but a node address.
+    externalTrafficPolicy: Cluster
+    # Do not allocate NodePorts 30000-32767 (see above).
+    allocateLoadBalancerNodePorts: false
+    # Source: edge_ingress_cidrs in infra/envs/local/lab.yaml (lab.local.yaml).
+    # GitOps sees no Ansible variables: "bash scripts/lab.sh customize"
+    # writes the list between the markers, verify-traefik.yml reports deviations.
+    # Do not change by hand.
+    # lab-customize:edge-ingress-cidrs BEGIN
+    loadBalancerSourceRanges:
+      - 192.168.122.0/24
+    # lab-customize:edge-ingress-cidrs END
+
+# Pod hardening. The chart defaults already fulfil PSA restricted; here
+# explicit nevertheless, so that a chart update does not change them unnoticed.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 64Mi  # lab-limit: traefik/traefik/traefik

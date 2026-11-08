@@ -1,0 +1,27 @@
+---
+# The restore deletes the PVC under a workload. That is only safe while Argo CD
+# cannot start the workload again, so root, gitea and matrix must have no
+# automated sync. Stop before anything is deleted if one of them has.
+- name: Read root and the file applications
+  kubernetes.core.k8s_info:
+    api_version: argoproj.io/v1alpha1
+    kind: Application
+    namespace: "{{ argocd_namespace }}"
+    name: "{{ item }}"
+  register: recover_paused
+  loop: "{{ [argocd_root_app_name] + (recover_targets | map(attribute='app') | list) }}"
+
+- name: Name the applications that still sync by themselves
+  ansible.builtin.set_fact:
+    recover_unpaused: >-
+      {{ recover_paused.results | map(attribute='resources') | flatten
+         | selectattr('spec.syncPolicy.automated', 'defined')
+         | map(attribute='metadata.name') | list }}
+
+- name: Stop while auto-sync is on
+  when: recover_unpaused | length > 0
+  ansible.builtin.fail:
+    msg: >-
+      Auto-sync is still on for {{ recover_unpaused | join(', ') }}. Argo CD
+      would start the workload again while its PVC is replaced. Pause first:
+      cd ansible && ansible-playbook recover-files.yml --tags pause

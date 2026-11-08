@@ -1,0 +1,24 @@
+# {{ ansible_managed }}
+# WireGuard {{ wireguard_mode }} for {{ wireguard_interface }}. Private key is read from a file
+# (PostUp), never embedded here, so ansible --diff cannot leak it.
+# Issue #60. Values: ansible/inventory/group_vars/all/wireguard.yml.
+
+[Interface]
+Address = {{ wireguard_address }}
+{% if wireguard_mode == 'server' and (wireguard_listen_port | int) > 0 %}
+ListenPort = {{ wireguard_listen_port | int }}
+{% endif %}
+MTU = {{ wireguard_mtu }}
+# Load the private key without putting it into this file.
+PostUp = wg set %i private-key {{ wireguard_private_key_path }}
+SaveConfig = false
+
+[Peer]
+PublicKey = {{ wireguard_peer_public_key }}
+AllowedIPs = {{ wireguard_peer_allowed_ips }}
+{% if wireguard_mode == 'client' and wireguard_peer_endpoint %}
+Endpoint = {{ wireguard_peer_endpoint }}
+{% endif %}
+{% if wireguard_mode == 'client' and (wireguard_keepalive | int) > 0 %}
+PersistentKeepalive = {{ wireguard_keepalive | int }}
+{% endif %}

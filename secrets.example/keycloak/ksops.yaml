@@ -1,0 +1,18 @@
+---
+# KSOPS generator: decrypts the listed files when rendering
+# (repo-server, age key). lab.sh init renders the *.sops.yaml files
+# from the examples. Values never go into the bundle or the log.
+apiVersion: viaduct.ai/v1
+kind: ksops
+metadata:
+  name: secrets-keycloak
+  annotations:
+    config.kubernetes.io/function: |
+      exec:
+        path: ksops
+files:
+  - ./backup-s3-creds.sops.yaml
+  - ./keycloak-db-owner.sops.yaml
+  - ./keycloak-admin.sops.yaml
+  - ./keycloak-oidc-clients.sops.yaml
+  - ./keycloak-notes-client.sops.yaml

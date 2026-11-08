@@ -1,0 +1,60 @@
+---
+# Dead man's switch: a systemd timer deletes the table (and disables
+# nftables.service) after firewall_rollback_seconds, unless Ansible stops it
+# beforehand. Ansible stops it only when a NEW SSH connection
+# works through the new rules. If a rule locks you out, the host is open again
+# after expiry (state before stage 3), also after a reboot.
+
+- name: Remove old dead man's timer (if left over from an abort)
+  ansible.builtin.systemd_service:
+    name: host-filter-rollback.timer
+    state: stopped
+  failed_when: false
+
+- name: Reload systemd (drop-in of nftables.service)
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+
+- name: Start dead man's timer
+  ansible.builtin.command:
+    argv:
+      - systemd-run
+      - --unit=host-filter-rollback
+      - --collect
+      - "--on-active={{ firewall_rollback_seconds }}"
+      - --timer-property=AccuracySec=1s
+      - /bin/sh
+      - -c
+      - /usr/sbin/nft delete table inet host_filter; /usr/bin/systemctl disable nftables.service
+  changed_when: true
+
+- name: Load table host_filter atomically
+  ansible.builtin.command: /usr/sbin/nft -f /etc/nftables.d/host_filter.nft
+  changed_when: true
+
+- name: Close existing SSH connection (next task reconnects)
+  ansible.builtin.meta: reset_connection
+
+- name: Check new connection through the new rules
+  block:
+    - name: Establish new SSH connection
+      ansible.builtin.wait_for_connection:
+        timeout: 30
+  rescue:
+    - name: Report abort
+      ansible.builtin.fail:
+        msg: >-
+          No new SSH connection possible. The dead man's timer deletes the
+          table host_filter after {{ firewall_rollback_seconds }} s at the latest.
+          Afterwards check rules/variables and run again.
+
+- name: Stop dead man's timer (rules confirmed)
+  ansible.builtin.systemd_service:
+    name: host-filter-rollback.timer
+    state: stopped
+
+- name: Load nftables at boot
+  ansible.builtin.systemd_service:
+    name: nftables
+    enabled: true
+    state: started

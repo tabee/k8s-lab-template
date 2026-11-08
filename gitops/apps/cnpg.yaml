@@ -1,0 +1,80 @@
+---
+# Child application of the root app (app of apps), stage 8b: CloudNativePG.
+# Source 1: Helm chart cloudnative-pg (operator, CRDs, webhooks).
+# Source 2: Helm chart plugin-barman-cloud (backup/restore to S3, CNPG-I).
+#           Must run in the same namespace as the operator (the operator
+#           finds plugins via services in its namespace).
+# Source 3: this repo, provides the values files ($values) and the
+#           NetworkPolicy under gitops/platform/cnpg/manifests.
+# Versions pinned here, the only place (as of 2026-10-27):
+#   cloudnative-pg 0.29.1 = Operator 1.30.1
+#   plugin-barman-cloud 0.8.1 = plugin v0.15.1 (needs cert-manager)
+# Source: https://cloudnative-pg.github.io/charts/index.yaml
+# Project platform: namespace cnpg-system, chart repo and cluster-wide
+# kinds are in ansible/inventory/group_vars/all/argocd.yml
+# (argocd_platform_*). repoURL (Git and chart), targetRevision and project
+# must match.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: cnpg
+  namespace: argocd
+  # Deleting this file cleans up operator and plugin. The CRDs carry
+  # helm.sh/resource-policy: keep (from the charts), Argo CD leaves them
+  # in place. Nevertheless: remove the app db-lab first (docs/learning-path/stage-8b-cnpg.md,
+  # way back), otherwise clusters without an operator are left dangling.
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: platform
+  sources:
+    - repoURL: https://cloudnative-pg.github.io/charts
+      chart: cloudnative-pg
+      targetRevision: 0.29.1
+      helm:
+        releaseName: cloudnative-pg
+        valueFiles:
+          - $values/gitops/platform/cnpg/values-operator.yaml
+    - repoURL: https://cloudnative-pg.github.io/charts
+      chart: plugin-barman-cloud
+      targetRevision: 0.8.1
+      helm:
+        releaseName: plugin-barman-cloud
+        valueFiles:
+          - $values/gitops/platform/cnpg/values-plugin.yaml
+    - repoURL: ssh://git@github.com/YOUR-NAME/k8s-lab.git
+      targetRevision: main
+      ref: values
+      # With path Argo CD additionally renders this source as manifests.
+      path: gitops/platform/cnpg/manifests
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: cnpg-system
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    # Argo CD creates the namespace; PSA restricted like with traefik (operator
+    # and plugin run without root, without capabilities, seccomp RuntimeDefault).
+    managedNamespaceMetadata:
+      labels:
+        pod-security.kubernetes.io/enforce: restricted
+        pod-security.kubernetes.io/enforce-version: latest
+        pod-security.kubernetes.io/audit: restricted
+        pod-security.kubernetes.io/audit-version: latest
+        pod-security.kubernetes.io/warn: restricted
+        pod-security.kubernetes.io/warn-version: latest
+    syncOptions:
+      - CreateNamespace=true
+      # CRDs are too big for the last-applied annotation of client-side apply.
+      - ServerSideApply=true
+    # Certificate/Issuer need the CRDs and the webhook from the app cert-manager.
+    # While they are missing the sync fails at once and nothing is created (the
+    # plugin Deployment is wave 1, see values-plugin.yaml); ten tries with
+    # backoff (10 s ... 3 min) cover a slow first start of cert-manager.
+    retry:
+      limit: 10
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 3m

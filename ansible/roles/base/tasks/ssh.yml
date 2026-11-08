@@ -1,0 +1,62 @@
+---
+# Drop-in instead of editing sshd_config. sshd takes the FIRST value per option;
+# "10-" is read before "50-cloud-init.conf" and therefore wins.
+- name: Listen address must be an IP of this host (otherwise no SSH anymore)
+  ansible.builtin.assert:
+    that:
+      - base_ssh_listen_address in ansible_facts['all_ipv4_addresses']
+    fail_msg: "{{ base_ssh_listen_address }} is no IPv4 of this host: {{ ansible_facts['all_ipv4_addresses'] }}"
+    quiet: true
+
+# Without "state" the module only reads the status (changes nothing).
+- name: Check whether sshd runs via socket activation (Ubuntu 24.04)
+  ansible.builtin.systemd_service:
+    name: ssh.socket
+  register: base_ssh_socket
+  failed_when: false
+
+# validate checks the whole configuration incl. drop-in (sshd -t) BEFORE writing.
+- name: SSH hardening as drop-in
+  ansible.builtin.template:
+    src: sshd-hardening.conf.j2
+    dest: /etc/ssh/sshd_config.d/10-hardening.conf
+    owner: root
+    group: root
+    mode: "0644"
+    validate: /usr/sbin/sshd -t -f %s
+  notify:
+    - Reload SSH
+    - Regenerate SSH socket
+
+- name: Run handlers now so that the check sees the new state
+  ansible.builtin.meta: flush_handlers
+
+# Proves that a NEW login works with the new configuration; the
+# old connection (ControlPersist) would otherwise hide an error.
+- name: Close existing SSH connection
+  ansible.builtin.meta: reset_connection
+
+- name: Establish new SSH connection
+  ansible.builtin.wait_for_connection:
+    timeout: 30
+
+- name: Read effective sshd configuration
+  ansible.builtin.command: /usr/sbin/sshd -T
+  register: base_sshd_effective
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Check that sshd hardening is effective
+  ansible.builtin.assert:
+    that:
+      - "'passwordauthentication no' in base_sshd_effective.stdout_lines"
+      - "'kbdinteractiveauthentication no' in base_sshd_effective.stdout_lines"
+      - "'permitrootlogin no' in base_sshd_effective.stdout_lines"
+      - "'allowtcpforwarding no' in base_sshd_effective.stdout_lines"
+      - "'permittunnel no' in base_sshd_effective.stdout_lines"
+      - "('listenaddress ' ~ base_ssh_listen_address ~ ':22') in base_sshd_effective.stdout_lines"
+      - "('kexalgorithms ' ~ base_ssh_kex_algorithms | join(',')) in base_sshd_effective.stdout_lines"
+      - "('ciphers ' ~ base_ssh_ciphers | join(',')) in base_sshd_effective.stdout_lines"
+      - "('macs ' ~ base_ssh_macs | join(',')) in base_sshd_effective.stdout_lines"
+    quiet: true
+  when: not ansible_check_mode

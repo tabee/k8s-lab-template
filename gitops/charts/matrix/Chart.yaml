@@ -1,0 +1,13 @@
+---
+# Local chart for the lab Matrix service. Only the pieces that must be
+# templated live here (homeserver config, Element config, startup scripts) and
+# the two Deployments, which carry a checksum of the rendered ConfigMaps so a
+# config change restarts the pods. Everything else is a raw manifest under
+# gitops/workloads/matrix/manifests so the certificate and the LimitRange stay
+# visible to the existing checks. Not published to a chart registry.
+# Runbook: docs/how-to/matrix.md
+apiVersion: v2
+name: matrix
+description: Synapse and Element Web configuration for the lab (federation off)
+type: application
+version: 0.1.0

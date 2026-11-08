@@ -1,0 +1,15 @@
+# Template for gitea-runner-registration.sops.yaml: structure without real values.
+# The runner registers with the key token (mounted as a file, gitops/workloads/gitea-runner/deployment.yaml).
+# Same value as secrets/gitea/gitea-runner-token.sops.yaml (Gitea side).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: gitea-runner-registration
+  namespace: gitea-runner
+  labels:
+    app.kubernetes.io/managed-by: argocd
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+type: Opaque
+stringData:
+  token: "@file:gitea-runner-token"

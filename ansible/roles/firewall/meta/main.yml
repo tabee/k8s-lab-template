@@ -1,0 +1,64 @@
+---
+# Role "firewall": host firewall with nftables, incoming traffic only.
+galaxy_info:
+  author: k8s-lab
+  description: Own nftables table (default deny incoming) next to k3s
+  license: MIT
+  min_ansible_version: "2.17"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - noble
+dependencies: []
+
+# Required variables; values come from inventory/group_vars/k3s/main.yml.
+argument_specs:
+  main:
+    short_description: Host-Firewall (nftables)
+    options:
+      firewall_admin_cidrs:
+        type: list
+        elements: str
+        required: true
+        description: Source networks for SSH and k8s API (the control machine must be inside)
+      firewall_admin_tcp_ports:
+        type: list
+        elements: int
+        required: true
+        description: TCP ports reachable from the admin networks
+      firewall_cluster_cidrs:
+        type: list
+        elements: str
+        required: true
+        description: Pod and service network allowed to reach the host
+      firewall_cluster_interfaces:
+        type: list
+        elements: str
+        required: true
+        description: CNI interfaces over which pod traffic arrives
+      firewall_cluster_tcp_ports:
+        type: list
+        elements: int
+        required: true
+        description: TCP ports on the host that pods may reach
+      firewall_ingress_tcp_ports:
+        type: list
+        elements: int
+        required: true
+        description: Ingress ports (empty = no rule)
+      firewall_ingress_cidrs:
+        type: list
+        elements: str
+        required: true
+        description: Source networks for the ingress ports (the admin networks are always allowed)
+      firewall_dnat_admin_only:
+        type: bool
+        required: true
+        description: >-
+          New connections from outside to every DNAT target except the ingress ports
+          (NodePort, hostPort, admin port) only from the admin networks
+      firewall_wireguard_udp_port: { type: raw, required: false, default: 0, description: UDP WireGuard listen port (0 = off) }
+      firewall_rollback_seconds:
+        type: int
+        required: true
+        description: Dead man's switch, after this many seconds without confirmation the table is deleted

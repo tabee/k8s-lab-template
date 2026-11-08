@@ -1,0 +1,69 @@
+---
+# Child application of the root app (app of apps), stage 8c: K8up.
+# Source 1: Helm chart k8up (operator, CRDs, ClusterRoles). K8up backs up
+#           PVCs with restic to S3 (here: rustfs, bucket k8up-k3s-lab).
+# Source 2: this repo, provides values.yaml ($values) and the
+#           NetworkPolicy under gitops/platform/k8up/manifests.
+# Version pinned here, the only place (as of 2026-10-27):
+#   k8up 4.10.1 = operator v2.16.1 (image digest: values.yaml)
+# Source: https://k8up-io.github.io/k8up/index.yaml
+# Project platform: namespace k8up, chart repo and cluster-wide kinds
+# are in ansible/inventory/group_vars/all/argocd.yml (argocd_platform_*).
+#
+# The chart brings a cleanup job (Helm hook post-install/upgrade/
+# delete, a PostSync hook under Argo CD): it deletes in all namespaces
+# old RBAC objects pod-executor from K8up 1.x. The operator recreates for
+# running jobs what it needs itself. See docs.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: k8up
+  namespace: argocd
+  # Deleting this file cleans up the operator; schedules in gitea then
+  # no longer run. CRDs stay (Argo CD does not delete Helm crds/).
+  # The two post-delete finalizers are set by Argo CD itself, because the k8up chart
+  # has a PostDelete hook. If they are not here, root reports OutOfSync forever.
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+    - post-delete-finalizer.argocd.argoproj.io
+    - post-delete-finalizer.argocd.argoproj.io/cleanup
+spec:
+  project: platform
+  sources:
+    - repoURL: https://k8up-io.github.io/k8up
+      chart: k8up
+      targetRevision: 4.10.1
+      helm:
+        releaseName: k8up
+        valueFiles:
+          - $values/gitops/platform/k8up/values.yaml
+    - repoURL: ssh://git@github.com/YOUR-NAME/k8s-lab.git
+      targetRevision: main
+      ref: values
+      # With path Argo CD additionally renders this source as manifests.
+      path: gitops/platform/k8up/manifests
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: k8up
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    managedNamespaceMetadata:
+      labels:
+        pod-security.kubernetes.io/enforce: restricted
+        pod-security.kubernetes.io/enforce-version: latest
+        pod-security.kubernetes.io/audit: restricted
+        pod-security.kubernetes.io/audit-version: latest
+        pod-security.kubernetes.io/warn: restricted
+        pod-security.kubernetes.io/warn-version: latest
+    syncOptions:
+      - CreateNamespace=true
+      # CRDs are too big for the last-applied annotation of client-side apply.
+      - ServerSideApply=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 3m

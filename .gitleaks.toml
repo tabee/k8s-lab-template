@@ -1,0 +1,41 @@
+# gitleaks configuration for k8s-lab (docs: docs/how-to/secret-scan.md).
+#
+# The default rules of gitleaks apply unchanged. Exceptions are narrow: a false
+# positive in the history is one fingerprint in .gitleaksignore (private repo scan
+# only); anything that also appears in the public export is an [[allowlists]] block
+# below, because the export is scanned as a folder without history.
+#
+# Rules for later exceptions (details in docs/how-to/secret-scan.md):
+#   - First clarify whether the finding is real. A real finding is never allowed,
+#     instead the secret is rotated.
+#   - Exception as narrow as possible: path AND rule AND line pattern.
+#   - Every exception gets a comment with reason and date.
+#   - Comments "gitleaks:allow" in the code have no effect (the scan runs with
+#     --ignore-gitleaks-allow), so that all exceptions are central here.
+title = "k8s-lab"
+
+[extend]
+useDefault = true
+
+# Test fixture, not a live secret. 2026-11-03.
+# scripts/gitea-import-e2e.sh seeds a throw-away Gitea on 127.0.0.1 with curl basic
+# auth and made-up passwords. Bound to this file, this rule and the two seed users. The path pattern
+# is not anchored at the start because gitleaks gets absolute paths from the export guard.
+[[allowlists]]
+description = "gitea-import-e2e: made-up basic-auth passwords for the throw-away test Gitea"
+condition = "AND"
+targetRules = ["curl-auth-user"]
+paths = ['''(^|/)scripts/gitea-import-e2e\.sh$''']
+regexTarget = "line"
+regexes = ['''curl .*-u (srcadmin|alice):'[^']+\'''']
+
+# Test fixture, not a live secret. 2026-11-03.
+# The export-guard test plants one random-looking string to see that the guard
+# reports it. The file is not part of the public export.
+[[allowlists]]
+description = "public-tests: planted entropy string that the export guard must find"
+condition = "AND"
+targetRules = ["generic-api-key"]
+paths = ['''(^|/)tests/public-tests\.sh$''']
+regexTarget = "line"
+regexes = ['''violation "entropy string" ''']

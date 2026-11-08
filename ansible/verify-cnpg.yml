@@ -1,0 +1,759 @@
+---
+# Check stage 8b (CloudNativePG with backup to rustfs).
+# Usage (from ansible/):
+#   ansible-playbook verify-cnpg.yml                   everything, including the restore test (~10 min)
+#   ansible-playbook verify-cnpg.yml --tags repo       repo only, without a cluster (before the commit)
+#   ansible-playbook verify-cnpg.yml --tags repo,cluster   without restore test: health + age of the last backup
+# Prerequisite: argocd.yml has run, the state is pushed.
+#
+# Names (namespace, cluster, ObjectStore, pooler, apps) the playbook reads
+# from the manifests under gitops/ (single place). Endpoint and bucket
+# come from group_vars/all/backup_s3.yml; objectstore.yaml holds a
+# copy that is compared here.
+#
+# Restore test (tag restore): write test rows A, remember the time T,
+# write test rows B, archive WAL, restore a throwaway cluster <cluster>-verify
+# from the ObjectStore up to T (PITR): A must be equal, B
+# must be missing. The throwaway cluster does not archive (no plugins section),
+# so it never writes to the bucket. At the end (also on error): throwaway cluster,
+# backup object and test table are gone. The base backup itself stays in S3
+# and expires after the retention (14d).
+#
+# Secrets: only metadata and key names, never values. The pooler test
+# is done by a pod that reads the password itself from the secret (secretKeyRef).
+
+- name: Check stage 8b CNPG
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: "{{ argocd_kubeconfig }}"
+  vars:
+    verify_retries: 60
+    verify_delay: 10
+    verify_backup_max_age_hours: 26
+    verify_repo: "{{ playbook_dir }}/.."
+    verify_wl: "{{ verify_repo }}/gitops/workloads/db-lab"
+    verify_plugin: barman-cloud.cloudnative-pg.io
+    # Manifests from the repo (source for all names).
+    verify_m_cluster: "{{ lookup('ansible.builtin.file', verify_wl ~ '/cluster.yaml') | from_yaml }}"
+    verify_m_os: "{{ lookup('ansible.builtin.file', verify_wl ~ '/objectstore.yaml') | from_yaml }}"
+    verify_m_pooler: "{{ lookup('ansible.builtin.file', verify_wl ~ '/pooler.yaml') | from_yaml }}"
+    verify_m_sb: "{{ lookup('ansible.builtin.file', verify_wl ~ '/scheduledbackup.yaml') | from_yaml }}"
+    verify_m_app_op: "{{ lookup('ansible.builtin.file', verify_repo ~ '/gitops/apps/cnpg.yaml') | from_yaml }}"
+    verify_m_app_db: "{{ lookup('ansible.builtin.file', verify_repo ~ '/gitops/apps/db-lab.yaml') | from_yaml }}"
+    verify_m_app_sec: "{{ lookup('ansible.builtin.file', verify_repo ~ '/gitops/apps/secrets-db-lab.yaml') | from_yaml }}"
+    verify_ns: "{{ verify_m_cluster.metadata.namespace }}"
+    verify_cluster: "{{ verify_m_cluster.metadata.name }}"
+    # Database and owner come from Git. Git stays on initdb (ADR-0018).
+    verify_boot: "{{ verify_m_cluster.spec.bootstrap.initdb | default(verify_m_cluster.spec.bootstrap.recovery) }}"
+    verify_db: "{{ verify_boot.database }}"
+    verify_owner: "{{ verify_boot.owner }}"
+    verify_op_ns: "{{ verify_m_app_op.spec.destination.namespace }}"
+    verify_cl_plugin: "{{ verify_m_cluster.spec.plugins | selectattr('name', 'equalto', verify_plugin) | first }}"
+    verify_server: "{{ verify_cl_plugin.parameters.serverName }}"
+    verify_os_name: "{{ verify_m_os.metadata.name }}"
+    verify_s3_secret: "{{ verify_m_os.spec.configuration.s3Credentials.accessKeyId.name }}"
+    verify_sops_file: "secrets/{{ verify_ns }}/{{ verify_s3_secret }}.sops.yaml"
+    verify_apps:
+      - "{{ verify_m_app_op.metadata.name }}"
+      - "{{ verify_m_app_sec.metadata.name }}"
+      - "{{ verify_m_app_db.metadata.name }}"
+    verify_restore: "{{ verify_cluster }}-verify"
+    verify_table: verify_cnpg
+    verify_psql: "psql -XAtq -v ON_ERROR_STOP=1 -d {{ verify_db }} -c"
+    # Pod security like in the CNPG pods (uid 26 = postgres in the image).
+    verify_pod_sc:
+      runAsNonRoot: true
+      runAsUser: 26
+      runAsGroup: 26
+      seccompProfile:
+        type: RuntimeDefault
+    verify_ctr_sc:
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop: [ALL]
+  tasks:
+    - name: Set the run ID (once, not anew on every access)
+      ansible.builtin.set_fact:
+        verify_run: "r{{ lookup('ansible.builtin.pipe', 'date -u +%Y%m%d%H%M%S') }}"
+      tags: [always]
+
+    # ================= Repo (without cluster) =================
+    - name: Check repo
+      tags: [repo]
+      block:
+        - name: Endpoint and bucket in objectstore.yaml = backup_s3.yml (copy checked)
+          ansible.builtin.assert:
+            that:
+              - verify_m_os.spec.configuration.endpointURL == backup_s3_vm_endpoint
+              - verify_m_os.spec.configuration.destinationPath == 's3://' ~ backup_s3_bucket ~ '/' ~ verify_ns
+              - verify_m_os.metadata.namespace == verify_ns
+            fail_msg: >-
+              gitops/workloads/db-lab/objectstore.yaml differs from group_vars/all/backup_s3.yml:
+              endpointURL {{ verify_m_os.spec.configuration.endpointURL }} (expected {{ backup_s3_vm_endpoint }}),
+              destinationPath {{ verify_m_os.spec.configuration.destinationPath }}
+              (expected s3://{{ backup_s3_bucket }}/{{ verify_ns }}). Source is backup_s3.yml, adjust the copy.
+            success_msg: "ObjectStore {{ verify_os_name }}: {{ backup_s3_vm_endpoint }}, s3://{{ backup_s3_bucket }}/{{ verify_ns }}"
+
+        - name: Cluster, pooler and backup plan point at each other
+          ansible.builtin.assert:
+            that:
+              - verify_cl_plugin.isWALArchiver | default(false)
+              - verify_cl_plugin.parameters.barmanObjectName == verify_os_name
+              - verify_server | length > 0
+              - verify_m_os.spec.configuration.serverName is not defined
+              - "'@sha256:' in verify_m_cluster.spec.imageName"
+              - verify_m_cluster.spec.enableSuperuserAccess == false
+              - verify_m_pooler.spec.cluster.name == verify_cluster
+              - verify_m_pooler.spec.type == 'rw'
+              - verify_m_sb.spec.cluster.name == verify_cluster
+              - verify_m_sb.spec.method == 'plugin'
+              - verify_m_sb.spec.pluginConfiguration.name == verify_plugin
+              - verify_m_pooler.metadata.namespace == verify_ns
+              - verify_m_sb.metadata.namespace == verify_ns
+              - verify_m_app_db.spec.destination.namespace == verify_ns
+              - verify_m_app_sec.spec.destination.namespace == verify_ns
+              - verify_m_app_sec.spec.source.path == 'secrets/' ~ verify_ns
+            fail_msg: "Manifests under gitops/ do not fit together (names, namespace, plugin, digest)"
+            quiet: true
+
+        - name: Argo CD projects allow the new namespaces and the chart repo
+          ansible.builtin.assert:
+            that:
+              - verify_ns in argocd_project_namespaces
+              - verify_op_ns in argocd_platform_namespaces
+              - >-
+                verify_m_app_op.spec.sources | selectattr('chart', 'defined') | map(attribute='repoURL')
+                | unique | difference(argocd_platform_chart_repos) | length == 0
+              - verify_m_app_op.spec.project == 'platform'
+              - verify_m_app_db.spec.project == 'lab'
+              - verify_m_app_sec.spec.project == 'lab'
+            fail_msg: >-
+              group_vars/all/argocd.yml: {{ verify_ns }} is missing in argocd_project_namespaces,
+              {{ verify_op_ns }} to argocd_platform_namespaces or the CNPG chart repo to
+              argocd_platform_chart_repos. Afterwards ansible-playbook argocd.yml.
+            quiet: true
+
+        - name: Read the SOPS file for the S3 secret (encrypted, values are not printed)
+          ansible.builtin.slurp:
+            src: "{{ verify_repo }}/{{ verify_sops_file }}"
+          register: verify_sops_raw
+          no_log: true
+
+        - name: Reduce SOPS file to metadata
+          ansible.builtin.set_fact:
+            verify_sops_meta:
+              name: "{{ verify_sops_doc.metadata.name | default('') }}"
+              namespace: "{{ verify_sops_doc.metadata.namespace | default('') }}"
+              annotations: "{{ verify_sops_doc.metadata.annotations | default({}) }}"
+              keys: "{{ (verify_sops_doc.data | default({})).keys() | list | sort }}"
+              encrypted: "{{ (verify_sops_doc.data | default({})).values() | reject('match', 'ENC\\[AES256_GCM,') | list | length == 0 }}"
+              has_sops: "{{ verify_sops_doc.sops is defined }}"
+          vars:
+            verify_sops_doc: "{{ verify_sops_raw.content | b64decode | from_yaml }}"
+          no_log: true
+
+        - name: S3 secret in the repo is encrypted, named correctly and never deleted
+          ansible.builtin.assert:
+            that:
+              - verify_sops_meta.has_sops
+              - verify_sops_meta.encrypted
+              - verify_sops_meta.name == verify_s3_secret
+              - verify_sops_meta.namespace == verify_ns
+              - verify_sops_meta['keys'] == ['ACCESS_KEY_ID', 'ACCESS_SECRET_KEY']
+              - "'Prune=false' in (verify_sops_meta.annotations['argocd.argoproj.io/sync-options'] | default(''))"
+              - "'Delete=false' in (verify_sops_meta.annotations['argocd.argoproj.io/sync-options'] | default(''))"
+              - "'./' ~ verify_s3_secret ~ '.sops.yaml' in verify_ksops.files"
+            fail_msg: >-
+              {{ verify_sops_file }}: Name {{ verify_sops_meta.name }}, Namespace {{ verify_sops_meta.namespace }},
+              Keys {{ verify_sops_meta['keys'] | join(',') }} (expected ACCESS_KEY_ID,ACCESS_SECRET_KEY),
+              encrypted {{ verify_sops_meta.encrypted }}, in ksops.yaml? Create new:
+              ansible/scripts/sops-secret.sh from-env {{ verify_ns }} {{ verify_s3_secret }} {{ backup_s3_user_env }}
+            success_msg: "{{ verify_sops_file }}: Keys {{ verify_sops_meta['keys'] | join(', ') }}, encrypted"
+          vars:
+            verify_ksops: "{{ lookup('ansible.builtin.file', verify_repo ~ '/secrets/' ~ verify_ns ~ '/ksops.yaml') | from_yaml }}"
+
+    # ================= Cluster =================
+    - name: Read Argo CD applications
+      kubernetes.core.k8s_info:
+        api_version: argoproj.io/v1alpha1
+        kind: Application
+        namespace: "{{ argocd_namespace }}"
+        name: "{{ item }}"
+      register: verify_app_info
+      until: >-
+        verify_app_info.resources | length == 1 and
+        (verify_app_info.resources | first).status.sync.status | default('') == 'Synced' and
+        (verify_app_info.resources | first).status.health.status | default('') == 'Healthy'
+      retries: "{{ verify_retries }}"
+      delay: "{{ verify_delay }}"
+      failed_when: false
+      loop: "{{ verify_apps }}"
+      tags: [cluster, restore]
+
+    - name: Applications are Synced and Healthy
+      ansible.builtin.assert:
+        that:
+          - item.resources | default([]) | length == 1
+          - (item.resources | first).status.sync.status | default('') == 'Synced'
+          - (item.resources | first).status.health.status | default('') == 'Healthy'
+        fail_msg: >-
+          Application {{ item.item }}: Sync={{ (item.resources | first | default({})).status.sync.status | default('-') }},
+          Health={{ (item.resources | first | default({})).status.health.status | default('-') }},
+          Messages: {{ (item.resources | first | default({})).status.conditions | default([]) | map(attribute='message') | join(' | ') | truncate(400) }}
+          {{ ((item.resources | first | default({})).status.operationState | default({})).message | default('') | truncate(300) }}
+        quiet: true
+      loop: "{{ verify_app_info.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      tags: [cluster, restore]
+
+    - name: PSA proof for the database and the operator namespace
+      ansible.builtin.include_tasks:
+        file: tasks/psa-probe.yml
+        apply:
+          tags: [cluster, restore]
+      vars:
+        verify_psa_namespaces:
+          - "{{ verify_ns }}"
+          - "{{ verify_op_ns }}"
+      tags: [cluster, restore]
+
+    - name: Read operator and plugin
+      kubernetes.core.k8s_info:
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ verify_op_ns }}"
+        label_selectors:
+          - "app.kubernetes.io/name={{ item }}"
+      register: verify_op
+      until: >-
+        verify_op.resources | length == 1 and
+        (verify_op.resources | first).status.readyReplicas | default(0) >= 1
+      retries: "{{ verify_retries }}"
+      delay: "{{ verify_delay }}"
+      loop: [cloudnative-pg, plugin-barman-cloud]
+      tags: [cluster, restore]
+
+    - name: Show operator version
+      ansible.builtin.debug:
+        msg: >-
+          {{ verify_op.results | map(attribute='resources') | map('first')
+             | map(attribute='spec.template.spec.containers') | map('first') | map(attribute='image') | list }}
+      tags: [cluster, restore]
+
+    - name: Read S3 secret in the cluster (metadata only)
+      kubernetes.core.k8s_info:
+        kind: Secret
+        namespace: "{{ verify_ns }}"
+        name: "{{ verify_s3_secret }}"
+      register: verify_sec
+      no_log: true
+      tags: [cluster, restore]
+
+    - name: Reduce S3 secret to metadata
+      ansible.builtin.set_fact:
+        verify_sec_meta:
+          found: "{{ verify_sec.resources | length == 1 }}"
+          keys: "{{ ((verify_sec.resources | first | default({})).data | default({})).keys() | list | sort }}"
+          annotations: "{{ (verify_sec.resources | first | default({})).metadata.annotations | default({}) }}"
+          managed_by: "{{ ((verify_sec.resources | first | default({})).metadata.labels | default({}))['app.kubernetes.io/managed-by'] | default('') }}"
+      no_log: true
+      tags: [cluster, restore]
+
+    - name: S3 secret comes from Argo CD (KSOPS) and is never deleted
+      ansible.builtin.assert:
+        that:
+          - verify_sec_meta.found
+          - verify_sec_meta['keys'] == ['ACCESS_KEY_ID', 'ACCESS_SECRET_KEY']
+          - verify_sec_meta.annotations['argocd.argoproj.io/tracking-id'] | default('') is match(verify_m_app_sec.metadata.name ~ ':')
+          - verify_sec_meta.managed_by == 'argocd'
+          - "'Prune=false' in (verify_sec_meta.annotations['argocd.argoproj.io/sync-options'] | default(''))"
+          - "'Delete=false' in (verify_sec_meta.annotations['argocd.argoproj.io/sync-options'] | default(''))"
+          - "'kubectl.kubernetes.io/last-applied-configuration' not in verify_sec_meta.annotations"
+        fail_msg: >-
+          Secret {{ verify_ns }}/{{ verify_s3_secret }}: found {{ verify_sec_meta.found }}, keys
+          {{ verify_sec_meta['keys'] | join(',') }}, Tracking
+          '{{ verify_sec_meta.annotations['argocd.argoproj.io/tracking-id'] | default('-') }}'.
+          Expected app {{ verify_m_app_sec.metadata.name }}, Prune=false,Delete=false.
+        quiet: true
+      tags: [cluster, restore]
+
+    - name: Read cluster (waits until healthy)
+      kubernetes.core.k8s_info:
+        api_version: postgresql.cnpg.io/v1
+        kind: Cluster
+        namespace: "{{ verify_ns }}"
+        name: "{{ verify_cluster }}"
+      register: verify_cl
+      until: >-
+        verify_cl.resources | length == 1 and
+        (verify_cl.resources | first).status.phase | default('') == 'Cluster in healthy state' and
+        (verify_cl.resources | first).status.readyInstances | default(0) == verify_m_cluster.spec.instances
+      retries: "{{ verify_retries }}"
+      delay: "{{ verify_delay }}"
+      failed_when: false
+      tags: [cluster, restore]
+
+    - name: Cluster is healthy, all instances ready, WAL archiving works
+      ansible.builtin.assert:
+        that:
+          - verify_cl_st.phase | default('') == 'Cluster in healthy state'
+          - verify_cl_st.readyInstances | default(0) == verify_m_cluster.spec.instances
+          - verify_cl_st.currentPrimary | default('') | length > 0
+          - verify_cl_st.currentPrimary == verify_cl_st.targetPrimary | default('')
+          - verify_cl_arch_bad | length == 0
+        fail_msg: >-
+          Cluster {{ verify_ns }}/{{ verify_cluster }}: Phase '{{ verify_cl_st.phase | default('-') }}',
+          ready {{ verify_cl_st.readyInstances | default(0) }}/{{ verify_m_cluster.spec.instances }},
+          Primary {{ verify_cl_st.currentPrimary | default('-') }},
+          ContinuousArchiving: {{ verify_cl_st.conditions | default([]) | selectattr('type', 'equalto', 'ContinuousArchiving')
+                                  | map(attribute='message', default='-') | join(' ') }}.
+          Logs: kubectl -n {{ verify_ns }} logs {{ verify_cluster }}-1 -c plugin-barman-cloud
+        success_msg: "Primary {{ verify_cl_st.currentPrimary | default('-') }}, {{ verify_cl_st.readyInstances | default(0) }} instances ready"
+      vars:
+        verify_cl_st: "{{ (verify_cl.resources | first | default({})).status | default({}) }}"
+        # The condition is set by the instance; if it is missing (plugin version), decides
+        # pg_stat_archiver in the next step.
+        verify_cl_arch_bad: >-
+          {{ verify_cl_st.conditions | default([]) | selectattr('type', 'equalto', 'ContinuousArchiving')
+             | selectattr('status', 'equalto', 'False') | list }}
+      tags: [cluster, restore]
+
+    - name: Remember primary
+      ansible.builtin.set_fact:
+        verify_primary: "{{ (verify_cl.resources | first).status.currentPrimary }}"
+      tags: [cluster, restore]
+
+    - name: Check WAL archive in the primary (pg_stat_archiver)
+      kubernetes.core.k8s_exec:
+        namespace: "{{ verify_ns }}"
+        pod: "{{ verify_primary }}"
+        container: postgres
+        command: >-
+          {{ verify_psql }} "SELECT archived_count > 0, coalesce(last_failed_time < last_archived_time, true),
+          archived_count, failed_count FROM pg_stat_archiver"
+      register: verify_arch
+      changed_when: false
+      tags: [cluster, restore]
+
+    - name: WAL archiving ok (at least one file, last attempt successful)
+      ansible.builtin.assert:
+        that:
+          - (verify_arch.stdout | trim).split('|')[0] == 't'
+          - (verify_arch.stdout | trim).split('|')[1] == 't'
+        fail_msg: >-
+          pg_stat_archiver (ok, last-ok, archived, errors): {{ verify_arch.stdout | trim }}.
+          Logs: kubectl -n {{ verify_ns }} logs {{ verify_primary }} -c plugin-barman-cloud
+        success_msg: "archived/errors: {{ (verify_arch.stdout | trim).split('|')[2:] | join('/') }}"
+      tags: [cluster, restore]
+
+    - name: Read ObjectStore in the cluster
+      kubernetes.core.k8s_info:
+        api_version: barmancloud.cnpg.io/v1
+        kind: ObjectStore
+        namespace: "{{ verify_ns }}"
+        name: "{{ verify_os_name }}"
+      register: verify_os
+      tags: [cluster, restore]
+
+    - name: ObjectStore im Cluster = Repo = backup_s3.yml
+      ansible.builtin.assert:
+        that:
+          - verify_os.resources | length == 1
+          - verify_os_cfg.endpointURL == backup_s3_vm_endpoint
+          - verify_os_cfg.destinationPath == 's3://' ~ backup_s3_bucket ~ '/' ~ verify_ns
+          - (verify_os.resources | first).spec.retentionPolicy == verify_m_os.spec.retentionPolicy
+        fail_msg: >-
+          ObjectStore {{ verify_os_name }} in the cluster: {{ verify_os_cfg.endpointURL | default('-') }},
+          {{ verify_os_cfg.destinationPath | default('-') }}. Argo CD not in sync yet?
+        quiet: true
+      vars:
+        verify_os_cfg: "{{ (verify_os.resources | first | default({})).spec.configuration | default({}) }}"
+      tags: [cluster, restore]
+
+    # ---------- Pooler ----------
+    - name: Read pooler deployment
+      kubernetes.core.k8s_info:
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ verify_ns }}"
+        name: "{{ verify_m_pooler.metadata.name }}"
+      register: verify_pooler
+      until: >-
+        verify_pooler.resources | length == 1 and
+        (verify_pooler.resources | first).status.readyReplicas | default(0) == verify_m_pooler.spec.instances
+      retries: "{{ verify_retries }}"
+      delay: "{{ verify_delay }}"
+      tags: [cluster, restore]
+
+    - name: Test the connection through the pooler (pod reads the password itself)
+      tags: [cluster, restore]
+      block:
+        - name: Start test pod (psql through the pooler, as app user)
+          kubernetes.core.k8s:
+            definition:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                name: verify-pooler
+                namespace: "{{ verify_ns }}"
+              spec:
+                restartPolicy: Never
+                automountServiceAccountToken: false
+                securityContext: "{{ verify_pod_sc }}"
+                # New pod: kube-router does not know it for the first second,
+                # default-deny rejects. So wait for the pooler first.
+                initContainers:
+                  - name: wait
+                    image: "{{ verify_m_cluster.spec.imageName }}"
+                    command: [sh, -c, "for i in $(seq 1 30); do pg_isready -q -t 2 && exit 0; sleep 2; done; exit 1"]
+                    env:
+                      - name: PGHOST
+                        value: "{{ verify_m_pooler.metadata.name }}"
+                    securityContext: "{{ verify_ctr_sc }}"
+                    resources:
+                      requests: {cpu: 10m, memory: 32Mi}
+                      limits: {memory: 128Mi}
+                containers:
+                  - name: psql
+                    image: "{{ verify_m_cluster.spec.imageName }}"
+                    command: [psql, -XAtq, -v, ON_ERROR_STOP=1, -c, "SELECT 'POOLER-OK ' || current_user || ' recovery=' || pg_is_in_recovery()"]
+                    env:
+                      - name: PGHOST
+                        value: "{{ verify_m_pooler.metadata.name }}"
+                      - name: PGSSLMODE
+                        value: require
+                      - name: PGCONNECT_TIMEOUT
+                        value: "5"
+                      - name: PGDATABASE
+                        valueFrom:
+                          secretKeyRef: {name: "{{ verify_cluster }}-app", key: dbname}
+                      - name: PGUSER
+                        valueFrom:
+                          secretKeyRef: {name: "{{ verify_cluster }}-app", key: username}
+                      - name: PGPASSWORD
+                        valueFrom:
+                          secretKeyRef: {name: "{{ verify_cluster }}-app", key: password}
+                    securityContext: "{{ verify_ctr_sc }}"
+                    resources:
+                      requests: {cpu: 10m, memory: 32Mi}
+                      limits: {memory: 128Mi}
+
+        - name: Wait until the test pod is done
+          kubernetes.core.k8s_info:
+            kind: Pod
+            namespace: "{{ verify_ns }}"
+            name: verify-pooler
+          register: verify_pp
+          until: (verify_pp.resources | first).status.phase | default('') in ['Succeeded', 'Failed']
+          retries: 30
+          delay: 5
+
+        - name: Read log of the test pod
+          kubernetes.core.k8s_log:
+            namespace: "{{ verify_ns }}"
+            name: verify-pooler
+          register: verify_pp_log
+
+        - name: Pooler leads to the primary (not in recovery)
+          ansible.builtin.assert:
+            that:
+              - (verify_pp.resources | first).status.phase == 'Succeeded'
+              - "'POOLER-OK ' ~ verify_owner ~ ' recovery=false' in verify_pp_log.log"
+            fail_msg: "Pooler-Test: {{ verify_pp_log.log | trim | truncate(400) }}"
+            success_msg: "{{ verify_pp_log.log | trim }}"
+      always:
+        - name: Test pod gone
+          kubernetes.core.k8s:
+            state: absent
+            kind: Pod
+            namespace: "{{ verify_ns }}"
+            name: verify-pooler
+            wait: true
+
+    - name: Read ScheduledBackup
+      kubernetes.core.k8s_info:
+        api_version: postgresql.cnpg.io/v1
+        kind: ScheduledBackup
+        namespace: "{{ verify_ns }}"
+        name: "{{ verify_m_sb.metadata.name }}"
+      register: verify_sb
+      tags: [cluster, backup, restore]
+
+    - name: ScheduledBackup exists and has triggered at least once
+      ansible.builtin.assert:
+        that:
+          - verify_sb.resources | length == 1
+          - (verify_sb.resources | first).status.lastScheduleTime | default('') | length > 0
+        fail_msg: "ScheduledBackup {{ verify_m_sb.metadata.name }} is missing or has never triggered"
+        success_msg: >-
+          {{ verify_m_sb.metadata.name }}: last {{ (verify_sb.resources | first).status.lastScheduleTime | default('-') }},
+          next {{ (verify_sb.resources | first).status.nextScheduleTime | default('-') }} (UTC)
+      tags: [cluster, backup, restore]
+
+    # ================= Restore-Test (PITR) =================
+    - name: Restore test
+      tags: [restore]
+      block:
+        - name: Remove the old throwaway cluster (if an earlier run aborted)
+          kubernetes.core.k8s:
+            state: absent
+            api_version: postgresql.cnpg.io/v1
+            kind: Cluster
+            namespace: "{{ verify_ns }}"
+            name: "{{ verify_restore }}"
+            wait: true
+            wait_timeout: 300
+
+        - name: Create test table
+          kubernetes.core.k8s_exec:
+            namespace: "{{ verify_ns }}"
+            pod: "{{ verify_primary }}"
+            container: postgres
+            command: >-
+              {{ verify_psql }} "CREATE TABLE IF NOT EXISTS {{ verify_table }} (run text, n int, payload text, PRIMARY KEY (run, n))"
+          changed_when: true
+
+        - name: Request base backup
+          kubernetes.core.k8s:
+            definition:
+              apiVersion: postgresql.cnpg.io/v1
+              kind: Backup
+              metadata:
+                name: "verify-{{ verify_run }}"
+                namespace: "{{ verify_ns }}"
+                labels:
+                  app.kubernetes.io/managed-by: verify-cnpg
+              spec:
+                cluster:
+                  name: "{{ verify_cluster }}"
+                method: plugin
+                pluginConfiguration:
+                  name: "{{ verify_plugin }}"
+
+        - name: Wait until the backup is done
+          kubernetes.core.k8s_info:
+            api_version: postgresql.cnpg.io/v1
+            kind: Backup
+            namespace: "{{ verify_ns }}"
+            name: "verify-{{ verify_run }}"
+          register: verify_bk
+          until: (verify_bk.resources | first).status.phase | default('') in ['completed', 'failed']
+          retries: "{{ verify_retries }}"
+          delay: "{{ verify_delay }}"
+
+        - name: Backup successful
+          ansible.builtin.assert:
+            that: (verify_bk.resources | first).status.phase == 'completed'
+            fail_msg: >-
+              Backup verify-{{ verify_run }}: {{ (verify_bk.resources | first).status.error | default('-') | truncate(400) }}
+            success_msg: >-
+              Backup verify-{{ verify_run }}: {{ (verify_bk.resources | first).status.startedAt | default('-') }} bis
+              {{ (verify_bk.resources | first).status.stoppedAt | default('-') }}
+
+        - name: Write test rows A and remember the time T (after the commit)
+          kubernetes.core.k8s_exec:
+            namespace: "{{ verify_ns }}"
+            pod: "{{ verify_primary }}"
+            container: postgres
+            command: >-
+              {{ verify_psql }} "INSERT INTO {{ verify_table }} SELECT '{{ verify_run }}-A', g, md5(g::text) FROM generate_series(1, 100) g"
+              -c "SELECT pg_sleep(1)"
+              -c "SELECT to_char(clock_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') || '+00'"
+              -c "SELECT pg_sleep(1)"
+          register: verify_t
+          changed_when: true
+
+        - name: Write test rows B (after T, must not appear in the restore), switch WAL
+          kubernetes.core.k8s_exec:
+            namespace: "{{ verify_ns }}"
+            pod: "{{ verify_primary }}"
+            container: postgres
+            command: >-
+              {{ verify_psql }} "INSERT INTO {{ verify_table }} SELECT '{{ verify_run }}-B', g, md5(g::text) FROM generate_series(1, 100) g"
+              -c "SELECT pg_walfile_name(pg_switch_wal())"
+          register: verify_wal
+          changed_when: true
+
+        - name: Record the expected values of A
+          kubernetes.core.k8s_exec:
+            namespace: "{{ verify_ns }}"
+            pod: "{{ verify_primary }}"
+            container: postgres
+            command: >-
+              {{ verify_psql }} "SELECT count(*) || '|' || md5(string_agg(n || ':' || payload, ',' ORDER BY n))
+              FROM {{ verify_table }} WHERE run = '{{ verify_run }}-A'"
+          register: verify_a_src
+          changed_when: false
+
+        - name: Remember values
+          ansible.builtin.set_fact:
+            verify_target: "{{ (verify_t.stdout | trim).splitlines() | reject('equalto', '') | last }}"
+            verify_walfile: "{{ (verify_wal.stdout | trim).splitlines() | last }}"
+            verify_a: "{{ verify_a_src.stdout | trim }}"
+
+        - name: Wait until the WAL file with B is archived
+          kubernetes.core.k8s_exec:
+            namespace: "{{ verify_ns }}"
+            pod: "{{ verify_primary }}"
+            container: postgres
+            command: >-
+              {{ verify_psql }} "SELECT last_archived_wal >= '{{ verify_walfile }}' FROM pg_stat_archiver"
+          register: verify_archived
+          until: (verify_archived.stdout | trim) == 't'
+          retries: 30
+          delay: 5
+          changed_when: false
+
+        - name: Restore the throwaway cluster from the ObjectStore (up to T, without archiving)
+          kubernetes.core.k8s:
+            definition:
+              apiVersion: postgresql.cnpg.io/v1
+              kind: Cluster
+              metadata:
+                name: "{{ verify_restore }}"
+                namespace: "{{ verify_ns }}"
+                labels:
+                  app.kubernetes.io/managed-by: verify-cnpg
+              spec:
+                instances: 1
+                imageName: "{{ verify_m_cluster.spec.imageName }}"
+                enableSuperuserAccess: false
+                storage:
+                  size: 1Gi
+                resources:
+                  requests: {cpu: 50m, memory: 256Mi}
+                  limits: {memory: 512Mi}
+                postgresql:
+                  parameters: "{{ verify_m_cluster.spec.postgresql.parameters }}"
+                bootstrap:
+                  recovery:
+                    source: origin
+                    recoveryTarget:
+                      targetTime: "{{ verify_target }}"
+                # Deliberately no plugins section: the throwaway cluster never writes to the bucket.
+                externalClusters:
+                  - name: origin
+                    plugin:
+                      name: "{{ verify_plugin }}"
+                      parameters:
+                        barmanObjectName: "{{ verify_os_name }}"
+                        serverName: "{{ verify_server }}"
+
+        - name: Wait until the throwaway cluster is healthy
+          kubernetes.core.k8s_info:
+            api_version: postgresql.cnpg.io/v1
+            kind: Cluster
+            namespace: "{{ verify_ns }}"
+            name: "{{ verify_restore }}"
+          register: verify_rc
+          until: >-
+            (verify_rc.resources | first).status.phase | default('') == 'Cluster in healthy state' and
+            (verify_rc.resources | first).status.readyInstances | default(0) == 1
+          retries: "{{ verify_retries }}"
+          delay: "{{ verify_delay }}"
+          failed_when: false
+
+        - name: Throwaway cluster is healthy
+          ansible.builtin.assert:
+            that:
+              - (verify_rc.resources | first).status.phase | default('') == 'Cluster in healthy state'
+            fail_msg: >-
+              {{ verify_restore }}: Phase '{{ (verify_rc.resources | first | default({})).status.phase | default('-') }}'.
+              Logs: kubectl -n {{ verify_ns }} logs -l cnpg.io/cluster={{ verify_restore }} --all-containers --tail 50
+            quiet: true
+
+        - name: Count A and B in the throwaway cluster
+          kubernetes.core.k8s_exec:
+            namespace: "{{ verify_ns }}"
+            pod: "{{ (verify_rc.resources | first).status.currentPrimary }}"
+            container: postgres
+            command: >-
+              {{ verify_psql }} "SELECT (SELECT count(*) || '|' || md5(string_agg(n || ':' || payload, ',' ORDER BY n))
+              FROM {{ verify_table }} WHERE run = '{{ verify_run }}-A') || '#'
+              || (SELECT count(*) FROM {{ verify_table }} WHERE run = '{{ verify_run }}-B')"
+          register: verify_dst
+          changed_when: false
+
+        - name: PITR is correct (A equal, B missing)
+          ansible.builtin.assert:
+            that:
+              - verify_a.startswith('100|')
+              - (verify_dst.stdout | trim).split('#')[0] == verify_a
+              - (verify_dst.stdout | trim).split('#')[1] == '0'
+            fail_msg: >-
+              Restore until {{ verify_target }}: A is '{{ (verify_dst.stdout | trim).split('#')[0] }}' (expected '{{ verify_a }}'),
+              B hat {{ (verify_dst.stdout | trim).split('#')[1] | default('-') }} rows (expected 0).
+            success_msg: "PITR until {{ verify_target }}: A = {{ verify_a }}, B = 0 rows"
+
+      always:
+        - name: Delete throwaway cluster
+          kubernetes.core.k8s:
+            state: absent
+            api_version: postgresql.cnpg.io/v1
+            kind: Cluster
+            namespace: "{{ verify_ns }}"
+            name: "{{ verify_restore }}"
+            wait: true
+            wait_timeout: 300
+
+        - name: Delete backup object (data in S3 stays until the retention)
+          kubernetes.core.k8s:
+            state: absent
+            api_version: postgresql.cnpg.io/v1
+            kind: Backup
+            namespace: "{{ verify_ns }}"
+            name: "verify-{{ verify_run }}"
+
+        - name: Delete test table
+          kubernetes.core.k8s_exec:
+            namespace: "{{ verify_ns }}"
+            pod: "{{ verify_primary }}"
+            container: postgres
+            command: >-
+              {{ verify_psql }} "DROP TABLE IF EXISTS {{ verify_table }}"
+          changed_when: true
+          failed_when: false
+
+    # ================= Age of the last backup =================
+    - name: Read ObjectStore status
+      kubernetes.core.k8s_info:
+        api_version: barmancloud.cnpg.io/v1
+        kind: ObjectStore
+        namespace: "{{ verify_ns }}"
+        name: "{{ verify_os_name }}"
+      register: verify_os_st
+      tags: [cluster, backup, restore]
+
+    - name: Last successful backup is fresh, maximum age in hours {{ verify_backup_max_age_hours }}
+      ansible.builtin.assert:
+        that:
+          - verify_last | length > 0
+          - verify_age_h | float < verify_backup_max_age_hours | float
+          - verify_win.firstRecoverabilityPoint | default('') | length > 0
+        fail_msg: >-
+          Last backup (server {{ verify_server }}): '{{ verify_last | default('-') }}',
+          last error '{{ verify_win.lastFailedBackupTime | default('-') }}'. On the very first run: the
+          immediate backup may have run before the S3 secret; then run once without --tags (with restore test).
+        success_msg: >-
+          Last backup {{ verify_last }} (UTC, {{ verify_age_h | float | round(1) }} h ago),
+          Recoverable from {{ verify_win.firstRecoverabilityPoint | default('-') }} (UTC)
+      vars:
+        verify_win: >-
+          {{ (((verify_os_st.resources | first | default({})).status | default({})).serverRecoveryWindow
+              | default({}))[verify_server] | default({}) }}
+        verify_last: "{{ verify_win.lastSuccessfulBackupTime | default('') }}"
+        verify_age_h: >-
+          {{ ((now(utc=true) - (verify_last | to_datetime('%Y-%m-%dT%H:%M:%SZ'))).total_seconds() / 3600) if verify_last else 9999 }}
+      tags: [cluster, backup, restore]
+
+    # Wave 2 (issue #5): namespace db-lab (control pod in a policy-free namespace first).
+    - name: Egress probes (allowed targets connect, everything else is blocked)
+      ansible.builtin.include_tasks: tasks/egress-probe.yml
+      vars:
+        egress_probes: "{{ egress_probe_control + egress_probe_dblab }}"
+      tags: [cluster, egress]

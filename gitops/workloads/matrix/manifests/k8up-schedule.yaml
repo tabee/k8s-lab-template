@@ -1,0 +1,57 @@
+---
+# File backup of the Synapse volume (PVC matrix-data) with K8up/restic.
+# The bucket string k8up-k3s-lab/matrix is a separate restic repository
+# (same bucket and the same repo password as Gitea, own prefix) so a prune
+# in one namespace cannot forget the other namespace's snapshots.
+# ONLY place for these times. Time zone UTC, cron with 5 fields:
+#   Backup 21:30 daily, prune 23:30 daily, check Sunday 01:30.
+# Gitea takes the preceding hourly slots (20:30, 22:30, Sunday 00:30).
+# A 30-minute deadline plus 5 minutes for termination/controller delay fits
+# inside each one-hour slot. Per-action concurrency is disabled; this is
+# not a cross-namespace mutex. Manual runs follow memory-budget.md.
+# Only a PVC with k8up.io/backup: "true" is backed up (pvc.yaml).
+#
+# COPY: endpoint and bucket exist only in
+# ansible/inventory/group_vars/all/backup_s3.yml. verify-matrix.yml compares
+# the endpoint and checks that the bucket is <k8up bucket>/<namespace>.
+apiVersion: k8up.io/v1
+kind: Schedule
+metadata:
+  name: matrix-files
+  namespace: matrix
+  annotations:
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+spec:
+  podConfigRef:
+    name: k8up-restricted
+  backend:
+    repoPasswordSecretRef:
+      name: k8up-repo
+      key: password
+    s3:
+      endpoint: http://192.168.122.1:9000
+      bucket: k8up-k3s-lab/matrix
+      accessKeyIDSecretRef:
+        name: k8up-s3-creds
+        key: ACCESS_KEY_ID
+      secretAccessKeySecretRef:
+        name: k8up-s3-creds
+        key: ACCESS_SECRET_KEY
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 2
+  backup:
+    schedule: "30 21 * * *"
+    concurrentRunsAllowed: false
+    activeDeadlineSeconds: 1800
+  prune:
+    schedule: "30 23 * * *"
+    concurrentRunsAllowed: false
+    activeDeadlineSeconds: 1800
+    retention:
+      keepDaily: 14
+      keepWeekly: 8
+      keepMonthly: 6
+  check:
+    schedule: "30 1 * * 0"
+    concurrentRunsAllowed: false
+    activeDeadlineSeconds: 1800

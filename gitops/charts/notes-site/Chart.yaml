@@ -1,0 +1,11 @@
+---
+# Template for a notes site (sidequest notes). Per entry in
+# gitops/sites.yaml the ApplicationSet gitops/apps/notes.yaml makes an
+# application with this chart (values from the entry, see values.yaml).
+# Meant only for this repo, never for a chart registry.
+# Runbook: docs/how-to/notes-sites.md
+apiVersion: v2
+name: notes-site
+description: Password-protected notes site (Zensical + knowledge graph) from a Git repo
+type: application
+version: 0.1.0

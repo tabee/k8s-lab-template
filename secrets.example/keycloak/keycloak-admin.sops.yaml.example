@@ -1,0 +1,17 @@
+# Template for keycloak-admin.sops.yaml: structure without real values.
+# Bootstrap admin of the master realm: Keycloak reads it only while the
+# master realm does not exist yet; the realm job logs in with it. The admin
+# console has no public route (port-forward only).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: keycloak-admin
+  namespace: keycloak
+  labels:
+    app.kubernetes.io/managed-by: argocd
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+type: Opaque
+stringData:
+  username: "@file:keycloak-admin-user"
+  password: "@file:keycloak-admin-pw"
